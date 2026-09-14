@@ -1,0 +1,7 @@
+go 1.22
+
+use (
+	./edge/agent
+	./services/control-plane
+	./shared/types
+)
