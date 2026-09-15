@@ -72,3 +72,28 @@ stateDiagram-v2
 * **`MITIGATING`**: Autonomous mitigation policy is executing (safe simulated action in Phase 1).
 * **`RECOVERED`**: Metrics returned to within safe limits following mitigation.
 * **`ESCALATED`**: Mitigation unsuccessful or severity escalated, requiring central operator review.
+
+---
+
+## 5. Edge Local Durable Persistence Pipeline (Phase 2)
+
+The edge agent enforces local data durability before considering any telemetry batch accepted:
+
+```mermaid
+flowchart TD
+    TG["Telemetry Generator\n(Deterministic Synthetic)"] --> VAL["Domain Validation\n(types.TelemetryBatch.Validate)"]
+    VAL --> WAL["SQLite Storage Engine\n(WAL Mode Transaction)"]
+    WAL --> CONF["Confirmation Read\n(Verify Batch In SQLite)"]
+    CONF --> PEND["Locally Accepted Batch\n(Status: PENDING Sync)"]
+```
+
+### Core Durability Invariants:
+1. **Local Persistence Precedes Ingestion**: Batches are committed to local SQLite WAL storage *before* any remote synchronization is attempted.
+2. **Autonomous Offline Survivability**: The edge node does not require the control plane to start, run, or persist telemetry. If the control plane is offline, unreachable, or non-existent, the edge continues collecting and buffering data locally.
+3. **Write-Ahead Logging (WAL)**:
+   * Provides concurrent reads while writes are occurring without blocking.
+   * Atomic commits ensure that abrupt edge power loss or crashes cannot corrupt the database file.
+   * `PRAGMA synchronous=NORMAL` balances high write throughput with durability across application restarts.
+4. **Per-Node Sequence Continuity**: On startup, the agent queries `MAX(sequence_number)` from the local database, ensuring monotonic sequence numbers across application restarts without collisions or resets.
+5. **Idempotency Guarantee**: `batch_id` serves as a unique primary key. Duplicate batch insertions are detected and rejected (`ErrDuplicateBatch`), preventing duplicate records.
+6. **Realistic Buffer Limits (No False Zero-Data-Loss Claims)**: Physical disk capacity on edge hardware is finite. Telemetry batches are persisted with status `PENDING` to await upstream sync. While the pipeline guarantees durable local writes, it explicitly does **not** claim mathematically guaranteed zero data loss under indefinite network partitions.
