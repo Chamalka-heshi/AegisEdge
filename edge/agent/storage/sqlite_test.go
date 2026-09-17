@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,7 +71,9 @@ func TestSQLite_Idempotency(t *testing.T) {
 
 // TestSQLite_OfflineFirstDurabilityAndReopening demonstrates that the edge operates
 // completely independently of the control plane, storing multiple batches locally in WAL mode
-// and proving that all data survives a complete application restart.
+// and verifying that all data survives a complete application/connection restart.
+// Note: This test verifies SQLite persistence across application/process restarts; it does
+// not simulate physical power loss or OS crash scenarios.
 func TestSQLite_OfflineFirstDurabilityAndReopening(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "offline_durability.db")
@@ -222,5 +225,52 @@ func TestSQLite_FailureCases(t *testing.T) {
 	}
 	if _, err := store.CountBatches(ctx); !errors.Is(err, ErrStoreClosed) {
 		t.Fatalf("expected ErrStoreClosed on CountBatches, got %v", err)
+	}
+}
+
+// TestSQLite_PragmasConfigured verifies that the SQLite connection has WAL mode,
+// synchronous=NORMAL (value 1), busy_timeout=5000, and foreign_keys=ON (value 1) actively configured.
+func TestSQLite_PragmasConfigured(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pragma_check.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Check journal_mode
+	var journalMode string
+	if err := store.db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal_mode failed: %v", err)
+	}
+	if strings.ToLower(journalMode) != "wal" {
+		t.Errorf("expected journal_mode 'wal', got %q", journalMode)
+	}
+
+	// 2. Check synchronous (0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA)
+	var syncMode int
+	if err := store.db.QueryRow("PRAGMA synchronous;").Scan(&syncMode); err != nil {
+		t.Fatalf("query synchronous failed: %v", err)
+	}
+	if syncMode != 1 {
+		t.Errorf("expected synchronous mode 1 (NORMAL), got %d", syncMode)
+	}
+
+	// 3. Check busy_timeout
+	var busyTimeout int
+	if err := store.db.QueryRow("PRAGMA busy_timeout;").Scan(&busyTimeout); err != nil {
+		t.Fatalf("query busy_timeout failed: %v", err)
+	}
+	if busyTimeout != 5000 {
+		t.Errorf("expected busy_timeout 5000, got %d", busyTimeout)
+	}
+
+	// 4. Check foreign_keys
+	var foreignKeys int
+	if err := store.db.QueryRow("PRAGMA foreign_keys;").Scan(&foreignKeys); err != nil {
+		t.Fatalf("query foreign_keys failed: %v", err)
+	}
+	if foreignKeys != 1 {
+		t.Errorf("expected foreign_keys 1 (ON), got %d", foreignKeys)
 	}
 }
