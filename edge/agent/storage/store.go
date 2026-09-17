@@ -49,8 +49,9 @@ type Record struct {
 	SyncStatus     SyncStatus           `json:"sync_status"`
 }
 
-// Store defines the local durable storage contract for the edge node.
-// Implementations MUST guarantee durability before returning success.
+// Store defines the local storage contract for the edge node.
+// Implementations must commit batches according to configured storage durability semantics
+// before returning success. Local persistence acts as the system's first durable buffering boundary.
 type Store interface {
 	// PersistBatch transactionally validates and persists a telemetry batch with PENDING status.
 	// If a batch with the same BatchID already exists, ErrDuplicateBatch is returned.
