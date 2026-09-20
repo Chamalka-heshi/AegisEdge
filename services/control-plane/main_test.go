@@ -17,4 +17,11 @@ func TestServerConfig_Defaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("expected LogLevel 'info', got %q", cfg.LogLevel)
 	}
+
+	if Version != "0.3.0-dev" {
+		t.Errorf("expected Version '0.3.0-dev', got %q", Version)
+	}
+	if AppName != "aegisedge-control-plane" {
+		t.Errorf("expected AppName 'aegisedge-control-plane', got %q", AppName)
+	}
 }
