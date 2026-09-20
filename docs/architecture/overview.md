@@ -98,3 +98,46 @@ flowchart TD
 5. **Per-Node Sequence Continuity**: On startup, the agent queries `MAX(sequence_number)` from the local database, ensuring monotonic sequence numbers across application restarts without collisions or resets.
 6. **Idempotency Guarantee**: `batch_id` serves as a unique primary key. Duplicate batch insertions are detected and rejected (`ErrDuplicateBatch`), preventing duplicate records.
 7. **Realistic Buffer Limits (No False Zero-Data-Loss Claims)**: Physical disk capacity on edge hardware is finite. Telemetry batches are persisted with status `PENDING` to await upstream sync. AegisEdge explicitly does **not** claim mathematically guaranteed zero data loss under indefinite network partitions.
+
+---
+
+## 6. Edge-to-Control-Plane Synchronization Pipeline (Phase 3)
+
+Phase 3 introduces edge-to-control-plane synchronization over HTTP to prove the distributed recovery flow:
+
+```mermaid
+flowchart LR
+    subgraph EdgeStore ["Edge Local Storage (SQLite WAL)"]
+        PB["Pending Batches\n(Status: PENDING)"]
+    end
+
+    subgraph SyncerWorker ["Edge Syncer Worker"]
+        PN["GetPendingNodes()"] --> PBNode["GetPendingBatchesByNode(NodeID)"]
+        PBNode --> Client["HTTP Sync Client\n(Bounded Backoff Retries)"]
+    end
+
+    subgraph ControlPlane ["Control Plane Ingestion"]
+        EP["POST /api/v1/telemetry/batches\n(1MB MaxBytesReader)"] --> VAL["Domain Validation"]
+        VAL --> IDEM["Idempotency Filter\n(map by BatchID)"]
+        IDEM -- "New" --> RES1["201 Created\nstatus: accepted"]
+        IDEM -- "Duplicate" --> RES2["200 OK\nstatus: already_accepted"]
+    end
+
+    PB --> PN
+    Client -- "HTTP POST" --> EP
+    RES1 -- "Ack" --> Mark["MarkBatchSynced()\nStatus: SYNCED"]
+    RES2 -- "Ack" --> Mark
+    Client -- "Cycle Failed" --> Attempt["RecordSyncAttempt()\nattempt += 1, Status: PENDING\nHalt sequence for this node"]
+```
+
+### Core Synchronization Invariants:
+1. **At-Least-Once Delivery + Idempotent Processing**: The system guarantees at-least-once delivery; exactly-once delivery is NOT claimed. Duplicates are handled idempotently via `BatchID`.
+2. **Per-Node Sequence Ordering `(NodeID, SequenceNumber)`**: Sequence numbers are strictly per-node. Ordering is enforced per-node, never globally across different edge nodes.
+3. **Failure Isolation Between Nodes**: If Node A sequence $N$ fails, subsequent batches for Node A are halted for that sync cycle to prevent out-of-order delivery, but Node B continues synchronizing independently.
+4. **Retry Attempt Semantics**: The persisted `attempt` counter represents logical synchronization cycles and is incremented once per failed cycle, not per transient internal HTTP retry.
+5. **Idempotent Duplicate Acceptance**: If the control plane returns HTTP 200 `already_accepted`, the edge marks the local batch as `SYNCED`.
+6. **Timestamp Semantics**:
+   * `collected_at`: Immutable edge timestamp when telemetry was captured.
+   * `sent_at`: Recorded on the edge when transmission was attempted.
+   * `ingested_at`: Appended by the control plane upon acceptance.
+7. **Phase 3 Control Plane In-Memory Limitation**: Accepted batches survive for the lifetime of the control plane process. Process restarts reset the accepted set. Because the edge maintains records in SQLite until acknowledged, a control plane restart triggers safe re-synchronization without edge data loss. Durable control-plane storage will be introduced in later phases.

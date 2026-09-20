@@ -44,6 +44,7 @@ Key architectural decisions are formally documented in `docs/decisions/`:
 * [ADR-0002: Edge-to-Control-Plane Communication and Offline Synchronization](docs/decisions/ADR-0002-edge-to-control-plane-communication-and-offline-sync.md)
 * [ADR-0003: Domain Event and Incident Contracts](docs/decisions/ADR-0003-domain-event-and-incident-contracts.md)
 * [ADR-0004: Edge-Local Persistence and WAL Durability](docs/decisions/ADR-0004-edge-local-persistence-and-wal-durability.md)
+* [ADR-0005: Edge-to-Control-Plane HTTP Synchronization and Offline Recovery](docs/decisions/ADR-0005-edge-to-control-plane-http-synchronization.md)
 
 ---
 
@@ -52,6 +53,24 @@ Key architectural decisions are formally documented in `docs/decisions/`:
 ### Prerequisites
 * **Go** 1.22+ (verified on Go 1.27)
 * **Git**
+
+### Running the System (Phase 3 Distributed Sync)
+
+#### 1. Start the Control Plane Server
+```powershell
+go run ./services/control-plane -port 8080
+```
+
+#### 2. Start the Edge Agent
+```powershell
+go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:8080 -interval 3s
+```
+
+#### 3. Offline-to-Online Demonstration
+1. Start the edge agent while the control plane is stopped (`-once` or daemon mode).
+2. Observe telemetry batches being generated and safely committed to SQLite with `sync_status = 'PENDING'`.
+3. Start the control plane server on port 8080.
+4. Observe the edge agent connecting, synchronizing all pending batches in `(NodeID, SequenceNumber)` order, and updating their SQLite records to `SYNCED`.
 
 ### Running Tests
 To verify all modules across the Go workspace:
