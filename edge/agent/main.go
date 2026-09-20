@@ -12,12 +12,13 @@ import (
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/config"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/sync"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/telemetry"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
 
 const (
-	Version = "0.2.0-dev"
+	Version = "0.3.0-dev"
 	AppName = "aegisedge-agent"
 )
 
@@ -25,11 +26,14 @@ func main() {
 	cfg := config.LoadFromEnv()
 
 	var (
-		showVersion = flag.Bool("version", false, "Print version and exit")
-		nodeID      = flag.String("node-id", cfg.NodeID, "Unique node identifier")
-		dbPath      = flag.String("db-path", cfg.DatabasePath, "Local SQLite database path")
-		interval    = flag.Duration("interval", cfg.CollectionInterval, "Telemetry collection interval")
-		runOnce     = flag.Bool("once", false, "Run single collection step and exit")
+		showVersion     = flag.Bool("version", false, "Print version and exit")
+		nodeID          = flag.String("node-id", cfg.NodeID, "Unique node identifier")
+		dbPath          = flag.String("db-path", cfg.DatabasePath, "Local SQLite database path")
+		interval        = flag.Duration("interval", cfg.CollectionInterval, "Telemetry collection interval")
+		controlPlaneURL = flag.String("control-plane-url", cfg.ControlPlaneURL, "Control plane HTTP endpoint")
+		syncInterval    = flag.Duration("sync-interval", cfg.SyncInterval, "Background synchronization interval")
+		syncEnabled     = flag.Bool("sync-enabled", cfg.SyncEnabled, "Enable background synchronization")
+		runOnce         = flag.Bool("once", false, "Run single collection step and exit")
 	)
 	flag.Parse()
 
@@ -41,18 +45,24 @@ func main() {
 	cfg.NodeID = *nodeID
 	cfg.DatabasePath = *dbPath
 	cfg.CollectionInterval = *interval
+	cfg.ControlPlaneURL = *controlPlaneURL
+	cfg.SyncInterval = *syncInterval
+	cfg.SyncEnabled = *syncEnabled
 	cfg.RunOnce = *runOnce
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
-	logger.Info("starting aegisedge agent (offline-first local persistence mode)",
+	logger.Info("starting aegisedge agent (offline-first sync mode)",
 		slog.String("app", AppName),
 		slog.String("version", Version),
 		slog.String("node_id", cfg.NodeID),
 		slog.String("db_path", cfg.DatabasePath),
 		slog.Duration("interval", cfg.CollectionInterval),
+		slog.String("control_plane_url", cfg.ControlPlaneURL),
+		slog.Duration("sync_interval", cfg.SyncInterval),
+		slog.Bool("sync_enabled", cfg.SyncEnabled),
 		slog.Bool("once", cfg.RunOnce),
 	)
 
@@ -93,7 +103,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// If run-once mode was requested, execute single step and exit
+	// 4. Initialize synchronization pipeline (if enabled)
+	var syncer *sync.Syncer
+	if cfg.SyncEnabled {
+		client := sync.NewHTTPClient(cfg.ControlPlaneURL, sync.WithLogger(logger))
+		syncer = sync.NewSyncer(store, client, logger)
+	}
+
+	// If run-once mode was requested, execute single collection step and sync attempt
 	if cfg.RunOnce {
 		batch, err := runCollectionStep(ctx, gen, store, logger)
 		if err != nil {
@@ -104,26 +121,63 @@ func main() {
 			slog.String("batch_id", batch.BatchID),
 			slog.Int64("sequence_number", batch.SequenceNumber),
 		)
+
+		if syncer != nil {
+			logger.Info("executing single-shot synchronization step...")
+			stats, err := syncer.SyncPendingBatches(ctx, 50)
+			if err != nil {
+				logger.Warn("single-shot synchronization encountered error (data safely buffered locally)", slog.Any("error", err))
+			} else {
+				logger.Info("single-shot synchronization complete",
+					slog.Int("total_synced", stats.TotalSynced),
+					slog.Int("total_failed", stats.TotalFailed),
+				)
+			}
+		}
 		return
 	}
 
-	// 4. Daemon loop with graceful signal handling
+	// 5. Daemon loop with graceful signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	ticker := time.NewTicker(cfg.CollectionInterval)
-	defer ticker.Stop()
+	collectTicker := time.NewTicker(cfg.CollectionInterval)
+	defer collectTicker.Stop()
 
-	logger.Info("entering autonomous telemetry collection loop (no control plane required)")
+	var syncTicker *time.Ticker
+	if syncer != nil {
+		syncTicker = time.NewTicker(cfg.SyncInterval)
+		defer syncTicker.Stop()
+	}
+
+	logger.Info("entering autonomous telemetry collection and synchronization loop")
 
 	for {
 		select {
 		case <-sigChan:
-			logger.Info("shutdown signal received; terminating collection loop cleanly")
+			logger.Info("shutdown signal received; terminating agent loop cleanly")
 			return
-		case <-ticker.C:
+
+		case <-collectTicker.C:
 			if _, err := runCollectionStep(ctx, gen, store, logger); err != nil {
 				logger.Error("telemetry collection and persistence step failed", slog.Any("error", err))
+			} else if syncer != nil {
+				// Proactively trigger sync after new batch is persisted
+				if _, err := syncer.SyncPendingBatches(ctx, 50); err != nil {
+					logger.Debug("background sync cycle encountered transient issue", slog.Any("error", err))
+				}
+			}
+
+		case <-func() <-chan time.Time {
+			if syncTicker != nil {
+				return syncTicker.C
+			}
+			return nil
+		}():
+			if syncer != nil {
+				if _, err := syncer.SyncPendingBatches(ctx, 50); err != nil {
+					logger.Debug("periodic sync cycle encountered transient issue", slog.Any("error", err))
+				}
 			}
 		}
 	}
