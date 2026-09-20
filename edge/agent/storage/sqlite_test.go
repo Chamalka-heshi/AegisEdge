@@ -274,3 +274,155 @@ func TestSQLite_PragmasConfigured(t *testing.T) {
 		t.Errorf("expected foreign_keys 1 (ON), got %d", foreignKeys)
 	}
 }
+
+// TestSQLite_MarkBatchSynced verifies that MarkBatchSynced updates status to SYNCED and captures sent_at.
+func TestSQLite_MarkBatchSynced(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "sync_test.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	batch := newTestBatch("batch-sync-1", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, batch); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	sentAt := now.Add(500 * time.Millisecond)
+	if err := store.MarkBatchSynced(ctx, "batch-sync-1", sentAt); err != nil {
+		t.Fatalf("MarkBatchSynced failed: %v", err)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-sync-1")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != SyncStatusSynced {
+		t.Errorf("expected SYNCED, got %s", rec.SyncStatus)
+	}
+	if rec.SentAt == nil || !rec.SentAt.Equal(sentAt) {
+		t.Errorf("expected sent_at %v, got %v", sentAt, rec.SentAt)
+	}
+
+	// Should not appear in pending batches anymore
+	pending, err := store.GetPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingBatches failed: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected 0 pending batches, got %d", len(pending))
+	}
+
+	// Non-existent batch should return ErrBatchNotFound
+	if err := store.MarkBatchSynced(ctx, "non-existent", sentAt); !errors.Is(err, ErrBatchNotFound) {
+		t.Errorf("expected ErrBatchNotFound, got %v", err)
+	}
+}
+
+// TestSQLite_RecordSyncAttempt verifies that RecordSyncAttempt increments attempt count and leaves status as PENDING.
+func TestSQLite_RecordSyncAttempt(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "attempt_test.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	batch := newTestBatch("batch-attempt-1", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, batch); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	sentAt1 := now.Add(1 * time.Second)
+	if err := store.RecordSyncAttempt(ctx, "batch-attempt-1", sentAt1); err != nil {
+		t.Fatalf("RecordSyncAttempt 1 failed: %v", err)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-attempt-1")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.Attempt != 1 {
+		t.Errorf("expected attempt 1, got %d", rec.Attempt)
+	}
+	if rec.SyncStatus != SyncStatusPending {
+		t.Errorf("expected status PENDING after failed attempt, got %s", rec.SyncStatus)
+	}
+
+	// Second failed sync cycle
+	sentAt2 := now.Add(2 * time.Second)
+	if err := store.RecordSyncAttempt(ctx, "batch-attempt-1", sentAt2); err != nil {
+		t.Fatalf("RecordSyncAttempt 2 failed: %v", err)
+	}
+
+	rec, err = store.GetBatch(ctx, "batch-attempt-1")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.Attempt != 2 {
+		t.Errorf("expected attempt 2, got %d", rec.Attempt)
+	}
+	if rec.SyncStatus != SyncStatusPending {
+		t.Errorf("expected status PENDING, got %s", rec.SyncStatus)
+	}
+
+	// Non-existent batch should return ErrBatchNotFound
+	if err := store.RecordSyncAttempt(ctx, "non-existent", sentAt2); !errors.Is(err, ErrBatchNotFound) {
+		t.Errorf("expected ErrBatchNotFound, got %v", err)
+	}
+}
+
+// TestSQLite_PerNodePendingQueries verifies distinct node retrieval and per-node sequence ordering.
+func TestSQLite_PerNodePendingQueries(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "per_node_test.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	// Insert out-of-order across nodes
+	_ = store.PersistBatch(ctx, newTestBatch("batch-b-1", "node-B", 1, now.Add(1*time.Second)))
+	_ = store.PersistBatch(ctx, newTestBatch("batch-a-2", "node-A", 2, now.Add(2*time.Second)))
+	_ = store.PersistBatch(ctx, newTestBatch("batch-a-1", "node-A", 1, now))
+	_ = store.PersistBatch(ctx, newTestBatch("batch-b-2", "node-B", 2, now.Add(3*time.Second)))
+
+	nodes, err := store.GetPendingNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetPendingNodes failed: %v", err)
+	}
+	if len(nodes) != 2 || nodes[0] != "node-A" || nodes[1] != "node-B" {
+		t.Fatalf("expected ['node-A', 'node-B'], got %v", nodes)
+	}
+
+	// Get Node-A pending batches: must be strictly ordered by sequence (1 then 2)
+	pendingA, err := store.GetPendingBatchesByNode(ctx, "node-A", 10)
+	if err != nil {
+		t.Fatalf("GetPendingBatchesByNode A failed: %v", err)
+	}
+	if len(pendingA) != 2 {
+		t.Fatalf("expected 2 pending batches for Node A, got %d", len(pendingA))
+	}
+	if pendingA[0].SequenceNumber != 1 || pendingA[1].SequenceNumber != 2 {
+		t.Errorf("Node A ordering incorrect: seq %d, then seq %d", pendingA[0].SequenceNumber, pendingA[1].SequenceNumber)
+	}
+
+	// Get Node-B pending batches
+	pendingB, err := store.GetPendingBatchesByNode(ctx, "node-B", 10)
+	if err != nil {
+		t.Fatalf("GetPendingBatchesByNode B failed: %v", err)
+	}
+	if len(pendingB) != 2 {
+		t.Fatalf("expected 2 pending batches for Node B, got %d", len(pendingB))
+	}
+	if pendingB[0].SequenceNumber != 1 || pendingB[1].SequenceNumber != 2 {
+		t.Errorf("Node B ordering incorrect: seq %d, then seq %d", pendingB[0].SequenceNumber, pendingB[1].SequenceNumber)
+	}
+}

@@ -63,6 +63,22 @@ type Store interface {
 	// GetPendingBatches retrieves batches that are awaiting synchronization, ordered by sequence_number.
 	GetPendingBatches(ctx context.Context, limit int) ([]*Record, error)
 
+	// GetPendingNodes returns distinct NodeIDs with batches currently in PENDING status.
+	GetPendingNodes(ctx context.Context) ([]string, error)
+
+	// GetPendingBatchesByNode retrieves pending batches for a specific node, ordered by sequence_number ASC.
+	// This enables node-isolated synchronization pipelines.
+	GetPendingBatchesByNode(ctx context.Context, nodeID string, limit int) ([]*Record, error)
+
+	// MarkBatchSynced updates the batch's sync_status to SYNCED and sets sent_at.
+	// Returns ErrBatchNotFound if the batch does not exist.
+	MarkBatchSynced(ctx context.Context, batchID string, sentAt time.Time) error
+
+	// RecordSyncAttempt increments the logical sync attempt counter by 1 and updates sent_at,
+	// keeping sync_status as PENDING. This represents a failed synchronization cycle.
+	// Returns ErrBatchNotFound if the batch does not exist.
+	RecordSyncAttempt(ctx context.Context, batchID string, sentAt time.Time) error
+
 	// GetLatestSequenceNumber returns the highest sequence number persisted for a given node.
 	// If no records exist for the node, it returns -1.
 	GetLatestSequenceNumber(ctx context.Context, nodeID string) (int64, error)

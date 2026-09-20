@@ -299,7 +299,144 @@ func (s *SQLiteStore) GetPendingBatches(ctx context.Context, limit int) ([]*Reco
 	return results, nil
 }
 
-// GetLatestSequenceNumber returns the highest sequence number stored for the given nodeID.
+// GetPendingNodes returns distinct NodeIDs that have batches awaiting synchronization.
+func (s *SQLiteStore) GetPendingNodes(ctx context.Context) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `SELECT DISTINCT node_id FROM telemetry_batches WHERE sync_status = ? ORDER BY node_id ASC;`
+	rows, err := s.db.QueryContext(ctx, query, string(SyncStatusPending))
+	if err != nil {
+		return nil, fmt.Errorf("querying pending nodes failed: %w", err)
+	}
+	defer rows.Close()
+
+	var nodes []string
+	for rows.Next() {
+		var nodeID string
+		if err := rows.Scan(&nodeID); err != nil {
+			return nil, fmt.Errorf("scanning node_id failed: %w", err)
+		}
+		nodes = append(nodes, nodeID)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating pending nodes failed: %w", err)
+	}
+
+	return nodes, nil
+}
+
+// GetPendingBatchesByNode retrieves pending records for a specific node ordered strictly by sequence_number ASC.
+func (s *SQLiteStore) GetPendingBatchesByNode(ctx context.Context, nodeID string, limit int) ([]*Record, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `
+	SELECT 
+		batch_id,
+		node_id,
+		sequence_number,
+		collected_at,
+		sent_at,
+		attempt,
+		payload,
+		created_at,
+		sync_status
+	FROM telemetry_batches
+	WHERE sync_status = ? AND node_id = ?
+	ORDER BY sequence_number ASC
+	LIMIT ?;`
+
+	rows, err := s.db.QueryContext(ctx, query, string(SyncStatusPending), nodeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("querying pending batches for node %q failed: %w", nodeID, err)
+	}
+	defer rows.Close()
+
+	var results []*Record
+	for rows.Next() {
+		rec, err := scanRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, rec)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating pending batches for node %q failed: %w", nodeID, err)
+	}
+
+	return results, nil
+}
+
+// MarkBatchSynced updates the batch's sync_status to SYNCED and records sent_at.
+func (s *SQLiteStore) MarkBatchSynced(ctx context.Context, batchID string, sentAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	query := `UPDATE telemetry_batches SET sync_status = ?, sent_at = ? WHERE batch_id = ?;`
+	sentAtStr := sentAt.UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, query, string(SyncStatusSynced), sentAtStr, batchID)
+	if err != nil {
+		return fmt.Errorf("marking batch synced failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected failed: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrBatchNotFound
+	}
+
+	return nil
+}
+
+// RecordSyncAttempt increments the logical sync attempt counter by 1 and updates sent_at,
+// keeping sync_status as PENDING. This represents a failed logical synchronization cycle.
+func (s *SQLiteStore) RecordSyncAttempt(ctx context.Context, batchID string, sentAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	query := `UPDATE telemetry_batches SET attempt = attempt + 1, sent_at = ? WHERE batch_id = ?;`
+	sentAtStr := sentAt.UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, query, sentAtStr, batchID)
+	if err != nil {
+		return fmt.Errorf("recording sync attempt failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected failed: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrBatchNotFound
+	}
+
+	return nil
+}
+
 // If no batches exist, it returns -1.
 func (s *SQLiteStore) GetLatestSequenceNumber(ctx context.Context, nodeID string) (int64, error) {
 	s.mu.RLock()
