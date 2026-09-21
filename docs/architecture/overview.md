@@ -141,3 +141,52 @@ flowchart LR
    * `sent_at`: Recorded on the edge when transmission was attempted.
    * `ingested_at`: Appended by the control plane upon acceptance.
 7. **Phase 3 Control Plane In-Memory Limitation**: Accepted batches survive for the lifetime of the control plane process. Process restarts reset the accepted set. Because the edge maintains records in SQLite until acknowledged, a control plane restart triggers safe re-synchronization without edge data loss. Durable control-plane storage will be introduced in later phases.
+
+---
+
+## 7. Event-Driven Messaging Architecture & Ingestion Pipeline (Phase 4 Design)
+
+Phase 4 introduces an event-driven architecture using NATS to decouple edge devices from control-plane hostnames and enable multi-consumer telemetry streaming.
+
+### Component Role Distinctions
+To maintain architectural clarity throughout the platform, the messaging tiers are strictly distinguished:
+* **NATS**: The underlying publish/subscribe messaging system responsible for subject-based routing, cluster topology, and connection multiplexing.
+* **JetStream**: The durable streaming and persistence subsystem built into NATS, responsible for message storage, stream persistence, consumer offset tracking, deduplication windows (`Nats-Msg-Id`), and delivery acknowledgments (`Ack`/`Nak`/`Term`).
+* **Consumer**: The application processing component (running within the control plane or auxiliary ingestor services) responsible for fetching messages from JetStream, validating envelopes and domain objects, enforcing application-level idempotency, executing business logic, and signaling message completion.
+
+```mermaid
+flowchart TD
+    subgraph EdgeAgent ["Edge Node (AegisEdge Agent)"]
+        TG["Telemetry Generator"] --> VAL["Domain Validation"]
+        VAL --> WAL["SQLite WAL Storage Engine\n(Durable Local Boundary)"]
+        WAL --> NP["NATS Publisher Worker\n(Wrapped Event Envelope)"]
+    end
+
+    subgraph Broker ["NATS Messaging Bus"]
+        JS["JetStream Persistent Stream\naegisedge.v1.telemetry.*"]
+    end
+
+    subgraph ControlPlane ["Central Control Plane"]
+        NC["NATS Consumer Group\n(Durable Pull Consumer)"] --> ENV["Envelope & Version Validation"]
+        ENV --> DOM["Domain Validation (Validate())"]
+        DOM --> IDEM["Idempotency Filter (BatchID)"]
+        IDEM -- "New" --> COMMIT["Commit to System Store"]
+        IDEM -- "Duplicate" --> NOOP["Log & Discard Duplicate"]
+        COMMIT --> ACK["Message Ack()"]
+        NOOP --> ACK
+    end
+
+    NP -- "Publish with Nats-Msg-Id: BatchID" --> JS
+    JS -- "PubAck" --> ACKWAL["MarkBatchSynced() in SQLite"]
+    JS -- "Deliver Message" --> NC
+```
+
+### Core Architecture Invariants (Phase 4):
+1. **Persist Locally First, Publish Second**: SQLite remains the primary durability boundary for the edge node. NATS is an asynchronous distributed transport, not a replacement for local persistence. If NATS is unreachable or partitioned, batches remain safely stored in SQLite WAL according to configured SQLite durability semantics (`synchronous=NORMAL`), subject to local storage capacity limits and documented power loss guarantees.
+2. **Canonical Event Envelope**: All NATS messages wrap payloads in a standardized metadata envelope (`event_id`, `event_type`, `schema_version`, `source_node_id`, `sequence_number`, `occurred_at`, `published_at`, `correlation_id`, `payload`).
+3. **Event Identity & Deduplication**: For telemetry events, `event_id` is set identical to `batch_id`. NATS JetStream headers populate `Nats-Msg-Id: <batch_id>` for broker-side deduplication, while the control plane consumer enforces application-level idempotency by `batch_id`.
+4. **Subject Hierarchy**: Formatted as `aegisedge.v1.<domain>.<node_id>` (e.g., `aegisedge.v1.telemetry.edge-node-01`). Supports per-node partitioning, subject authorization, and wildcard subscriptions (`aegisedge.v1.telemetry.*`).
+5. **Delivery Semantics (At-Least-Once + Idempotent Processing)**: AegisEdge does not claim exactly-once delivery and instead uses at-least-once delivery with idempotent processing because retries, reconnects, and network or node failures can cause duplicate delivery.
+6. **Per-Node Sequence Ordering**: Causality is strictly maintained per-node as `(NodeID, SequenceNumber)`. No global sequence synchronization across nodes is assumed or imposed. Node A failure isolates Node A sequence progression without blocking Node B.
+7. **Transport Coexistence & Role Differentiation (No Automatic Fallback)**: The edge syncer adopts a pluggable `BatchPublisher` transport interface. At runtime, exactly one transport is active per sync worker cycle, avoiding split-brain database race conditions. Automatic runtime fallback from NATS to HTTP is **NOT implemented or implied**; when NATS connectivity is lost, telemetry remains safely buffered in local SQLite WAL according to configured durability semantics until NATS connectivity is restored. HTTP remains strictly a secondary, control-plane, and development/testing transport (for diagnostics `/healthz`, query APIs, initial device enrollment handshake, and lightweight local unit testing without an external NATS broker daemon), while NATS serves as the primary distributed streaming pipeline.
+
