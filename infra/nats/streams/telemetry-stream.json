@@ -1,0 +1,17 @@
+{
+  "name": "AEGISEDGE_TELEMETRY",
+  "description": "AegisEdge Phase 4 Telemetry Ingestion Stream",
+  "subjects": [
+    "aegisedge.v1.telemetry.*"
+  ],
+  "retention": "limits",
+  "max_consumers": -1,
+  "max_msgs": 100000,
+  "max_bytes": 536870912,
+  "max_age": 604800000000000,
+  "max_msg_size": 1048576,
+  "storage": "file",
+  "discard": "old",
+  "duplicate_window": 86400000000000,
+  "num_replicas": 1
+}
