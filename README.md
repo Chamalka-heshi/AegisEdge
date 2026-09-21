@@ -73,6 +73,9 @@ go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:80
 3. Start the control plane server on port 8080.
 4. Observe the edge agent connecting, synchronizing all pending batches in `(NodeID, SequenceNumber)` order, and updating their SQLite records to `SYNCED`.
 
+#### 4. Local NATS Development Environment (Phase 4.2 Preparation)
+A local NATS/JetStream development environment is available for Phase 4 event-driven messaging development (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). Note that application-level NATS integration is scheduled for subsequent phases; the edge agent and control plane currently communicate via Phase 3 HTTP synchronization.
+
 ### Running Tests
 To verify all modules across the Go workspace:
 
