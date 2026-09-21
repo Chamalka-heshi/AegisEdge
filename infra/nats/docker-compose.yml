@@ -1,0 +1,25 @@
+# AegisEdge Phase 4.2: Local Development NATS & JetStream Environment
+# Reference: ADR-0006 (NATS Event-Driven Messaging Architecture)
+
+services:
+  nats:
+    image: nats:2.10.26-alpine
+    container_name: aegisedge-nats
+    restart: unless-stopped
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    ports:
+      - "127.0.0.1:4222:4222"   # NATS client TCP protocol (localhost only)
+      - "127.0.0.1:8222:8222"   # HTTP monitoring & healthcheck (localhost only)
+    volumes:
+      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+volumes:
+  nats_data:
+    name: aegisedge_nats_data
