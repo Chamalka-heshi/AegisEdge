@@ -24,6 +24,10 @@ profile.out
 *.sqlite3
 data/
 
+# Local NATS development storage and logs
+infra/nats/data/
+*.log
+
 # Environment configurations and secrets
 .env
 .env.*
