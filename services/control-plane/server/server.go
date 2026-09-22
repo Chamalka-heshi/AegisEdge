@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
+
+// ErrDuplicateBatch is returned when a batch with the same BatchID has already been ingested.
+var ErrDuplicateBatch = errors.New("duplicate batch already ingested")
 
 // IngestedBatch holds a validated telemetry batch along with its control-plane ingestion timestamp.
 type IngestedBatch struct {
@@ -207,6 +211,51 @@ func (s *Server) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.ingested)
+}
+
+// IngestBatch programmatically ingests a validated telemetry batch.
+// Used by the NATS consumer to share the same in-memory idempotency boundary as HTTP.
+//
+// Returns nil on successful first ingestion.
+// Returns ErrDuplicateBatch if the batch has already been ingested (idempotent no-op).
+//
+// Limitation (Phase 4.3):
+// Duplicate detection is idempotent during the lifetime of the current control-plane process.
+// Persistent duplicate detection across control-plane restarts is NOT provided by the
+// current in-memory ingestion boundary and is deferred to a future persistent ingestion layer.
+func (s *Server) IngestBatch(_ context.Context, batch *types.TelemetryBatch) error {
+	if err := batch.Validate(); err != nil {
+		return fmt.Errorf("batch validation failed: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.ingested[batch.BatchID]; exists {
+		s.logger.Info("duplicate batch ingestion (idempotent no-op via NATS consumer)",
+			slog.String("batch_id", batch.BatchID),
+			slog.String("node_id", batch.NodeID),
+		)
+		return ErrDuplicateBatch
+	}
+
+	ingestedAt := time.Now().UTC()
+	record := &IngestedBatch{
+		Batch:      *batch,
+		IngestedAt: ingestedAt,
+	}
+
+	s.ingested[batch.BatchID] = record
+	s.ingestedList = append(s.ingestedList, record)
+
+	s.logger.Info("telemetry batch ingested via NATS consumer",
+		slog.String("batch_id", batch.BatchID),
+		slog.String("node_id", batch.NodeID),
+		slog.Int64("sequence_number", batch.SequenceNumber),
+		slog.Time("ingested_at", ingestedAt),
+	)
+
+	return nil
 }
 
 // writeJSON writes a structured JSON response with proper Content-Type header.
