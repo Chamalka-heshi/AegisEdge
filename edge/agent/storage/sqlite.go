@@ -141,6 +141,19 @@ func (s *SQLiteStore) runMigrations() error {
 		}
 	}
 
+	// 4. Migration v2: published_at column for NATS JetStream PUBLISHED state
+	if currentVersion < 2 {
+		addPublishedAt := `ALTER TABLE telemetry_batches ADD COLUMN published_at TEXT;`
+		if _, err := tx.ExecContext(ctx, addPublishedAt); err != nil {
+			return fmt.Errorf("migration v2 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v2: %w", err)
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -424,6 +437,34 @@ func (s *SQLiteStore) RecordSyncAttempt(ctx context.Context, batchID string, sen
 	res, err := s.db.ExecContext(ctx, query, sentAtStr, batchID)
 	if err != nil {
 		return fmt.Errorf("recording sync attempt failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected failed: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrBatchNotFound
+	}
+
+	return nil
+}
+
+// MarkBatchPublished updates the batch's sync_status to PUBLISHED and records published_at.
+// This indicates that a NATS JetStream PubAck was successfully received.
+func (s *SQLiteStore) MarkBatchPublished(ctx context.Context, batchID string, publishedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	query := `UPDATE telemetry_batches SET sync_status = ?, published_at = ? WHERE batch_id = ?;`
+	publishedAtStr := publishedAt.UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, query, string(SyncStatusPublished), publishedAtStr, batchID)
+	if err != nil {
+		return fmt.Errorf("marking batch published failed: %w", err)
 	}
 
 	rowsAffected, err := res.RowsAffected()

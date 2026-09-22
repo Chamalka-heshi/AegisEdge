@@ -426,3 +426,144 @@ func TestSQLite_PerNodePendingQueries(t *testing.T) {
 		t.Errorf("Node B ordering incorrect: seq %d, then seq %d", pendingB[0].SequenceNumber, pendingB[1].SequenceNumber)
 	}
 }
+
+// TestSQLite_MarkBatchPublished verifies the PUBLISHED sync status for NATS JetStream.
+func TestSQLite_MarkBatchPublished(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "published.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	batch := newTestBatch("batch-pub-1", "node-pub", 1, now)
+	if err := store.PersistBatch(ctx, batch); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	// Verify initial status is PENDING
+	rec, err := store.GetBatch(ctx, "batch-pub-1")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != SyncStatusPending {
+		t.Fatalf("expected PENDING, got %s", rec.SyncStatus)
+	}
+
+	// Mark as PUBLISHED
+	publishedAt := now.Add(10 * time.Second)
+	if err := store.MarkBatchPublished(ctx, "batch-pub-1", publishedAt); err != nil {
+		t.Fatalf("MarkBatchPublished failed: %v", err)
+	}
+
+	// Verify status is now PUBLISHED
+	rec, err = store.GetBatch(ctx, "batch-pub-1")
+	if err != nil {
+		t.Fatalf("GetBatch after publish failed: %v", err)
+	}
+	if rec.SyncStatus != SyncStatusPublished {
+		t.Errorf("expected PUBLISHED, got %s", rec.SyncStatus)
+	}
+}
+
+// TestSQLite_PublishedExcludedFromPending verifies that PUBLISHED batches
+// are not returned by GetPendingBatches or GetPendingBatchesByNode.
+func TestSQLite_PublishedExcludedFromPending(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "published_excluded.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+
+	// Persist 3 batches
+	for i := int64(1); i <= 3; i++ {
+		batch := newTestBatch("batch-excl-"+string(rune('0'+i)), "node-excl", i, now.Add(time.Duration(i)*time.Second))
+		_ = store.PersistBatch(ctx, batch)
+	}
+
+	// Mark batch 2 as PUBLISHED
+	_ = store.MarkBatchPublished(ctx, "batch-excl-1", now)
+
+	// Mark batch 3 as SYNCED (HTTP path)
+	_ = store.MarkBatchSynced(ctx, "batch-excl-2", now)
+
+	// Only batch 3 (seq=3) should be pending
+	pending, err := store.GetPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingBatches failed: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending, got %d", len(pending))
+	}
+	if pending[0].BatchID != "batch-excl-3" {
+		t.Errorf("expected batch-excl-3 as pending, got %s", pending[0].BatchID)
+	}
+
+	// GetPendingBatchesByNode should also exclude PUBLISHED
+	pendingByNode, err := store.GetPendingBatchesByNode(ctx, "node-excl", 10)
+	if err != nil {
+		t.Fatalf("GetPendingBatchesByNode failed: %v", err)
+	}
+	if len(pendingByNode) != 1 {
+		t.Fatalf("expected 1 pending by node, got %d", len(pendingByNode))
+	}
+
+	// GetPendingNodes should still return node-excl (because batch 3 is still pending)
+	nodes, err := store.GetPendingNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetPendingNodes failed: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0] != "node-excl" {
+		t.Errorf("expected ['node-excl'], got %v", nodes)
+	}
+}
+
+// TestSQLite_MarkBatchPublished_NotFound verifies error for non-existent batch.
+func TestSQLite_MarkBatchPublished_NotFound(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "pub_notfound.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	err = store.MarkBatchPublished(ctx, "nonexistent-batch", time.Now().UTC())
+	if !errors.Is(err, ErrBatchNotFound) {
+		t.Errorf("expected ErrBatchNotFound, got %v", err)
+	}
+}
+
+// TestSQLite_MigrationV2_PublishedAt verifies that migration v2 adds the published_at column.
+func TestSQLite_MigrationV2_PublishedAt(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "migration_v2.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// Verify schema_migrations has version 2
+	var maxVersion int
+	err = store.db.QueryRowContext(ctx, "SELECT MAX(version) FROM schema_migrations;").Scan(&maxVersion)
+	if err != nil {
+		t.Fatalf("failed to query schema version: %v", err)
+	}
+	if maxVersion < 2 {
+		t.Errorf("expected schema version >= 2, got %d", maxVersion)
+	}
+
+	// Verify published_at column exists by querying it
+	_, err = store.db.ExecContext(ctx, "SELECT published_at FROM telemetry_batches LIMIT 1;")
+	if err != nil {
+		t.Errorf("published_at column query failed: %v", err)
+	}
+}
+

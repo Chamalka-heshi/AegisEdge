@@ -20,16 +20,17 @@ var (
 type SyncStatus string
 
 const (
-	SyncStatusPending SyncStatus = "PENDING"
-	SyncStatusSyncing SyncStatus = "SYNCING"
-	SyncStatusSynced  SyncStatus = "SYNCED"
-	SyncStatusFailed  SyncStatus = "FAILED"
+	SyncStatusPending   SyncStatus = "PENDING"
+	SyncStatusSyncing   SyncStatus = "SYNCING"
+	SyncStatusSynced    SyncStatus = "SYNCED"
+	SyncStatusFailed    SyncStatus = "FAILED"
+	SyncStatusPublished SyncStatus = "PUBLISHED"
 )
 
 // IsValid checks whether the sync status is recognized.
 func (s SyncStatus) IsValid() bool {
 	switch s {
-	case SyncStatusPending, SyncStatusSyncing, SyncStatusSynced, SyncStatusFailed:
+	case SyncStatusPending, SyncStatusSyncing, SyncStatusSynced, SyncStatusFailed, SyncStatusPublished:
 		return true
 	default:
 		return false
@@ -78,6 +79,11 @@ type Store interface {
 	// keeping sync_status as PENDING. This represents a failed synchronization cycle.
 	// Returns ErrBatchNotFound if the batch does not exist.
 	RecordSyncAttempt(ctx context.Context, batchID string, sentAt time.Time) error
+
+	// MarkBatchPublished updates the batch's sync_status to PUBLISHED and sets published_at.
+	// This indicates a successful NATS JetStream PubAck was received.
+	// Returns ErrBatchNotFound if the batch does not exist.
+	MarkBatchPublished(ctx context.Context, batchID string, publishedAt time.Time) error
 
 	// GetLatestSequenceNumber returns the highest sequence number persisted for a given node.
 	// If no records exist for the node, it returns -1.
