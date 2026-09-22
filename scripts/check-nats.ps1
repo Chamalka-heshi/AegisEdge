@@ -80,15 +80,15 @@ try {
     $streamFound = $false
     if ($jsz.account_details) {
         foreach ($acc in $jsz.account_details) {
-            if ($acc.streams) {
-                foreach ($str in $acc.streams) {
+            if ($acc.stream_detail) {
+                foreach ($str in $acc.stream_detail) {
                     if ($str.name -eq $StreamName) {
                         $streamFound = $true
                         Write-Host "  [OK] Stream '$StreamName' found." -ForegroundColor Green
-                        Write-Host "  Subjects:       $($str.config.subjects -join ', ')" -ForegroundColor Green
-                        Write-Host "  Storage Type:   $($str.config.storage)" -ForegroundColor Green
+                        Write-Host "  Created:        $($str.created)" -ForegroundColor Green
                         Write-Host "  Messages:       $($str.state.messages)" -ForegroundColor Green
                         Write-Host "  Bytes:          $($str.state.bytes)" -ForegroundColor Green
+                        Write-Host "  Consumers:      $($str.state.consumer_count)" -ForegroundColor Green
                     }
                 }
             }
@@ -97,11 +97,97 @@ try {
     
     if (-not $streamFound) {
         Write-Host "  [INFO] Stream '$StreamName' is not yet provisioned." -ForegroundColor Yellow
-        Write-Host "  Provision using: infra/nats/streams/telemetry-stream.json or NATS CLI." -ForegroundColor Yellow
+        Write-Host "  Provision using: scripts/provision-streams.ps1 or NATS CLI." -ForegroundColor Yellow
     }
 } catch {
     Write-Host "  [ERROR] Failed to query /jsz: $_" -ForegroundColor Red
     exit 1
+}
+
+# 6. Query stream configuration via NATS protocol (if stream was found)
+if ($streamFound) {
+    Write-Host "`n==> 6. Querying Stream Configuration via NATS Protocol..." -ForegroundColor Cyan
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $ClientPort)
+        $netStream = $tcp.GetStream()
+        $netStream.ReadTimeout = 5000
+        $enc = [System.Text.UTF8Encoding]::new($false)
+        $rdr = New-Object System.IO.StreamReader($netStream, $enc)
+        $wtr = New-Object System.IO.StreamWriter($netStream, $enc)
+        $wtr.NewLine = "`r`n"
+        $wtr.AutoFlush = $true
+
+        # Read INFO, send CONNECT
+        $rdr.ReadLine() | Out-Null
+        $wtr.WriteLine('CONNECT {"verbose":false,"pedantic":false,"lang":"powershell","version":"1.0.0"}')
+
+        # Subscribe to reply inbox
+        $inbox = "_INBOX.check.$([guid]::NewGuid().ToString('N'))"
+        $wtr.WriteLine("SUB $inbox 1")
+
+        # Request stream info
+        $reqPayload = "{`"name`":`"$StreamName`"}"
+        $reqBytes = [System.Text.Encoding]::UTF8.GetBytes($reqPayload)
+        $wtr.WriteLine("PUB `$JS.API.STREAM.INFO.$StreamName $inbox $($reqBytes.Length)")
+        $wtr.Write($reqPayload)
+        $wtr.WriteLine("")
+        $wtr.WriteLine("PING")
+
+        # Read response
+        $deadline = (Get-Date).AddSeconds(3)
+        $streamInfo = ""
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 200
+            while ($netStream.DataAvailable) {
+                $line = $rdr.ReadLine()
+                if ($line -match "^MSG\s") {
+                    $parts = $line -split "\s+"
+                    $pLen = [int]$parts[$parts.Length - 1]
+                    if ($pLen -gt 0) {
+                        $buf = New-Object char[] $pLen
+                        $read = 0
+                        while ($read -lt $pLen) {
+                            $n = $rdr.Read($buf, $read, $pLen - $read)
+                            if ($n -le 0) { break }
+                            $read += $n
+                        }
+                        $streamInfo = New-Object string(,$buf)
+                        $rdr.ReadLine() | Out-Null
+                    }
+                    break
+                }
+            }
+            if ($streamInfo) { break }
+        }
+        $tcp.Close()
+
+        if ($streamInfo) {
+            $info = $streamInfo | ConvertFrom-Json
+            if ($info.config) {
+                $cfg = $info.config
+                Write-Host "  Stream Name:      $($cfg.name)" -ForegroundColor Green
+                Write-Host "  Subjects:         $($cfg.subjects -join ', ')" -ForegroundColor Green
+                Write-Host "  Storage:          $($cfg.storage)" -ForegroundColor Green
+                Write-Host "  Retention:        $($cfg.retention)" -ForegroundColor Green
+                Write-Host "  Replicas:         $($cfg.num_replicas)" -ForegroundColor Green
+                Write-Host "  Max Messages:     $($cfg.max_msgs)" -ForegroundColor Green
+                Write-Host "  Max Bytes:        $($cfg.max_bytes)" -ForegroundColor Green
+
+                # Convert nanoseconds to human-readable
+                $maxAgeDays = [math]::Round($cfg.max_age / 86400000000000, 1)
+                Write-Host "  Max Age:          $($cfg.max_age) ns ($maxAgeDays days)" -ForegroundColor Green
+                Write-Host "  Max Msg Size:     $($cfg.max_msg_size) bytes ($([math]::Round($cfg.max_msg_size / 1048576, 1)) MB)" -ForegroundColor Green
+                Write-Host "  Discard Policy:   $($cfg.discard_policy)" -ForegroundColor Green
+
+                $dupWindowHrs = [math]::Round($cfg.duplicate_window / 3600000000000, 1)
+                Write-Host "  Dup Window:       $($cfg.duplicate_window) ns ($dupWindowHrs hours)" -ForegroundColor Green
+            }
+        } else {
+            Write-Host "  [WARN] Could not query stream config via NATS protocol." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  [WARN] Stream config query failed: $_" -ForegroundColor Yellow
+    }
 }
 
 Write-Host "`n==> Phase 4.2 NATS environment verification completed successfully!" -ForegroundColor Green
