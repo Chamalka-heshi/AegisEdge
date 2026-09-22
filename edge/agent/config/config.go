@@ -12,6 +12,8 @@ const (
 	DefaultCollectionInterval = 5 * time.Second
 	DefaultControlPlaneURL    = "http://localhost:8080"
 	DefaultSyncInterval       = 5 * time.Second
+	DefaultNATSURL            = "nats://127.0.0.1:4222"
+	DefaultNATSPublishTimeout = 5 * time.Second
 )
 
 // Config represents runtime configuration parameters for the edge agent.
@@ -23,6 +25,9 @@ type Config struct {
 	SyncInterval       time.Duration
 	SyncEnabled        bool
 	RunOnce            bool
+	NATSEnabled        bool
+	NATSURL            string
+	NATSPublishTimeout time.Duration
 }
 
 // LoadFromEnv loads configuration from environment variables, falling back to sensible defaults.
@@ -63,6 +68,25 @@ func LoadFromEnv() Config {
 		}
 	}
 
+	natsEnabled := false
+	if natsEnabledStr := strings.TrimSpace(os.Getenv("NATS_ENABLED")); natsEnabledStr != "" {
+		if strings.ToLower(natsEnabledStr) == "true" || natsEnabledStr == "1" {
+			natsEnabled = true
+		}
+	}
+
+	natsURL := strings.TrimSpace(os.Getenv("NATS_URL"))
+	if natsURL == "" {
+		natsURL = DefaultNATSURL
+	}
+
+	natsPublishTimeout := DefaultNATSPublishTimeout
+	if natsTimeoutStr := strings.TrimSpace(os.Getenv("NATS_PUBLISH_TIMEOUT")); natsTimeoutStr != "" {
+		if parsed, err := time.ParseDuration(natsTimeoutStr); err == nil && parsed > 0 {
+			natsPublishTimeout = parsed
+		}
+	}
+
 	return Config{
 		NodeID:             nodeID,
 		DatabasePath:       dbPath,
@@ -71,5 +95,9 @@ func LoadFromEnv() Config {
 		SyncInterval:       syncInterval,
 		SyncEnabled:        syncEnabled,
 		RunOnce:            false,
+		NATSEnabled:        natsEnabled,
+		NATSURL:            natsURL,
+		NATSPublishTimeout: natsPublishTimeout,
 	}
 }
+

@@ -106,8 +106,34 @@ func main() {
 	// 4. Initialize synchronization pipeline (if enabled)
 	var syncer *sync.Syncer
 	if cfg.SyncEnabled {
-		client := sync.NewHTTPClient(cfg.ControlPlaneURL, sync.WithLogger(logger))
-		syncer = sync.NewSyncer(store, client, logger)
+		if cfg.NATSEnabled {
+			// NATS JetStream transport
+			publisher, err := sync.NewNATSPublisher(sync.NATSPublisherConfig{
+				URL:            cfg.NATSURL,
+				PublishTimeout: cfg.NATSPublishTimeout,
+			}, logger)
+			if err != nil {
+				logger.Error("failed to initialize NATS publisher", slog.Any("error", err))
+				os.Exit(1)
+			}
+			defer func() {
+				logger.Info("closing NATS publisher...")
+				if err := publisher.Close(); err != nil {
+					logger.Error("error closing NATS publisher", slog.Any("error", err))
+				}
+			}()
+			syncer = sync.NewSyncerWithPublisher(store, publisher, logger)
+			logger.Info("synchronization transport: NATS JetStream",
+				slog.String("nats_url", cfg.NATSURL),
+			)
+		} else {
+			// HTTP transport (existing Phase 3)
+			client := sync.NewHTTPClient(cfg.ControlPlaneURL, sync.WithLogger(logger))
+			syncer = sync.NewSyncer(store, client, logger)
+			logger.Info("synchronization transport: HTTP",
+				slog.String("control_plane_url", cfg.ControlPlaneURL),
+			)
+		}
 	}
 
 	// If run-once mode was requested, execute single collection step and sync attempt
