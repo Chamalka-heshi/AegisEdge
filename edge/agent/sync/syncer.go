@@ -189,4 +189,3 @@ func (s *Syncer) SyncPendingBatches(ctx context.Context, limitPerNode int) (*Syn
 
 	return stats, nil
 }
-
