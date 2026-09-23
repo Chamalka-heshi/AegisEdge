@@ -100,4 +100,3 @@ func LoadFromEnv() Config {
 		NATSPublishTimeout: natsPublishTimeout,
 	}
 }
-
