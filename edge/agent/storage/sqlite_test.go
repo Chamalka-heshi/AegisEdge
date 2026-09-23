@@ -566,4 +566,3 @@ func TestSQLite_MigrationV2_PublishedAt(t *testing.T) {
 		t.Errorf("published_at column query failed: %v", err)
 	}
 }
-
