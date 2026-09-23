@@ -124,4 +124,3 @@ func main() {
 	}
 	logger.Info("control plane server stopped successfully")
 }
-
