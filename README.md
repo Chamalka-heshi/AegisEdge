@@ -46,6 +46,8 @@ Key architectural decisions are formally documented in `docs/decisions/`:
 * [ADR-0004: Edge-Local Persistence and WAL Durability](docs/decisions/ADR-0004-edge-local-persistence-and-wal-durability.md)
 * [ADR-0005: Edge-to-Control-Plane HTTP Synchronization and Offline Recovery](docs/decisions/ADR-0005-edge-to-control-plane-http-synchronization.md)
 * [ADR-0006: NATS Event-Driven Messaging Architecture and Ingestion Pipeline](docs/decisions/ADR-0006-nats-event-driven-messaging.md)
+* [ADR-0007: NATS JetStream Application Integration](docs/decisions/ADR-0007-nats-jetstream-application-integration.md)
+* [ADR-0008: NATS JetStream Resilience, Redelivery, and Recovery Design](docs/decisions/ADR-0008-nats-resilience-and-recovery.md)
 
 ---
 
@@ -73,8 +75,8 @@ go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:80
 3. Start the control plane server on port 8080.
 4. Observe the edge agent connecting, synchronizing all pending batches in `(NodeID, SequenceNumber)` order, and updating their SQLite records to `SYNCED`.
 
-#### 4. Local NATS Development Environment (Phase 4.2 Preparation)
-A local NATS/JetStream development environment is available for Phase 4 event-driven messaging development (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). Note that application-level NATS integration is scheduled for subsequent phases; the edge agent and control plane currently communicate via Phase 3 HTTP synchronization.
+#### 4. Event-Driven Messaging via NATS JetStream (Phase 4.3 & 4.4)
+A local NATS/JetStream development environment is available (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). In Phase 4.3, full application-level NATS integration was completed (`NATS_ENABLED=true`), enabling `SQLite -> PENDING -> NATS JetStream -> PubAck -> PUBLISHED -> Consumer -> Idempotent Ingestion -> ACK`. Phase 4.4 formalizes the comprehensive resilience, redelivery, and failure recovery design in [`ADR-0008`](docs/decisions/ADR-0008-nats-resilience-and-recovery.md).
 
 ### Running Tests
 To verify all modules across the Go workspace:

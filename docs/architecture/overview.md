@@ -177,7 +177,7 @@ flowchart TD
     end
 
     NP -- "Publish with Nats-Msg-Id: BatchID" --> JS
-    JS -- "PubAck" --> ACKWAL["MarkBatchSynced() in SQLite"]
+    JS -- "PubAck" --> ACKWAL["MarkBatchPublished() in SQLite\n(Status: PUBLISHED)"]
     JS -- "Deliver Message" --> NC
 ```
 
@@ -189,4 +189,44 @@ flowchart TD
 5. **Delivery Semantics (At-Least-Once + Idempotent Processing)**: AegisEdge does not claim exactly-once delivery and instead uses at-least-once delivery with idempotent processing because retries, reconnects, and network or node failures can cause duplicate delivery.
 6. **Per-Node Sequence Ordering**: Causality is strictly maintained per-node as `(NodeID, SequenceNumber)`. No global sequence synchronization across nodes is assumed or imposed. Node A failure isolates Node A sequence progression without blocking Node B.
 7. **Transport Coexistence & Role Differentiation (No Automatic Fallback)**: The edge syncer adopts a pluggable `BatchPublisher` transport interface. At runtime, exactly one transport is active per sync worker cycle, avoiding split-brain database race conditions. Automatic runtime fallback from NATS to HTTP is **NOT implemented or implied**; when NATS connectivity is lost, telemetry remains safely buffered in local SQLite WAL according to configured durability semantics until NATS connectivity is restored. HTTP remains strictly a secondary, control-plane, and development/testing transport (for diagnostics `/healthz`, query APIs, initial device enrollment handshake, and lightweight local unit testing without an external NATS broker daemon), while NATS serves as the primary distributed streaming pipeline.
+
+---
+
+## 8. Resilience, Redelivery, and Recovery Architecture (Phase 4.4)
+
+Phase 4.4 (formally defined in [ADR-0008](docs/decisions/ADR-0008-nats-resilience-and-recovery.md)) establishes the comprehensive failure, recovery, and redelivery design for the event pipeline:
+
+```mermaid
+flowchart TD
+    subgraph EdgeBoundary ["Edge Durability Boundary"]
+        EB_COL["Generate & Validate"] --> EB_SQL["Persist to SQLite WAL\n(sync_status: PENDING)"]
+    end
+
+    subgraph TransportBoundary ["NATS JetStream Transport Boundary"]
+        EB_SQL -- "BatchPublisher.PublishBatch()" --> TB_JS["JetStream Stream AEGISEDGE_TELEMETRY\n(Limits: 7d, 512MB, 100k msgs)"]
+        TB_JS -- "PubAck (Stream Seq)" --> EB_ACK["MarkBatchPublished()\n(sync_status: PUBLISHED)"]
+        TB_JS -. "PubAck Timeout / NAK" .-> EB_FAIL["RecordSyncAttempt()\n(attempt += 1, remains PENDING)"]
+    end
+
+    subgraph ConsumerBoundary ["Control Plane Ingestion Boundary"]
+        TB_JS -- "Fetch / Deliver" --> CB_CONS["Telemetry Consumer\n(Pull Subscription)"]
+        CB_CONS --> CB_VAL["Envelope & Schema Validation"]
+        CB_VAL --> CB_IDEM{"Idempotency Filter\n(BatchID Map)"}
+        CB_IDEM -- "New Batch" --> CB_STORE["Ingest to Store"]
+        CB_IDEM -- "Duplicate" --> CB_LOG["Log Idempotent No-Op"]
+        CB_STORE --> CB_ACK["Explicit msg.Ack()"]
+        CB_LOG --> CB_ACK
+        CB_VAL -- "Processing Failure" --> CB_NAK["msg.Nak()\n(Allow Redelivery)"]
+    end
+```
+
+### Core Resilience Principles:
+1. **Clear Boundary Separation**:
+   * **Local Durability**: Governed by SQLite WAL commits (`synchronous=NORMAL`). Survives agent restarts and clean reboots.
+   * **Broker Buffering**: Governed by JetStream file-backed stream retention (`limits`, 7-day age, 512 MB bytes, 100,000 messages).
+   * **Consumer Idempotency**: Governed by `BatchID` equality. Prevents duplicate state mutation on redeliveries.
+2. **The Two-Phase Publish Window**: If JetStream returns a `PubAck` but the local `MarkBatchPublished()` call fails (e.g. disk full), the edge preserves `PENDING` and republishes on the next cycle. The identical `BatchID`/`EventID` allows JetStream deduplication (within its 24-hour window) and the consumer's idempotency filter to suppress duplicate state mutation.
+3. **Consumer ACK Discipline**: Messages are acknowledged **only after** successful application ingestion or when recognized as an idempotent duplicate. Processing failures trigger `Nak()`, enabling broker-managed redelivery.
+4. **Per-Node Sequence Isolation**: Sequence progression is strictly bounded by `(NodeID, SequenceNumber)`. A transient failure on Node A sequence $N$ halts subsequent batches for Node A to prevent sequence gaps, while Node B continues synchronizing without interruption.
+
 
