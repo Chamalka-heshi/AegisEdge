@@ -229,4 +229,66 @@ flowchart TD
 3. **Consumer ACK Discipline**: Messages are acknowledged **only after** successful application ingestion or when recognized as an idempotent duplicate. Processing failures trigger `Nak()`, enabling broker-managed redelivery.
 4. **Per-Node Sequence Isolation**: Sequence progression is strictly bounded by `(NodeID, SequenceNumber)`. A transient failure on Node A sequence $N$ halts subsequent batches for Node A to prevent sequence gaps, while Node B continues synchronizing without interruption.
 
+---
+
+## 9. Edge Anomaly Detection Architecture (Phase 5.1 Design)
+
+Phase 5.1 (formally defined in [ADR-0009](docs/decisions/ADR-0009-edge-anomaly-detection.md)) establishes the comprehensive architecture and design for edge-local anomaly detection and autonomous incident lifecycle evaluation.
+
+> [!IMPORTANT]
+> **Phase 5.1 Scope Boundary**: This phase is **ARCHITECTURE AND DESIGN ONLY**.
+> No detector implementation code, no ML models, no Python runtimes or ML dependencies (`TensorFlow`, `PyTorch`, `scikit-learn`, `NumPy`, `pandas`), no SQLite schema changes, and no autonomous remediation actions are introduced in this phase.
+
+### 9.1 The Decoupled Edge Intelligence Pipeline
+
+The anomaly detection subsystem enforces strict decoupling across four primary stages:
+
+$$\text{Telemetry} \longrightarrow \text{Local Anomaly Detection} \longrightarrow \text{Incident Engine} \longrightarrow \text{Safe Response}$$
+
+```mermaid
+flowchart TD
+    TEL["Telemetry Collection\n(Metrics Collector & SQLite WAL)"] --> DET["Local Anomaly Detection\n(Evaluates Deviation & AnomalyScore)"]
+    DET --> INC["Incident Engine\n(State Machine & Policy Evaluation)"]
+    INC --> SAFE["Safe Response\n(Allowlisted Simulated Actuators)"]
+```
+
+### 9.2 Layered Detection Strategy & Roadmap
+
+AegisEdge adopts a three-tier layered intelligence strategy unified behind a single `AnomalyDetector` conceptual interface:
+
+1. **Layer 1: Deterministic Threshold Rules (Target: Phase 5.2)**: Static bounds checking ($O(1)$ evaluation) for hard resource saturation (`cpu > 90%`, `disk > 95%`, `memory > 92%`). Zero ML dependencies, fully deterministic, instant evaluation. *(Initial design examples — not empirically validated production thresholds.)*
+2. **Layer 2: Rolling Statistical Anomaly Detection (Target: Future Phase 5.4)**: Sliding-window statistical tracking (EWMA, rolling z-score drift $|Z| \ge 3.0$, and rate-of-change $\frac{\Delta y}{\Delta t}$). Detects progressive resource leaks, sudden spikes, and trend shifts without hardcoded static limits. *(Initial design examples — not empirically validated production thresholds.)*
+3. **Layer 3: Lightweight Edge ML Inference (Target: Future Phase 5.5)**: Compact multi-variate unsupervised models (Isolation Forest / Autoencoder / ONNX) trained centrally in the cloud/control plane and executed locally at the edge for complex cross-metric correlations.
+
+### 9.3 False-Positive Suppression Pipeline (Design Specification)
+
+To prevent transient system spikes (cron jobs, GC pauses, network reconnects) from generating alert storms:
+
+```mermaid
+flowchart TD
+    RAW["Raw Anomaly Detected"] --> CONSEC{"Consecutive Violations\n>= N Ticks? (Example: N=3)"}
+    CONSEC -- "No" --> SUPP1["Suppress (Remain NORMAL)"]
+    CONSEC -- "Yes" --> COOLDOWN{"Cooldown Elapsed?\n(Example: >= 60s)"}
+    COOLDOWN -- "No" --> SUPP2["Suppress Alert Storm"]
+    COOLDOWN -- "Yes" --> HYST{"Exceeds Trigger Threshold\n(Example: CPU > 85%)"}
+    HYST -- "Yes" --> FIRE["Trigger Incident\nStatus: ANOMALY_DETECTED"]
+    FIRE --> RECOV{"Metric Below Recovery\nThreshold (Example: CPU < 70%)\nfor M Ticks? (Example: M=3)"}
+    RECOV -- "Yes" --> RESOLVE["Transition to RECOVERED\nSet ResolvedAt"]
+```
+
+> [!NOTE]
+> The suppression parameters below are **initial design examples — not empirically validated production thresholds**. They do not guarantee the elimination of false positives under real physical workloads.
+
+* **Consecutive Violations ($N$)**: An anomaly must persist for $N$ consecutive ticks (design example: 3) before an incident is created.
+* **Hysteresis**: Distinct trigger ($\theta_{\text{trigger}} = 85\%$) and recovery ($\theta_{\text{recover}} = 70\%$) thresholds mitigate flapping.
+* **Recovery Persistence ($M$)**: Normalization must persist for $M$ consecutive ticks (design example: 3) before transitioning to `RECOVERED`.
+* **Cooldown Window**: An enforced cooldown interval (design example: 60s) prevents immediate re-triggering of the same rule.
+
+### 9.4 Core Architectural Invariants:
+1. **Detection $\neq$ Mitigation**: The detection subsystem is an observer only. It produces detection results and incident events and never executes shell commands, kills processes, or alters system configurations.
+2. **Network-Independent Local Detection**: The detection engine is architecturally designed to operate without NATS, HTTP, cloud, or control-plane availability, subject to local compute, memory, storage, and process availability.
+3. **Safety Boundary: Detection Performs No Host Mutation**: An architectural constraint requiring zero OS command executions, zero process terminations, and zero network modifications.
+4. **Durability Option A (Future Design)**: Incidents will be persisted in a dedicated SQLite table (`edge_incidents`) physically separate from high-frequency telemetry. Durable incident persistence does not currently exist; schema migrations are deferred to a future incident phase.
+5. **Stable Identity & Causality**: Incidents will generate immutable UUIDv4 identifiers upon creation; they do not reuse telemetry `BatchID` values or telemetry `SequenceNumber` counters.
+
 
