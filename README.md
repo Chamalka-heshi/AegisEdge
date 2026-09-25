@@ -48,6 +48,7 @@ Key architectural decisions are formally documented in `docs/decisions/`:
 * [ADR-0006: NATS Event-Driven Messaging Architecture and Ingestion Pipeline](docs/decisions/ADR-0006-nats-event-driven-messaging.md)
 * [ADR-0007: NATS JetStream Application Integration](docs/decisions/ADR-0007-nats-jetstream-application-integration.md)
 * [ADR-0008: NATS JetStream Resilience, Redelivery, and Recovery Design](docs/decisions/ADR-0008-nats-resilience-and-recovery.md)
+* [ADR-0009: Edge Anomaly Detection Architecture & Design](docs/decisions/ADR-0009-edge-anomaly-detection.md)
 
 ---
 
@@ -77,6 +78,9 @@ go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:80
 
 #### 4. Event-Driven Messaging via NATS JetStream (Phase 4.3 & 4.4)
 A local NATS/JetStream development environment is available (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). In Phase 4.3, full application-level NATS integration was completed (`NATS_ENABLED=true`), enabling `SQLite -> PENDING -> NATS JetStream -> PubAck -> PUBLISHED -> Consumer -> Idempotent Ingestion -> ACK`. Phase 4.4 formalizes the comprehensive resilience, redelivery, and failure recovery design in [`ADR-0008`](docs/decisions/ADR-0008-nats-resilience-and-recovery.md).
+
+#### 5. Edge Anomaly Detection Architecture (Phase 5.1 Design)
+Phase 5.1 establishes the formal architecture and design for edge anomaly detection (see [`ADR-0009`](docs/decisions/ADR-0009-edge-anomaly-detection-architecture.md)). This phase is **DESIGN ONLY**; implementation of the Layer 1 deterministic threshold detector is planned for Phase 5.2, with Layer 2 rolling statistical detection deferred to future Phase 5.4. No ML dependencies or schema modifications are introduced.
 
 ### Running Tests
 To verify all modules across the Go workspace:
