@@ -354,6 +354,7 @@ To operate the NATS pipeline reliably in production, the following metrics and s
 2. **Finite Storage Limits**: The edge agent does not possess infinite durability. If disconnected indefinitely, local storage capacity will eventually be exhausted.
 3. **In-Memory Ingestion Boundary in Phase 4.3**: Control-plane duplicate detection is currently bounded by the lifetime of the Go process. A control-plane restart wipes the deduplication cache.
 4. **Non-Clustered Broker**: The current development environment runs a single NATS server without clustering or multi-datacenter replication.
+5. **Finite Broker Deduplication Window**: JetStream duplicate suppression is bounded by the 24-hour window (`duplicate_window`). Retries occurring after 24 hours of disconnection will not be deduplicated at the broker tier.
 
 ---
 
