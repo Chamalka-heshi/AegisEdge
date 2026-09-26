@@ -486,3 +486,53 @@ func DefaultDeterministicAnomalyID(nodeID, metricName, version string, timestamp
 		b[10:16],
 	), nil
 }
+
+// DefaultRules returns standard baseline threshold rules for generated edge telemetry.
+func DefaultRules() []ThresholdRule {
+	highCPU := 90.0
+	recCPU := 80.0
+	expCPU := 50.0
+
+	highMem := 90.0
+	recMem := 80.0
+	expMem := 60.0
+
+	highDisk := 90.0
+	recDisk := 85.0
+	expDisk := 40.0
+
+	highTemp := 85.0
+	recTemp := 75.0
+	expTemp := 50.0
+
+	return []ThresholdRule{
+		{
+			MetricName:             "cpu_usage_percent",
+			UpperThreshold:         &highCPU,
+			UpperRecoveryThreshold: &recCPU,
+			ExpectedValue:          &expCPU,
+			DisallowNegative:       true,
+		},
+		{
+			MetricName:             "memory_usage_percent",
+			UpperThreshold:         &highMem,
+			UpperRecoveryThreshold: &recMem,
+			ExpectedValue:          &expMem,
+			DisallowNegative:       true,
+		},
+		{
+			MetricName:             "disk_usage_percent",
+			UpperThreshold:         &highDisk,
+			UpperRecoveryThreshold: &recDisk,
+			ExpectedValue:          &expDisk,
+			DisallowNegative:       true,
+		},
+		{
+			MetricName:             "temperature_celsius",
+			UpperThreshold:         &highTemp,
+			UpperRecoveryThreshold: &recTemp,
+			ExpectedValue:          &expTemp,
+			DisallowNegative:       false,
+		},
+	}
+}
