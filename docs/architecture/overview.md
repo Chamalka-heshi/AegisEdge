@@ -291,4 +291,43 @@ flowchart TD
 4. **Durability Option A (Future Design)**: Incidents will be persisted in a dedicated SQLite table (`edge_incidents`) physically separate from high-frequency telemetry. Durable incident persistence does not currently exist; schema migrations are deferred to a future incident phase.
 5. **Stable Identity & Causality**: Incidents will generate immutable UUIDv4 identifiers upon creation; they do not reuse telemetry `BatchID` values or telemetry `SequenceNumber` counters.
 
+---
+
+## 10. Local Anomaly Detection Pipeline Integration (Phase 5.3)
+
+Phase 5.3 integrates the deterministic anomaly detector ([ADR-0009](../decisions/ADR-0009-edge-anomaly-detection.md)) into the edge agent's collection and persistence pipeline.
+
+```mermaid
+flowchart TD
+    GEN["1. Telemetry Generation\n(Deterministic Synthetic Generator)"] --> VAL["2. Domain Contract Validation\n(types.TelemetryBatch.Validate)"]
+    VAL --> WAL["3. Durable Local Persistence\n(SQLite WAL Transaction Commit)"]
+    WAL --> CONF["4. Confirmation Read-Back\n(Verify Batch Status: PENDING)"]
+    CONF --> DET["5. Local Anomaly Detection\n(ThresholdDetector.DetectBatch)"]
+    DET --> SIG["6. AnomalySignal Hand-off\n(Structured Warning Log & In-Memory Callback)"]
+    SIG -.-> INC["7. Future Incident Engine\n(FSM & Policy Evaluation — Future Phase)"]
+```
+
+### Core Pipeline Invariants:
+
+1. **PERSIST FIRST. DETECT SECOND**:
+   Local persistence precedes anomaly detection. Telemetry batches are committed to SQLite WAL and confirmed *before* the detector evaluates the batch.
+2. **Strict Error Isolation**:
+   * A detector failure or error **never** prevents successful telemetry persistence.
+   * A detector error **never** marks the telemetry batch as failed or causes it to be discarded.
+   * Telemetry remains durably accepted and buffered for upstream synchronization regardless of detector outcomes.
+3. **Persistence Failure Semantics**:
+   * If SQLite persistence fails, telemetry is **not** accepted.
+   * The detector is **never executed** on batches that fail local persistence. The detector cannot become an alternative buffering or durability fallback.
+4. **Independent Upstream Synchronization**:
+   * Synchronization workers (HTTP client or NATS publisher) pull persisted `PENDING` batches asynchronously from SQLite.
+   * Synchronization is completely decoupled from detection results; anomalous batches are synchronized identically to nominal batches.
+5. **Local & Process-Local Lifecycle**:
+   * Anomaly detection is 100% offline with zero cloud, NATS, or HTTP dependencies.
+   * The detector is instantiated once per agent process lifetime, maintaining in-memory hysteresis state partitioned by `NodeID:MetricName`.
+   * Detector state is process-local; upon agent restart, the detector initializes fresh following cold-start semantics without altering SQLite WAL telemetry persistence.
+6. **Anomaly $\neq$ Incident**:
+   * The detector produces mathematical observation signals (`AnomalySignal` with normalized `AnomalyScore` $\in [0.0, 1.0]$).
+   * The Incident Engine (which declares incidents, evaluates multi-window persistence policies, and drives the Incident FSM) is deferred to future phases.
+   * Anomaly signals are logged locally using structured fields (`anomaly_id`, `node_id`, `metric_name`, `observed_value`, `expected_value`, `anomaly_score`, `detection_method`, `detector_version`, `correlation_id`) and made available for in-memory handling. No SQLite anomaly tables or NATS anomaly events are introduced in this phase.
+
 
