@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/config"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/sync"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/telemetry"
@@ -21,6 +22,9 @@ const (
 	Version = "0.3.0-dev"
 	AppName = "aegisedge-agent"
 )
+
+// AnomalyHandler defines a callback for processing detected anomaly signals locally.
+type AnomalyHandler func(ctx context.Context, sig *types.AnomalySignal)
 
 func main() {
 	cfg := config.LoadFromEnv()
@@ -103,7 +107,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 4. Initialize synchronization pipeline (if enabled)
+	// 4. Initialize deterministic anomaly detector (process-local lifecycle)
+	det, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
+		Version: "1.0.0",
+		Rules:   detector.DefaultRules(),
+	})
+	if err != nil {
+		logger.Error("failed to initialize anomaly detector", slog.Any("error", err))
+		os.Exit(1)
+	}
+	logger.Info("local anomaly detector initialized (process-local lifecycle)",
+		slog.String("detector_name", det.Name()),
+		slog.String("detector_version", det.Version()),
+		slog.Int("rules_count", len(detector.DefaultRules())),
+	)
+
+	// 5. Initialize synchronization pipeline (if enabled)
 	var syncer *sync.Syncer
 	if cfg.SyncEnabled {
 		if cfg.NATSEnabled {
@@ -138,7 +157,7 @@ func main() {
 
 	// If run-once mode was requested, execute single collection step and sync attempt
 	if cfg.RunOnce {
-		batch, err := runCollectionStep(ctx, gen, store, logger)
+		batch, _, err := runCollectionStep(ctx, gen, store, det, logger)
 		if err != nil {
 			logger.Error("single-shot collection step failed", slog.Any("error", err))
 			os.Exit(1)
@@ -163,7 +182,7 @@ func main() {
 		return
 	}
 
-	// 5. Daemon loop with graceful signal handling
+	// 6. Daemon loop with graceful signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
@@ -185,7 +204,7 @@ func main() {
 			return
 
 		case <-collectTicker.C:
-			if _, err := runCollectionStep(ctx, gen, store, logger); err != nil {
+			if _, _, err := runCollectionStep(ctx, gen, store, det, logger); err != nil {
 				logger.Error("telemetry collection and persistence step failed", slog.Any("error", err))
 			} else if syncer != nil {
 				// Proactively trigger sync after new batch is persisted
@@ -209,18 +228,25 @@ func main() {
 	}
 }
 
-// runCollectionStep executes the core Phase 2 durability invariant:
-// Generate -> Validate -> Persist to SQLite WAL -> Confirm -> Mark Accepted
+// runCollectionStep executes the core Phase 5.3 pipeline flow:
+// Generate -> Validate -> Persist to SQLite WAL -> Confirm -> Run Detector -> Log/Hand off Anomaly
+//
+// In accordance with ADR-0009 and Phase 5.3:
+// PERSIST FIRST. DETECT SECOND.
+// A detector failure MUST NOT prevent successful telemetry persistence or poison synchronization.
+// If SQLite persistence fails, detection is not executed and telemetry is not accepted.
 func runCollectionStep(
 	ctx context.Context,
 	gen telemetry.Generator,
 	store storage.Store,
+	det detector.Detector,
 	logger *slog.Logger,
-) (*types.TelemetryBatch, error) {
+	handlers ...AnomalyHandler,
+) (*types.TelemetryBatch, []*types.AnomalySignal, error) {
 	// Step A: Generate deterministic telemetry batch
 	batch, err := gen.GenerateBatch(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("telemetry generation failed: %w", err)
+		return nil, nil, fmt.Errorf("telemetry generation failed: %w", err)
 	}
 
 	logger.Info("telemetry batch generated",
@@ -232,18 +258,18 @@ func runCollectionStep(
 
 	// Step B: Explicit domain validation
 	if err := batch.Validate(); err != nil {
-		return nil, fmt.Errorf("batch validation failed: %w", err)
+		return nil, nil, fmt.Errorf("batch validation failed: %w", err)
 	}
 
-	// Step C: Durable persistence to SQLite WAL
+	// Step C: Durable persistence to SQLite WAL (PERSIST FIRST)
 	if err := store.PersistBatch(ctx, batch); err != nil {
-		return nil, fmt.Errorf("local persistence failed: %w", err)
+		return nil, nil, fmt.Errorf("local persistence failed: %w", err)
 	}
 
 	// Step D: Confirm successful persistence
 	rec, err := store.GetBatch(ctx, batch.BatchID)
 	if err != nil {
-		return nil, fmt.Errorf("confirming persisted batch failed: %w", err)
+		return nil, nil, fmt.Errorf("confirming persisted batch failed: %w", err)
 	}
 
 	logger.Info("telemetry batch locally accepted and committed to WAL",
@@ -253,5 +279,40 @@ func runCollectionStep(
 		slog.Time("collected_at", rec.CollectedAt),
 	)
 
-	return batch, nil
+	// Step E: Local Anomaly Detection (DETECT SECOND)
+	// The detector is an observer and must never cause persisted telemetry to be discarded or marked failed.
+	var detectedSignals []*types.AnomalySignal
+	if det != nil {
+		signals, detErr := det.DetectBatch(ctx, batch)
+		if detErr != nil {
+			// ERROR ISOLATION: Log warning; do not fail or discard persisted batch.
+			logger.Warn("anomaly detector evaluation encountered error; persisted telemetry remains safe and durable",
+				slog.String("batch_id", batch.BatchID),
+				slog.Any("error", detErr),
+			)
+		} else {
+			detectedSignals = signals
+			for _, sig := range signals {
+				// Structured logging conforming to ADR-0009
+				logger.Warn("anomaly detected",
+					slog.String("anomaly_id", sig.AnomalyID),
+					slog.String("node_id", sig.NodeID),
+					slog.String("metric_name", sig.MetricName),
+					slog.Float64("observed_value", sig.ObservedValue),
+					slog.Float64("expected_value", sig.ExpectedValue),
+					slog.Float64("anomaly_score", sig.AnomalyScore),
+					slog.String("detection_method", sig.DetectionMethod),
+					slog.String("detector_version", sig.DetectorVersion),
+					slog.String("correlation_id", sig.CorrelationID),
+				)
+				for _, h := range handlers {
+					if h != nil {
+						h(ctx, sig)
+					}
+				}
+			}
+		}
+	}
+
+	return batch, detectedSignals, nil
 }
