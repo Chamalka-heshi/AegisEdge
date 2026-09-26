@@ -33,7 +33,7 @@ func TestRunCollectionStep_SuccessAndConfirmation(t *testing.T) {
 	}
 
 	// Execute step 1
-	b1, err := runCollectionStep(ctx, gen, store, logger)
+	b1, _, err := runCollectionStep(ctx, gen, store, nil, logger)
 	if err != nil {
 		t.Fatalf("runCollectionStep 1 failed: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestRunCollectionStep_SuccessAndConfirmation(t *testing.T) {
 	}
 
 	// Execute step 2
-	b2, err := runCollectionStep(ctx, gen, store, logger)
+	b2, _, err := runCollectionStep(ctx, gen, store, nil, logger)
 	if err != nil {
 		t.Fatalf("runCollectionStep 2 failed: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestRunCollectionStep_PersistenceFailure(t *testing.T) {
 	gen, _ := telemetry.NewSimulatedGenerator("node-err", 0)
 
 	// Collection step must return an error and not pretend it was accepted
-	_, err = runCollectionStep(ctx, gen, store, logger)
+	_, _, err = runCollectionStep(ctx, gen, store, nil, logger)
 	if err == nil {
 		t.Fatal("expected error on closed store, got nil")
 	}
