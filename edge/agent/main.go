@@ -12,6 +12,7 @@ import (
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/config"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/sync"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/telemetry"
@@ -122,7 +123,59 @@ func main() {
 		slog.Int("rules_count", len(detector.DefaultRules())),
 	)
 
-	// 5. Initialize synchronization pipeline (if enabled)
+	// 5. Initialize local incident engine with durable SQLite persistence
+	policyCfg := incident.DefaultPolicyConfig()
+	policyCfg.Store = store
+	incEngine, err := incident.NewLocalEngine(policyCfg)
+	if err != nil {
+		logger.Error("failed to initialize incident engine", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	// 5b. Recover active incidents and recent correlation observations from durable SQLite store
+	recoveredIncidents, recoveredObs, err := incEngine.RecoverFromStore(ctx)
+	if err != nil {
+		logger.Error("failed to recover incident state from durable store", slog.Any("error", err))
+		os.Exit(1)
+	}
+	logger.Info("local incident engine initialized with durable SQLite persistence",
+		slog.Int("policy_m", policyCfg.M),
+		slog.Int("policy_n", policyCfg.N),
+		slog.Duration("window_duration", policyCfg.WindowDuration),
+		slog.Int("recovered_active_incidents", recoveredIncidents),
+		slog.Int("recovered_observations", recoveredObs),
+	)
+
+	// AnomalyHandler callback: correlates AnomalySignals via IncidentEngine with error isolation
+	incidentHandler := func(ctx context.Context, sig *types.AnomalySignal) {
+		inc, procErr := incEngine.Process(ctx, sig)
+		if procErr != nil {
+			// ERROR ISOLATION: Incident engine failure must not affect persisted telemetry or sync
+			logger.Error("incident engine failed to process anomaly signal",
+				slog.String("anomaly_id", sig.AnomalyID),
+				slog.String("node_id", sig.NodeID),
+				slog.String("metric_name", sig.MetricName),
+				slog.Any("error", procErr),
+			)
+			return
+		}
+		if inc != nil {
+			// Structured logging per ADR-0009 / ADR-0010
+			logger.Warn("incident created",
+				slog.String("incident_id", inc.IncidentID),
+				slog.String("node_id", inc.NodeID),
+				slog.String("metric_name", inc.TriggerMetric),
+				slog.String("severity", string(inc.Severity)),
+				slog.String("status", string(inc.Status)),
+				slog.String("rule_name", inc.RuleName),
+				slog.String("trigger_metric", inc.TriggerMetric),
+				slog.Float64("trigger_value", inc.TriggerValue),
+				slog.String("anomaly_id", sig.AnomalyID),
+			)
+		}
+	}
+
+	// 6. Initialize synchronization pipeline (if enabled)
 	var syncer *sync.Syncer
 	if cfg.SyncEnabled {
 		if cfg.NATSEnabled {
@@ -157,7 +210,7 @@ func main() {
 
 	// If run-once mode was requested, execute single collection step and sync attempt
 	if cfg.RunOnce {
-		batch, _, err := runCollectionStep(ctx, gen, store, det, logger)
+		batch, _, err := runCollectionStep(ctx, gen, store, det, logger, incidentHandler)
 		if err != nil {
 			logger.Error("single-shot collection step failed", slog.Any("error", err))
 			os.Exit(1)
@@ -204,7 +257,7 @@ func main() {
 			return
 
 		case <-collectTicker.C:
-			if _, _, err := runCollectionStep(ctx, gen, store, det, logger); err != nil {
+			if _, _, err := runCollectionStep(ctx, gen, store, det, logger, incidentHandler); err != nil {
 				logger.Error("telemetry collection and persistence step failed", slog.Any("error", err))
 			} else if syncer != nil {
 				// Proactively trigger sync after new batch is persisted
