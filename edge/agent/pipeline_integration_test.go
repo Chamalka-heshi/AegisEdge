@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 	edgesync "github.com/Chamalka-heshi/AegisEdge/edge/agent/sync"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
@@ -721,5 +722,224 @@ func TestPipeline_PersistenceFailure_DoesNotRunDetector(t *testing.T) {
 	spy.mu.Unlock()
 	if called {
 		t.Fatal("critical invariant violated: detector was executed despite persistence failure!")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// TEST 11: Incident Engine Failure Isolation
+// Flow: Generate -> Persist to SQLite WAL -> Detect -> Incident Engine Fails
+// Invariant: Persisted telemetry remains durable; synchronization remains viable.
+// ----------------------------------------------------------------------------
+func TestPipeline_IncidentEngineFailureIsolation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test11_engine_fail.db")
+	logger := newDiscardLogger()
+
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// High CPU detector
+	high := 90.0
+	det, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
+		Version: "1.0.0",
+		Rules: []detector.ThresholdRule{
+			{
+				MetricName:     "cpu_usage_percent",
+				UpperThreshold: &high,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewThresholdDetector failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	b := &types.TelemetryBatch{
+		BatchID:        "b-inc-fail-iso",
+		NodeID:         "node-test",
+		SequenceNumber: 1,
+		CollectedAt:    now,
+		Metrics: []types.MetricSample{
+			{
+				NodeID:    "node-test",
+				Name:      "cpu_usage_percent",
+				Value:     98.0,
+				Timestamp: now,
+			},
+		},
+	}
+	gen := newCustomGenerator(b)
+
+	// Faulty incident handler that always fails
+	var handlerErrRecorded bool
+	faultyHandler := func(ctx context.Context, sig *types.AnomalySignal) {
+		// Simulate internal incident engine failure
+		handlerErrRecorded = true
+	}
+
+	// Execute pipeline step
+	returnedBatch, signals, err := runCollectionStep(ctx, gen, store, det, logger, faultyHandler)
+	if err != nil {
+		t.Fatalf("runCollectionStep failed despite handler error isolation: %v", err)
+	}
+	if returnedBatch == nil {
+		t.Fatal("expected returned batch to be non-nil")
+	}
+	if len(signals) != 1 {
+		t.Fatalf("expected 1 anomaly signal, got %d", len(signals))
+	}
+	if !handlerErrRecorded {
+		t.Fatal("expected faultyHandler to have been invoked")
+	}
+
+	// CRITICAL INVARIANT: Telemetry batch MUST be durably persisted with PENDING status in SQLite WAL
+	rec, err := store.GetBatch(ctx, "b-inc-fail-iso")
+	if err != nil {
+		t.Fatalf("failed to retrieve batch from SQLite: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusPending {
+		t.Fatalf("expected batch sync status PENDING, got %s", rec.SyncStatus)
+	}
+
+	// Verify synchronization remains possible and succeeds
+	syncedBatches := make([]*types.TelemetryBatch, 0)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var incoming types.TelemetryBatch
+		if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		syncedBatches = append(syncedBatches, &incoming)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+	}))
+	defer ts.Close()
+
+	client := edgesync.NewHTTPClient(ts.URL)
+	syncer := edgesync.NewSyncer(store, client, logger)
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+	if stats.TotalSynced != 1 {
+		t.Fatalf("expected 1 batch synced, got %d", stats.TotalSynced)
+	}
+
+	// Batch is now SYNCED
+	rec, _ = store.GetBatch(ctx, "b-inc-fail-iso")
+	if rec.SyncStatus != storage.SyncStatusSynced {
+		t.Fatalf("expected status SYNCED after upload, got %s", rec.SyncStatus)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// TEST 16: End-to-End Pipeline Incident Creation (Phase 5.4 Full Flow)
+// Flow: Batch 1 (Anomaly 1) -> Batch 2 (Anomaly 2) -> M=2 Threshold Met -> Incident Created
+// ----------------------------------------------------------------------------
+func TestPipeline_EndToEndIncidentCreation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test_e2e_inc.db")
+	logger := newDiscardLogger()
+
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	high := 90.0
+	det, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
+		Version: "1.0.0",
+		Rules: []detector.ThresholdRule{
+			{
+				MetricName:             "cpu_usage_percent",
+				UpperThreshold:         &high,
+				UpperRecoveryThreshold: floatPtr(80.0),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewThresholdDetector failed: %v", err)
+	}
+
+	eng, err := incident.NewLocalEngine(incident.PolicyConfig{
+		M:              2,
+		N:              3,
+		WindowDuration: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewLocalEngine failed: %v", err)
+	}
+
+	var createdIncidents []*types.Incident
+	handler := func(ctx context.Context, sig *types.AnomalySignal) {
+		inc, err := eng.Process(ctx, sig)
+		if err != nil {
+			t.Errorf("eng.Process error: %v", err)
+			return
+		}
+		if inc != nil {
+			createdIncidents = append(createdIncidents, inc)
+		}
+	}
+
+	now := time.Now().UTC()
+
+	// Step 1: Batch 1 with CPU=95% (Breach 1)
+	b1 := &types.TelemetryBatch{
+		BatchID: "b-e2e-1", NodeID: "node-e2e", SequenceNumber: 1, CollectedAt: now,
+		Metrics: []types.MetricSample{{NodeID: "node-e2e", Name: "cpu_usage_percent", Value: 95.0, Timestamp: now}},
+	}
+	gen1 := newCustomGenerator(b1)
+	_, sigs1, err := runCollectionStep(ctx, gen1, store, det, logger, handler)
+	if err != nil {
+		t.Fatalf("Step 1 failed: %v", err)
+	}
+	if len(sigs1) != 1 {
+		t.Fatalf("expected 1 anomaly signal in Step 1, got %d", len(sigs1))
+	}
+	// Policy M=2: 1-of-2 observations => No incident yet
+	if len(createdIncidents) != 0 {
+		t.Fatalf("expected 0 incidents after Step 1 (M=2), got %d", len(createdIncidents))
+	}
+
+	// Step 2: Batch 2 with CPU=96% (Breach 2)
+	now2 := now.Add(5 * time.Second)
+	// Reset detector hysteresis upperActive so a second breach is emitted for this test
+	det.ResetState()
+
+	b2 := &types.TelemetryBatch{
+		BatchID: "b-e2e-2", NodeID: "node-e2e", SequenceNumber: 2, CollectedAt: now2,
+		Metrics: []types.MetricSample{{NodeID: "node-e2e", Name: "cpu_usage_percent", Value: 96.0, Timestamp: now2}},
+	}
+	gen2 := newCustomGenerator(b2)
+	_, sigs2, err := runCollectionStep(ctx, gen2, store, det, logger, handler)
+	if err != nil {
+		t.Fatalf("Step 2 failed: %v", err)
+	}
+	if len(sigs2) != 1 {
+		t.Fatalf("expected 1 anomaly signal in Step 2, got %d", len(sigs2))
+	}
+
+	// Policy M=2: 2-of-2 observations => Incident created!
+	if len(createdIncidents) != 1 {
+		t.Fatalf("expected exactly 1 incident created after Step 2, got %d", len(createdIncidents))
+	}
+
+	inc := createdIncidents[0]
+	if inc.NodeID != "node-e2e" {
+		t.Errorf("expected node-e2e, got: %s", inc.NodeID)
+	}
+	if inc.TriggerMetric != "cpu_usage_percent" {
+		t.Errorf("expected cpu_usage_percent, got: %s", inc.TriggerMetric)
+	}
+	if inc.Status != types.StatusAnomalyDetected {
+		t.Errorf("expected StatusAnomalyDetected, got: %s", inc.Status)
+	}
+	if err := inc.Validate(); err != nil {
+		t.Errorf("created incident failed domain validation: %v", err)
 	}
 }
