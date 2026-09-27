@@ -374,10 +374,62 @@ flowchart TD
 7. **Strict Error Isolation**:
    * Incident Engine failure or handler errors never invalidate or roll back persisted telemetry.
    * Telemetry batches remain safely committed to SQLite WAL with `PENDING` status, and background synchronization continues uninterrupted.
-8. **Process-Local State & Non-Goals**:
-   * In Phase 5.4, correlation state and active incidents reside in thread-safe, process-local memory (`LocalEngine`).
-   * Durable incident persistence (SQLite `edge_incidents` table) and central incident transport are deferred to future durability phases.
-   * **Autonomous Remediation is strictly a future phase**: no process kills, service restarts, network modifications, or shell commands are executed.
+8. **Evolution to Durable State**:
+   * In Phase 5.4, correlation state and active incidents resided in process-local memory (`LocalEngine`).
+   * Phase 5.5 upgrades this to durable SQLite persistence while preserving the same domain FSM and correlation policies.
+   * **Autonomous Remediation remains strictly a future phase**: no process kills, service restarts, network modifications, or shell commands are executed.
+
+---
+
+## 12. Durable Incident Persistence & Restart Recovery (Phase 5.5)
+
+Phase 5.5 introduces **Durable Incident Persistence** ([ADR-0011](../decisions/ADR-0011-durable-incident-persistence.md)), backing the Local Incident Engine with dedicated SQLite tables (`incident_records` and `incident_observations`) under WAL mode.
+
+```mermaid
+flowchart TD
+    TEL["1. Telemetry Collection\n(Synthetic / Host Metrics)"] --> VAL["2. Contract Validation\n(types.TelemetryBatch.Validate)"]
+    VAL --> WAL_TEL["3. Durable Telemetry Commit\n(SQLite WAL: telemetry_batches)"]
+    WAL_TEL --> DET["4. Local Anomaly Detection\n(ThresholdDetector.DetectBatch)"]
+    DET --> SIG["5. AnomalySignal Emission\n(Deterministic Mathematical Observations)"]
+    SIG --> INC_ENG["6. Local Incident Engine\n(M-of-N Sliding Window Evaluation)"]
+    INC_ENG --> TX["7. Atomic Evaluation Transaction\n(SQLite WAL Commit)"]
+    TX --> WAL_INC["8. Durable Incident Records\n(incident_records & incident_observations)"]
+    WAL_INC -.-> REM["9. Autonomous Remediation\n(STRICTLY DEFERRED TO FUTURE PHASE)"]
+```
+
+### Core Architecture & Operating Invariants:
+
+1. **Clear Separation of Durability Concerns**:
+   AegisEdge establishes explicit, decoupled durability boundaries:
+   * **Telemetry Durability**: Raw time-series samples are persisted locally to `telemetry_batches` (SQLite WAL) before detection or synchronization.
+   * **Incident Durability**: Derived anomaly observations and active incident lifecycles are persisted locally to `incident_records` and `incident_observations` (SQLite WAL) using atomic transactions.
+   * **NATS Transport Durability**: In-transit messages are buffered in JetStream file-backed streams with 24-hour message deduplication (`Nats-Msg-Id`).
+   * *Local incident persistence is strictly edge-local; central cloud incident replication is deferred to future transport phases.*
+2. **SQLite as the Single Source of Truth**:
+   * Process memory serves as a thread-safe working cache and reconstructed state.
+   * SQLite WAL storage is the authoritative durable source of truth.
+   * All incident lifecycle state updates and anomaly observation records are committed transactionally.
+3. **Restart Recovery & State Reconstruction**:
+   * Upon agent startup, `RecoverFromStore(ctx)` loads all active incidents (`ANOMALY_DETECTED`, `MITIGATING`, `ESCALATED`) and bounded recent observations within the sliding window horizon (`WindowDuration`, default: 5 minutes).
+   * Unfinished $M$-of-$N$ correlation progress (e.g. 1 of 2 observations) survives agent restart and resumes evaluation seamlessly upon arrival of the next observation.
+4. **Durable Idempotency**:
+   * `anomaly_id` is the primary key in `incident_observations`.
+   * Replayed or duplicate anomaly signals are rejected idempotently by SQLite index lookups and primary key constraints; duplicates never increment the $M$-of-$N$ counter or create duplicate incidents across restarts.
+5. **Atomic Incident Evaluation Boundary**:
+   * Observation insertion, idempotency verification, and incident creation/updates occur within a single SQLite transaction:
+     $$\text{BEGIN} \longrightarrow \text{Idempotency Check} \longrightarrow \text{Persist Observation} \longrightarrow \text{Create/Update Incident} \longrightarrow \text{COMMIT}$$
+   * If any step fails, the transaction rolls back cleanly, preventing partial or orphaned state.
+6. **Strict Error & Failure Isolation**:
+   $$\textbf{PERSIST TELEMETRY FIRST} \longrightarrow \textbf{DETECT SECOND} \longrightarrow \textbf{PERSIST INCIDENT THIRD}$$
+   * An error or failure in incident persistence never rolls back or marks already-persisted telemetry batches as failed.
+   * Background telemetry synchronization via HTTP or NATS JetStream proceeds independently.
+7. **Consistency Boundaries & Non-Claims**:
+   * AegisEdge guarantees local ACID transactional consistency within the edge SQLite WAL engine.
+   * Incident state survives application/process restart and SQLite crash-recovery scenarios covered by the configured WAL durability semantics (`synchronous=NORMAL`).
+   * Physical power-loss durability depends on SQLite synchronous settings, filesystem behavior, storage hardware, and OS/device caches.
+   * AegisEdge explicitly does not claim zero data loss, nor guaranteed survival of every physical power-loss scenario.
+   * It **does not claim** distributed exactly-once delivery, distributed two-phase commits, or remote cloud durability in this phase.
+
 
 
 
