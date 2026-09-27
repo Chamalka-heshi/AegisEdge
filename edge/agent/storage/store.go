@@ -10,10 +10,13 @@ import (
 
 // Common storage domain errors.
 var (
-	ErrDuplicateBatch = errors.New("batch with the given batch_id already exists")
-	ErrBatchNotFound  = errors.New("batch not found")
-	ErrStoreClosed    = errors.New("storage engine is closed")
-	ErrInvalidBatch   = errors.New("cannot persist invalid telemetry batch")
+	ErrDuplicateBatch   = errors.New("batch with the given batch_id already exists")
+	ErrBatchNotFound    = errors.New("batch not found")
+	ErrStoreClosed      = errors.New("storage engine is closed")
+	ErrInvalidBatch     = errors.New("cannot persist invalid telemetry batch")
+	ErrDuplicateAnomaly = errors.New("anomaly with the given anomaly_id already exists")
+	ErrIncidentNotFound = errors.New("incident not found")
+	ErrInvalidIncident  = errors.New("cannot persist invalid incident")
 )
 
 // SyncStatus represents the synchronization lifecycle state of a locally stored batch.
@@ -94,4 +97,57 @@ type Store interface {
 
 	// Close cleanly terminates database connections and checkpoints the WAL journal.
 	Close() error
+}
+
+// StoredObservation represents a durably recorded anomaly observation in SQLite.
+type StoredObservation struct {
+	AnomalyID       string            `json:"anomaly_id"`
+	IncidentID      string            `json:"incident_id,omitempty"`
+	NodeID          string            `json:"node_id"`
+	MetricName      string            `json:"metric_name"`
+	DetectedAt      time.Time         `json:"detected_at"`
+	ObservedValue   float64           `json:"observed_value"`
+	AnomalyScore    float64           `json:"anomaly_score"`
+	DetectionMethod string            `json:"detection_method"`
+	Evidence        map[string]string `json:"evidence,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+}
+
+// IncidentStore defines the durable persistence contract for incidents and anomaly observations.
+type IncidentStore interface {
+	// HasObservation checks if an AnomalyID has already been durably recorded (idempotency check).
+	HasObservation(ctx context.Context, anomalyID string) (bool, error)
+
+	// RecordObservation inserts an anomaly observation into SQLite.
+	// Returns ErrDuplicateAnomaly if the anomaly_id already exists.
+	RecordObservation(ctx context.Context, obs *StoredObservation) error
+
+	// GetActiveIncident retrieves the current active incident for nodeID and metricName.
+	// Returns (nil, nil) if no active incident exists.
+	GetActiveIncident(ctx context.Context, nodeID, metricName string) (*types.Incident, error)
+
+	// GetIncident retrieves an incident by its unique IncidentID.
+	// Returns (nil, ErrIncidentNotFound) if it does not exist.
+	GetIncident(ctx context.Context, incidentID string) (*types.Incident, error)
+
+	// ListActiveIncidents retrieves all incidents currently in active status (ANOMALY_DETECTED, MITIGATING, ESCALATED).
+	ListActiveIncidents(ctx context.Context) ([]*types.Incident, error)
+
+	// ListRecentObservations retrieves recent observations for a correlation stream within a temporal window,
+	// ordered chronologically by detected_at ASC.
+	ListRecentObservations(ctx context.Context, nodeID, metricName string, since time.Time, limit int) ([]*StoredObservation, error)
+
+	// ListAllRecentObservations retrieves recent observations across all streams detected at or after since,
+	// ordered chronologically by detected_at ASC.
+	ListAllRecentObservations(ctx context.Context, since time.Time, limit int) ([]*StoredObservation, error)
+
+	// PersistIncidentEvaluation executes an atomic transaction for:
+	// 1. Checking anomaly idempotency (returns isNew=false if already processed)
+	// 2. Persisting the anomaly observation
+	// 3. Creating or updating the Incident domain entity (if non-nil)
+	// Returns (isNew, error). If any operation fails, the transaction rolls back cleanly.
+	PersistIncidentEvaluation(ctx context.Context, obs *StoredObservation, inc *types.Incident) (bool, error)
+
+	// UpdateIncidentStatus updates the status, updated_at, and resolved_at of an incident.
+	UpdateIncidentStatus(ctx context.Context, incidentID string, status types.IncidentStatus, updatedAt time.Time, resolvedAt *time.Time) error
 }
