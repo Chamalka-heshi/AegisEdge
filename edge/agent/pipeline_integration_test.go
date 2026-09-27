@@ -869,6 +869,7 @@ func TestPipeline_EndToEndIncidentCreation(t *testing.T) {
 		M:              2,
 		N:              3,
 		WindowDuration: 5 * time.Minute,
+		Store:          store,
 	})
 	if err != nil {
 		t.Fatalf("NewLocalEngine failed: %v", err)
@@ -941,5 +942,132 @@ func TestPipeline_EndToEndIncidentCreation(t *testing.T) {
 	}
 	if err := inc.Validate(); err != nil {
 		t.Errorf("created incident failed domain validation: %v", err)
+	}
+
+	// Verify incident is durably committed in SQLite WAL
+	dbInc, err := store.GetIncident(ctx, inc.IncidentID)
+	if err != nil {
+		t.Fatalf("failed to retrieve durable incident from store: %v", err)
+	}
+	if dbInc.IncidentID != inc.IncidentID {
+		t.Errorf("durable incident ID mismatch: got %s, want %s", dbInc.IncidentID, inc.IncidentID)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// TEST 17: Pipeline Restart Recovery of M-of-N Across Multiple Collection Steps
+// Flow: Batch 1 (Anomaly 1) -> Close & Reopen SQLite (Simulate crash) -> Batch 2 (Anomaly 2) -> Incident Created
+// ----------------------------------------------------------------------------
+func TestPipeline_RestartRecovery_MofN_AcrossBatches(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test_restart_pipeline.db")
+	logger := newDiscardLogger()
+
+	store1, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+
+	high := 90.0
+	det, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
+		Version: "1.0.0",
+		Rules: []detector.ThresholdRule{
+			{
+				MetricName:             "cpu_usage_percent",
+				UpperThreshold:         &high,
+				UpperRecoveryThreshold: floatPtr(80.0),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewThresholdDetector failed: %v", err)
+	}
+
+	eng1, _ := incident.NewLocalEngine(incident.PolicyConfig{
+		M:              2,
+		N:              3,
+		WindowDuration: 5 * time.Minute,
+		Store:          store1,
+	})
+
+	now := time.Now().UTC()
+
+	// Step 1: Batch 1 with CPU=95% in instance 1
+	b1 := &types.TelemetryBatch{
+		BatchID: "b-rst-pipe-1", NodeID: "node-rst", SequenceNumber: 1, CollectedAt: now,
+		Metrics: []types.MetricSample{{NodeID: "node-rst", Name: "cpu_usage_percent", Value: 95.0, Timestamp: now}},
+	}
+	gen1 := newCustomGenerator(b1)
+	handler1 := func(ctx context.Context, sig *types.AnomalySignal) {
+		_, _ = eng1.Process(ctx, sig)
+	}
+	_, _, err = runCollectionStep(ctx, gen1, store1, det, logger, handler1)
+	if err != nil {
+		t.Fatalf("Step 1 failed: %v", err)
+	}
+
+	// Close store1 simulating agent crash / restart
+	store1.Close()
+
+	// Step 2: Restart agent with store2 and eng2
+	store2, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite store2 failed: %v", err)
+	}
+	defer store2.Close()
+
+	eng2, _ := incident.NewLocalEngine(incident.PolicyConfig{
+		M:              2,
+		N:              3,
+		WindowDuration: 5 * time.Minute,
+		Store:          store2,
+	})
+
+	// Reconstruct working state from durable SQLite records
+	recInc, recObs, err := eng2.RecoverFromStore(ctx)
+	if err != nil {
+		t.Fatalf("RecoverFromStore failed: %v", err)
+	}
+	if recInc != 0 {
+		t.Fatalf("expected 0 active incidents before threshold, got %d", recInc)
+	}
+	if recObs != 1 {
+		t.Fatalf("expected 1 observation recovered across restart, got %d", recObs)
+	}
+
+	var createdIncidents []*types.Incident
+	handler2 := func(ctx context.Context, sig *types.AnomalySignal) {
+		inc, err := eng2.Process(ctx, sig)
+		if err != nil {
+			t.Errorf("eng2.Process error: %v", err)
+			return
+		}
+		if inc != nil {
+			createdIncidents = append(createdIncidents, inc)
+		}
+	}
+
+	// Step 3: Batch 2 with CPU=97% in restarted instance
+	det.ResetState()
+	now2 := now.Add(10 * time.Second)
+	b2 := &types.TelemetryBatch{
+		BatchID: "b-rst-pipe-2", NodeID: "node-rst", SequenceNumber: 2, CollectedAt: now2,
+		Metrics: []types.MetricSample{{NodeID: "node-rst", Name: "cpu_usage_percent", Value: 97.0, Timestamp: now2}},
+	}
+	gen2 := newCustomGenerator(b2)
+	_, _, err = runCollectionStep(ctx, gen2, store2, det, logger, handler2)
+	if err != nil {
+		t.Fatalf("Step 2 failed in restarted agent: %v", err)
+	}
+
+	// M=2 correlation MUST have triggered across the restart boundary!
+	if len(createdIncidents) != 1 {
+		t.Fatalf("expected exactly 1 incident created across restart, got %d", len(createdIncidents))
+	}
+
+	// Verify both batches are durably persisted in SQLite WAL and available for sync
+	count, err := store2.CountBatches(ctx)
+	if err != nil || count != 2 {
+		t.Fatalf("expected 2 persisted telemetry batches in store2, got %d, err: %v", count, err)
 	}
 }
