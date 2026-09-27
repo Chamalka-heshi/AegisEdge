@@ -327,7 +327,57 @@ flowchart TD
    * Detector state is process-local; upon agent restart, the detector initializes fresh following cold-start semantics without altering SQLite WAL telemetry persistence.
 6. **Anomaly $\neq$ Incident**:
    * The detector produces mathematical observation signals (`AnomalySignal` with normalized `AnomalyScore` $\in [0.0, 1.0]$).
-   * The Incident Engine (which declares incidents, evaluates multi-window persistence policies, and drives the Incident FSM) is deferred to future phases.
-   * Anomaly signals are logged locally using structured fields (`anomaly_id`, `node_id`, `metric_name`, `observed_value`, `expected_value`, `anomaly_score`, `detection_method`, `detector_version`, `correlation_id`) and made available for in-memory handling. No SQLite anomaly tables or NATS anomaly events are introduced in this phase.
+   * Anomaly signals are logged locally using structured fields (`anomaly_id`, `node_id`, `metric_name`, `observed_value`, `expected_value`, `anomaly_score`, `detection_method`, `detector_version`, `correlation_id`) and handed off to downstream listeners via the `AnomalyHandler` interface.
+
+---
+
+## 11. Local Incident Engine & State Management (Phase 5.4)
+
+Phase 5.4 introduces the **Local Incident Engine** ([ADR-0010](../decisions/ADR-0010-incident-engine.md)), converting discrete `AnomalySignal` domain observations into formal `types.Incident` entities governed by the canonical Incident FSM.
+
+```mermaid
+flowchart TD
+    TEL["1. Telemetry Generation\n(Synthetic / Host Metrics)"] --> PERS["2. Durable Persistence\n(SQLite WAL Commit)"]
+    PERS --> DET["3. Anomaly Detection\n(ThresholdDetector.DetectBatch)"]
+    DET --> SIG["4. AnomalySignal Emission\n(Deterministic Mathematical Observations)"]
+    SIG --> INC_ENG["5. Local Incident Engine\n(M-of-N Sliding Window Policy & Idempotency)"]
+    INC_ENG --> INC_FSM["6. Incident Domain Lifecycle\n(Incident FSM: NORMAL -> ANOMALY_DETECTED)"]
+    INC_FSM --> INC_OBJ["7. Formal Incident Entity\n(types.Incident with Stable IncidentID)"]
+    INC_OBJ -.-> REM["8. Autonomous Remediation\n(STRICTLY DEFERRED TO FUTURE PHASE)"]
+```
+
+### Core Architecture & Operating Invariants:
+
+1. **Pipeline Ordering & Durability Invariant**:
+   The Incident Engine is strictly downstream of durable SQLite WAL persistence and anomaly detection:
+   $$\text{Telemetry} \longrightarrow \text{Persistence} \longrightarrow \text{Anomaly Detection} \longrightarrow \text{Incident Engine} \longrightarrow \text{Incident}$$
+   Local persistence always precedes detection and incident correlation.
+2. **Correlation Policy ($M$-of-$N$ Sliding Window)**:
+   * Transient, isolated spikes are suppressed to avoid alert fatigue.
+   * By default, at least $M=2$ qualifying anomaly observations within a sliding window of $N=3$ observations (temporal horizon: 5 minutes) are required before an incident is opened.
+3. **Partitioned Stream Isolation**:
+   * Correlation state is strictly partitioned by composite key: `NodeID:MetricName`.
+   * Cross-node and cross-metric state bleed is strictly prohibited; separate nodes and separate metrics maintain completely independent sliding observation windows.
+4. **Stable Incident Identity**:
+   * When an incident is triggered, an immutable `IncidentID` (UUIDv4) is assigned.
+   * Persistent breaches during an active incident episode update the existing incident (`UpdatedAt`, `TriggerValue`, latest evidence) and preserve the identical `IncidentID`.
+   * Re-breaches following recovery create a new, distinct incident with a new `IncidentID`.
+5. **Idempotency & Replay Safety**:
+   * Incoming signals are tracked by `AnomalyID`.
+   * Duplicate deliveries of an already-processed `AnomalyID` are treated as no-ops and never increment the $M$-of-$N$ counter.
+6. **Deterministic Severity Mapping**:
+   * Normalized `AnomalyScore` $[0.0, 1.0]$ maps deterministically to `IncidentSeverity`:
+     * Score $\ge 0.85 \implies$ `CRITICAL`
+     * Score $\ge 0.60 \implies$ `HIGH`
+     * Score $\ge 0.30 \implies$ `MEDIUM`
+     * Score $< 0.30 \implies$ `LOW`
+7. **Strict Error Isolation**:
+   * Incident Engine failure or handler errors never invalidate or roll back persisted telemetry.
+   * Telemetry batches remain safely committed to SQLite WAL with `PENDING` status, and background synchronization continues uninterrupted.
+8. **Process-Local State & Non-Goals**:
+   * In Phase 5.4, correlation state and active incidents reside in thread-safe, process-local memory (`LocalEngine`).
+   * Durable incident persistence (SQLite `edge_incidents` table) and central incident transport are deferred to future durability phases.
+   * **Autonomous Remediation is strictly a future phase**: no process kills, service restarts, network modifications, or shell commands are executed.
+
 
 
