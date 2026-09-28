@@ -212,17 +212,18 @@ func (t MitigationActionType) IsValid() bool {
 type MitigationStatus string
 
 const (
-	MitigationStatusPending   MitigationStatus = "PENDING"
-	MitigationStatusExecuting MitigationStatus = "EXECUTING"
-	MitigationStatusExecuted  MitigationStatus = "EXECUTED"
-	MitigationStatusFailed    MitigationStatus = "FAILED"
-	MitigationStatusSkipped   MitigationStatus = "SKIPPED"
+	MitigationStatusPending                       MitigationStatus = "PENDING"
+	MitigationStatusExecuting                     MitigationStatus = "EXECUTING"
+	MitigationStatusExecuted                      MitigationStatus = "EXECUTED"
+	MitigationStatusFailed                        MitigationStatus = "FAILED"
+	MitigationStatusSkipped                       MitigationStatus = "SKIPPED"
+	MitigationStatusUnknownReconciliationRequired MitigationStatus = "UNKNOWN_RECONCILIATION_REQUIRED"
 )
 
 // IsValid checks whether the mitigation status is recognized.
 func (s MitigationStatus) IsValid() bool {
 	switch s {
-	case MitigationStatusPending, MitigationStatusExecuting, MitigationStatusExecuted, MitigationStatusFailed, MitigationStatusSkipped:
+	case MitigationStatusPending, MitigationStatusExecuting, MitigationStatusExecuted, MitigationStatusFailed, MitigationStatusSkipped, MitigationStatusUnknownReconciliationRequired:
 		return true
 	default:
 		return false

@@ -398,6 +398,19 @@ func TestMitigationAction_Validate(t *testing.T) {
 			wantErr: nil,
 		},
 		{
+			name: "valid unknown reconciliation required status",
+			action: MitigationAction{
+				ActionID:    "act-002",
+				IncidentID:  "inc-001",
+				ActionType:  ActionSimulatedRestart,
+				Target:      "workload-worker",
+				Status:      MitigationStatusUnknownReconciliationRequired,
+				Message:     "Execution unconfirmed after restart",
+				TriggeredAt: now,
+			},
+			wantErr: nil,
+		},
+		{
 			name: "empty action_id",
 			action: MitigationAction{
 				ActionID:    "",
