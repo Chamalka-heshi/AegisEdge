@@ -642,3 +642,494 @@ AegisEdge formally adopts the Edge Anomaly Detection Architecture defined in thi
 3. **First Implementation Target (Phase 5.2)**: A pure Go, deterministic static threshold detector with hysteresis bands and $M$-of-$N$ consecutive sample gating.
 4. **Future ML Roadmap**: Pure Go statistical engines (v2) evolving to a hybrid deterministic/ML architecture (v3).
 5. **Phase Boundary**: All implementation work is deferred to Phase 5.2. Phase 5.1 is design only.
+
+---
+
+## 29. Phase 5.4: Rolling Statistical Anomaly Detection (Implemented)
+
+### 29.1 Overview & Scope
+
+In Phase 5.4, AegisEdge introduces a deterministic, local-first rolling statistical anomaly detector (`StatisticalDetector`).
+
+$$\textbf{IMPLEMENTED NOW (Phase 5.4)}$$
+* Pure Go rolling statistical detection using sample mean, standard deviation, and z-score.
+* Bounded rolling observation window per stream (`WindowSize`).
+* Warm-up suppression gate (`MinObservations`).
+* Uncontaminated baseline calculation (current observation is evaluated prior to being appended to history).
+* Deterministic zero/near-zero standard deviation handling without NaN, +Inf, or -Inf generation.
+* Stream state isolation partitioned strictly by `(NodeID, MetricName)`.
+* Deterministic anomaly identity generation (`DefaultDeterministicAnomalyID` via SHA-256).
+* Normalized `AnomalyScore` in $[0.0, 1.0]$ derived from `z_score / maxZScore`.
+* Seamless integration into canonical `Incident` domain mapping via `MapAnomalyToIncident`.
+
+$$\textbf{FUTURE WORK (Out of Scope for Phase 5.4)}$$
+* Machine learning algorithms (Isolation Forest, Random Cut Forest, neural networks).
+* EWMA or adaptive continuous baseline drift tracking.
+* Dynamic multi-metric multivariate correlation within the detector (remains the responsibility of the Incident Engine).
+* Persistence of rolling window state across process restarts (SQLite baselines table).
+* Autonomous response or remediation actuation.
+
+> [!NOTE]
+> Statistical z-score detection is **not** machine learning. It is an algorithmic statistical baseline over historical measurements. The default threshold ($Z=3.0$) is an initial engineering setting and is not claimed to be empirically validated or optimal for every metric. Statistical detection does **not** guarantee zero false positives or complete anomaly detection.
+
+### 29.2 Baseline Algorithm & Evaluation Lifecycle
+
+The detector maintains an isolated, bounded slice of recent float64 observations for each `nodeID:metricName` stream.
+
+1. **Validation**: Incoming `MetricSample` values are validated immediately. Any invalid sample (`NaN`, `+Inf`, `-Inf`, empty metric name) is rejected with an error; invalid values never touch or contaminate the rolling history.
+2. **Warm-Up Guard**: If historical observation count $N < \text{MinObservations}$, the sample is appended to the rolling window and evaluation returns `(nil, nil)`. No anomalies are emitted during warm-up.
+3. **Uncontaminated Baseline**:
+   $$\mu = \frac{1}{N} \sum_{i=1}^{N} x_i$$
+   $$\sigma = \sqrt{\frac{1}{N} \sum_{i=1}^{N} (x_i - \mu)^2}$$
+   Baseline statistics ($\mu$ and $\sigma$) are calculated strictly using the $N$ prior historical observations. The candidate reading is **not** included in the baseline calculation.
+4. **Zero / Near-Zero Variance Handling**:
+   If $\sigma \le \epsilon$ ($\epsilon = 10^{-9}$):
+   * If $|x_{\text{current}} - \mu| \le \text{minDiff}$ ($10^{-6}$): treated as nominal; no anomaly is triggered ($z = 0.0$).
+   * If $|x_{\text{current}} - \mu| > \text{minDiff}$: treated as a step-change anomaly relative to an invariant baseline. The z-score is assigned deterministically without division by zero:
+     $$z = \max\left(Z_{\text{threshold}}, \frac{|x_{\text{current}} - \mu|}{\max(|\mu|, 1.0)} \cdot Z_{\text{threshold}}\right)$$
+     This guarantees no `NaN`, `+Inf`, or `-Inf` values can ever be emitted.
+5. **Standard Deviation Evaluation**:
+   If $\sigma > \epsilon$:
+   $$z = \frac{|x_{\text{current}} - \mu|}{\sigma}$$
+   If $z \ge Z_{\text{threshold}}$, an anomaly is flagged.
+6. **Window Update**: The candidate reading is appended to the rolling history. If length exceeds `WindowSize`, the oldest reading is evicted, ensuring strictly bounded $O(W)$ memory footprint.
+7. **Signal Emission**: If an anomaly is flagged, an `AnomalySignal` is emitted with:
+   * `ExpectedValue` = historical mean $\mu$.
+   * `Deviation` = $x_{\text{current}} - \mu$.
+   * `AnomalyScore` = $\min(1.0, \max(0.0, z / \text{maxZScore}))$.
+   * `Evidence` containing $\mu$, $\sigma$, $z$, $Z_{\text{threshold}}$, $W$, $N$, direction, and version.
+
+### 29.3 Concurrency & Process Restart Semantics
+
+* **Thread-Safety**: The detector uses an internal `sync.RWMutex` protecting the rules registry and the per-stream rolling window state.
+* **Process Restarts**: In Phase 5.4, the rolling window state is purely in-memory. Process restarts reset streams to the warm-up state (`MinObservations`), during which statistical signals are suppressed until the window refills. Static threshold detectors continue to provide instant cold-start safety guardrails.
+
+---
+
+## 30. Phase 5.5A: Machine Learning Anomaly Detection Architecture & Design (Design Only)
+
+### 30.1 Purpose & Architectural Scope
+
+This section establishes the formal architectural design for incorporating Machine Learning (ML) based anomaly detection into AegisEdge.
+
+$$\textbf{PHASE 5.5A STATUS: DESIGN ONLY}$$
+* **No ML code, models, or dependencies are introduced in this phase.**
+* **No Python, Cgo, ONNX runtime, TensorFlow Lite, PyTorch, or external C libraries are added.**
+* **No Go detector implementations or SQLite schemas are modified.**
+
+$$\textbf{IMPLEMENTED NOW (Phases 5.1 – 5.4)}$$
+1. **Deterministic Static Threshold Detection (`ThresholdDetector`)**: Instant cold-start ($W=1$), absolute ceilings/floors, hysteresis recovery bands, rate-of-change limits.
+2. **Deterministic Rolling Statistical Detection (`StatisticalDetector`)**: Multi-sample rolling window ($W \le 20$), uncontaminated sample mean and standard deviation, z-score breach evaluation, zero-variance handling.
+3. **Local Incident Lifecycle Engine (`IncidentEngine`)**: $M$-of-$N$ temporal correlation, deduplication, deterministic FSM transitions (`NORMAL` $\rightarrow$ `ANOMALY_DETECTED` $\rightarrow$ `MITIGATING` $\rightarrow$ `RECOVERED` $\rightarrow$ `NORMAL`).
+
+$$\textbf{DESIGNED HERE (Phase 5.5A Target Architecture for Phase 5.5B+)}$$
+1. **Multivariate ML Detector (`MLDetector`)**: Coexists behind the existing `Detector` interface; consumes multi-metric feature vectors from edge telemetry.
+2. **Offline-Trained, Pure-Go Evaluated Isolation Forest**: Pre-trained tree ensemble serialized into an immutable, versioned manifest and traversed via native Go code (zero native C/Python dependencies).
+3. **Strict Boundary Decoupling**: Centralized offline training vs. localized edge inference.
+4. **Resilient Failure Safety**: If the ML model is missing, corrupt, incompatible, or times out, ML inference is skipped without emitting an anomaly or triggering remediation; the deterministic threshold and statistical detectors remain fully active.
+
+---
+
+### 30.2 The ML Pipeline Boundary & Separation of Concerns
+
+The ML detector operates strictly within the existing decoupled five-stage architecture:
+
+```
+Telemetry Collection (MetricSample / TelemetryBatch)
+         ↓
+  Anomaly Detector (Threshold / Statistical / [ML Detector])
+         ↓
+   AnomalySignal (Mathematical deviation contract)
+         ↓
+  Incident Mapper (MapAnomalyToIncident)
+         ↓
+  Incident Engine (M-of-N correlation & FSM lifecycle)
+         ↓
+Safe Actuator Execution (Allowlisted, non-destructive mitigations)
+```
+
+$$\textbf{Mandatory Invariant: AI/ML Inference Never Directly Mutates the Host.}$$
+
+The `MLDetector` is an observational component whose sole responsibility is:
+$$\text{Feature Vector } \mathbf{x} \longrightarrow \text{Inference Algorithm} \longrightarrow \text{AnomalySignal (or nil)}$$
+
+It does **not**:
+* Execute shell commands, modify process priority, or invoke OS syscalls.
+* Declare operational incidents (this authority belongs exclusively to the `IncidentEngine`).
+* Assign operational `IncidentSeverity` directly (severity mapping is mediated by deterministic policy).
+* Automatically trigger or dispatch remediation actions.
+
+---
+
+### 30.3 Evaluation & Selection of Machine Learning Algorithm
+
+To select an initial ML approach appropriate for resource-constrained edge computing (e.g. gateways with 512 MB – 2 GB RAM, ARM/x86_64 CPUs, intermittent connectivity), four candidate paradigms were evaluated:
+
+| Evaluation Criteria | A. Isolation Forest (iForest) | B. Deep Autoencoder (PyTorch/ONNX) | C. One-Class SVM (OC-SVM) | D. Statistical Baseline (Phase 5.4) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Edge Inference Suitability** | **Excellent**: Low complexity ($O(t \cdot \log \psi)$ tree traversal). | Poor–Moderate: Matrix multiplications require neural runtime. | Moderate: Kernel evaluation against support vectors ($O(N_{sv} \cdot d)$). | **Excellent**: $O(1)$ scalar arithmetic. |
+| **Training Requirements** | Low: Unsupervised, sub-sampled ($n=256$), fast convergence. | High: Iterative backpropagation, hyperparameter tuning, GPU beneficial. | Moderate: Quadratic in samples $O(n^2)$ without approximation. | None: Dynamic streaming calculation. |
+| **Computational Cost (CPU)** | **Minimal**: Integer/float threshold comparisons per tree node. | Moderate–High: Dense floating-point tensor operations. | Moderate: Dot products across high-dimensional support vectors. | **Minimal**: Scalar mean and variance. |
+| **Memory Footprint** | **Tiny**: 100 trees $\times$ depth 8 $\approx$ 200–500 KB total. | Heavy: 15–100 MB for runtime + model weights. | Moderate: Scales with number of support vectors (1–10 MB). | **Negligible**: $< 2$ KB per metric stream. |
+| **Explainability** | **High**: Tree path lengths, split thresholds, and isolating features. | Low: Latent space reconstruction error is opaque ("black box"). | Low–Moderate: Distance to hyperplane in kernel feature space. | **Complete**: Exact mean, stddev, and z-score distance. |
+| **Dependency Complexity** | **Zero Native Dependencies**: Evaluated in pure Go via serialized decision trees. | Severe: Requires Cgo, ONNX Runtime (`.so`/`.dll`), or Python daemon. | High: Requires native LibSVM/Cgo bindings for non-linear kernels. | **Zero**: Pure Go standard library. |
+| **Offline Operation** | **Native**: Runs entirely self-contained in process memory. | Native (if runtime packaged), but fragile to shared library drift. | Native (if compiled), but heavy memory retention. | **Native**: 100% offline. |
+| **Small-Data Behavior** | **Robust**: Standard sub-sample size $\psi=256$ prevents swamping/masking. | Poor: Prone to overfitting or failure to reconstruct without large datasets. | Sensitive to parameter $\nu$ and kernel bandwidth $\gamma$. | Limited to univariate rolling window. |
+| **Model Update Complexity** | Simple: JSON/binary artifact replacement over HTTP/NATS. | Complex: Weight checkpointing, tensor format versioning. | Moderate: Dual coefficient and support vector serialization. | Instant: Runtime parameter update. |
+| **Deterministic Inference** | **100% Deterministic**: Immutable tree structure and fixed split points. | Dependent on floating-point SIMD/BLAS implementation. | **100% Deterministic** once support vectors are fixed. | **100% Deterministic**. |
+| **Ease of Go Integration** | **Trivial**: Can be represented as a slice of Go structs with integer indices. | Difficult: Requires Cgo bindings, cross-compilation toolchains. | Moderate: Requires Cgo or custom Go kernel implementation. | **Native**. |
+
+#### Concrete Selection Decision: Isolation Forest (iForest)
+AegisEdge formally selects the **Isolation Forest** ensemble as its initial machine learning anomaly detection algorithm for Phase 5.5.
+
+**Technical Rationale**:
+1. **Zero External Runtime Footprint**: Unlike neural network autoencoders that require massive C++ runtimes (ONNX Runtime, LibTorch) with complex Cgo cross-compilation and shared library dependencies, an Isolation Forest consists strictly of binary decision trees. These can be evaluated in pure Go with zero Cgo dependencies and minimal CPU overhead.
+2. **Sub-Sampling Efficiency**: An Isolation Forest operates by isolating anomalies rather than profiling normal data points. Because anomalies have few similar points and distinct values, they are isolated close to the root of the tree ($E(h(x)) \ll c(\psi)$). Standard sub-sample sizes ($\psi = 256$) are small, training completes in seconds on modest hardware, and inference requires only $O(t \cdot \log \psi)$ comparisons per sample.
+3. **Multivariate Correlation**: While Phase 5.4 statistical z-scores evaluate single metric streams independently, an Isolation Forest evaluates a unified $d$-dimensional feature vector ($d=4$: CPU, Memory, Disk, Temperature). It detects multi-variant anomalies (e.g., moderate CPU elevation combined with rapid temperature rise and high memory pressure) where no individual metric crosses a univariate threshold.
+4. **Predictable Memory & Execution Bounds**: A forest of 100 trees with maximum depth $\lceil \log_2(256) \rceil = 8$ contains at most $100 \times (2^9 - 1) \approx 51,100$ nodes, consuming under 500 KB of RAM. Evaluation executes in tens of microseconds on embedded edge cores.
+
+---
+
+### 30.4 Training vs. Inference Boundary
+
+AegisEdge enforces a strict structural separation between where models are trained and where they are evaluated:
+
+```
+[ Central Control Plane / Analytics Pipeline ]
+  1. Ingest historical TelemetryBatches from SQLite/NATS
+  2. Filter, clean, and validate training dataset (DatasetID, Version)
+  3. Train Isolation Forest (Python/Scikit-Learn or Go CLI tooling)
+  4. Extract feature normalization bounds (mean, stddev / min, max)
+  5. Export immutable, signed Model Manifest (JSON/CBOR + SHA-256)
+                       │
+                       │ Secure Model Distribution (Signed Artifact)
+                       ▼
+[ Edge Node (Autonomous Agent) ]
+  1. Verify manifest integrity (SHA-256 checksum & signature)
+  2. Validate feature schema version compatibility
+  3. Deserialize trees into pure Go memory structures
+  4. Local Real-Time Inference: Telemetry -> Features -> Tree Traversal -> AnomalySignal
+  5. Independent of network availability, control plane, or cloud connectivity
+```
+
+* **Where Training Occurs**: Strictly centralized in the control-plane or an offline ML pipeline. Edge nodes **never** execute training algorithms, backpropagation, or tree generation.
+* **What Data Is Used**: Validated historical telemetry batches previously ingested and persisted in control-plane storage, representing known normal operating baselines.
+* **When Training Happens**: Asynchronous, scheduled batch jobs or operator-triggered pipeline runs.
+* **How Models Reach the Edge**: Packaged as immutable, versioned model manifests distributed over existing sync/configuration channels (or pre-baked into container/OS images).
+* **Behavior If No Model Exists**: If an edge node boots without an ML model manifest, the `MLDetector` enters the `MODEL_MISSING` state and skips inference. The node remains fully protected by the deterministic `ThresholdDetector` and `StatisticalDetector`.
+* **Compatibility Verification**: The model manifest contains an explicit `feature_schema_version`. If the edge agent's telemetry generator does not match the model's feature schema, the model is rejected.
+
+---
+
+### 30.5 Edge-First Local Inference Invariants
+
+Local inference on the edge must adhere to the following bounded guarantees:
+1. **Network Independence**: Local inference is independent of network availability, subject to model availability and local compute/resources. Once a valid model manifest is loaded into process memory, zero network I/O, DNS lookups, or RPC calls occur during evaluation.
+2. **Bounded Execution**: Evaluation latency is deterministic and bounded by the maximum tree depth. It must not block telemetry ingestion or persistence.
+3. **No Durability Coupling**: ML inference operates on in-memory feature vectors; inference state is ephemeral and resets cleanly on process reboot.
+
+---
+
+### 30.6 Dedicated Model Metadata Contract
+
+The model artifact is governed by a dedicated contract (`MLModelManifest`) completely decoupled from operational incident schemas:
+
+```go
+package ml
+
+import (
+    "time"
+)
+
+// ModelStatus represents the lifecycle state of a deployed model artifact.
+type ModelStatus string
+
+const (
+    ModelStatusActive   ModelStatus = "ACTIVE"
+    ModelStatusStale    ModelStatus = "STALE"
+    ModelStatusDisabled ModelStatus = "DISABLED"
+)
+
+// FeatureNormalizationParams stores immutable scaling parameters computed during training.
+type FeatureNormalizationParams struct {
+    MetricName string  `json:"metric_name"`
+    Mean       float64 `json:"mean"`
+    StdDev     float64 `json:"std_dev"`
+    Min        float64 `json:"min"`
+    Max        float64 `json:"max"`
+}
+
+// IsolationTreeNode represents a single node in a pure Go compiled decision tree.
+type IsolationTreeNode struct {
+    FeatureIndex int     `json:"feature_index"` // -1 for leaf nodes
+    SplitValue   float64 `json:"split_value"`
+    LeftChild    int     `json:"left_child"`    // index in tree slice; -1 if leaf
+    RightChild   int     `json:"right_child"`   // index in tree slice; -1 if leaf
+    Size         int     `json:"size"`          // number of samples in leaf
+}
+
+// IsolationTree represents a single isolation tree.
+type IsolationTree struct {
+    RootIndex int                 `json:"root_index"`
+    Nodes     []IsolationTreeNode `json:"nodes"`
+}
+
+// MLModelManifest defines the complete, self-contained, serializable model artifact.
+type MLModelManifest struct {
+    ModelID              string                       `json:"model_id"`
+    ModelVersion         string                       `json:"model_version"`
+    Algorithm            string                       `json:"algorithm"` // e.g. "isolation_forest"
+    FeatureSchemaVersion string                       `json:"feature_schema_version"` // e.g. "features.v1.0.0"
+    TrainingDatasetID    string                       `json:"training_dataset_id"`
+    CreatedAt            time.Time                    `json:"created_at"`
+    InputDimensions      int                          `json:"input_dimensions"` // e.g. 4
+    SupportedMetrics     []string                     `json:"supported_metrics"`
+    NormalizationParams  []FeatureNormalizationParams `json:"normalization_params"`
+    Trees                []IsolationTree              `json:"trees"`
+    SubSampleSize        int                          `json:"sub_sample_size"` // e.g. 256
+    DecisionThreshold    float64                      `json:"decision_threshold"` // e.g. 0.60
+    ChecksumSHA256       string                       `json:"checksum_sha256"`
+    Status               ModelStatus                  `json:"status"`
+}
+```
+
+---
+
+### 30.7 Feature Engineering & Schema Versioning
+
+The initial ML detector consumes only the telemetry metrics actually generated by [`edge/agent/telemetry/generator.go`](file:///C:/AegisEdge/edge/agent/telemetry/generator.go):
+
+| Index | Metric Name | Engineering Unit | Safe Operating Envelope | Semantics in Vector |
+| :--- | :--- | :--- | :--- | :--- |
+| **0** | `cpu_usage_percent` | Percentage $[0.0, 100.0]$ | $40\% \pm 20\%$ synthetic sine | Primary compute load indicator |
+| **1** | `memory_usage_percent` | Percentage $[0.0, 100.0]$ | $60\% \pm 10\%$ synthetic cosine | Primary memory pressure indicator |
+| **2** | `disk_usage_percent` | Percentage $[0.0, 100.0]$ | $35\% \rightarrow 40\%$ creeping ramp | Storage exhaustion indicator |
+| **3** | `temperature_celsius` | Celsius $[-40.0, 125.0]$ | $50^\circ\text{C} \pm 8^\circ\text{C}$ synthetic sine | Thermal stress indicator |
+
+**Feature Vector Definition**:
+$$\mathbf{x} = \begin{bmatrix} x_{\text{cpu}} \\ x_{\text{mem}} \\ x_{\text{disk}} \\ x_{\text{temp}} \end{bmatrix} \in \mathbb{R}^4$$
+
+* **Feature Schema Identifier**: `features.v1.0.0`
+* **Ordering Guarantee**: Metrics are ordered strictly by the integer index specified in the manifest to ensure consistent tree evaluation.
+* **Vector Assembly**: As telemetry samples arrive in a `TelemetryBatch`, the detector aligns them by timestamp to construct $\mathbf{x}$. If any metric in the schema is missing from the batch, the evaluation for that step is skipped.
+
+---
+
+### 30.8 Feature Normalization Strategy
+
+To prevent training/serving skew (where edge nodes interpret features differently from the training pipeline):
+1. **Offline Computation**: During model training on the central control plane, normalization parameters (mean $\mu_i$ and standard deviation $\sigma_i$, or minimum $min_i$ and maximum $max_i$) are calculated over the entire training baseline dataset.
+2. **Artifact Embedding**: These immutable parameters are embedded directly into the `NormalizationParams` field of `MLModelManifest`.
+3. **Inference Execution**: When an edge node constructs feature vector $\mathbf{x}$, it normalizes each component using the manifest's parameters:
+   $$\hat{x}_i = \frac{x_i - \mu_i}{\sigma_i}$$
+4. **No Local Recalculation**: Edge nodes **never** independently compute or adjust normalization parameters dynamically. This guarantees that model evaluation on the edge is mathematically identical to evaluation during offline validation.
+
+---
+
+### 30.9 Model Output to `AnomalySignal` Mapping
+
+The raw Isolation Forest score represents the average path length required to isolate a sample:
+
+$$s(\mathbf{x}, \psi) = 2^{-\frac{E(h(\mathbf{x}))}{c(\psi)}}$$
+
+where:
+* $h(\mathbf{x})$ is the path length (number of edges traversed) for sample $\mathbf{x}$ in an isolation tree.
+* $E(h(\mathbf{x}))$ is the average path length across all $T$ trees in the forest.
+* $c(\psi)$ is the average path length of an unsuccessful search in a Binary Search Tree (BST) built from $\psi$ samples:
+  $$c(\psi) = 2 \left( \ln(\psi - 1) + 0.5772156649 \right) - \frac{2(\psi - 1)}{\psi}$$
+
+**Interpretation**:
+* When $E(h(\mathbf{x})) \to 0$, $s \to 1.0$ (sample isolates near root $\rightarrow$ highly anomalous).
+* When $E(h(\mathbf{x})) \to c(\psi)$, $s \to 0.5$ (sample exhibits typical baseline behavior).
+* When $E(h(\mathbf{x})) \to \psi - 1$, $s \to 0.0$ (sample requires deep search $\rightarrow$ entirely normal).
+
+**Domain Signal Mapping**:
+If $s(\mathbf{x}, \psi) \ge \tau$ (where $\tau = \text{DecisionThreshold}$, e.g. 0.60):
+* `AnomalyID`: Derived deterministically using `DefaultDeterministicAnomalyID` based on SHA-256 of `(NodeID, "multivariate_telemetry", ModelVersion, Timestamp, BatchID, s)`.
+* `NodeID`: Device ID from batch.
+* `MetricName`: `"composite_multivariate"` (or dominant contributing metric).
+* `ObservedValue`: Raw anomaly score $s$.
+* `ExpectedValue`: Decision threshold $\tau$.
+* `Deviation`: $s - \tau$.
+* `AnomalyScore`: Normalized intensity in $[0.0, 1.0]$:
+  $$\text{AnomalyScore} = \min\left(1.0, \max\left(0.0, \frac{s - \tau}{1.0 - \tau}\right)\right)$$
+* `DetectionMethod`: `"ml_isolation_forest"`
+* `Evidence`: Diagnostic map including `model_id`, `model_version`, `raw_score`, `threshold`, `tree_count`, `avg_path_length`, `feature_vector`, and `top_feature`.
+
+---
+
+### 30.10 Anomaly Score Semantics
+
+$$\textbf{AnomalyScore is a Normalized Anomaly Indicator, NOT a Probability.}$$
+
+AegisEdge strictly preserves the semantics of `AnomalySignal.AnomalyScore` $\in [0.0, 1.0]$:
+* It quantifies the mathematical distance of the anomaly above the decision threshold $\tau$.
+* An `AnomalyScore` of `0.85` means the feature vector isolated significantly faster than the threshold.
+* **It does NOT mean**:
+  * An 85% probability that the edge node will crash.
+  * An 85% confidence score from a classifier.
+  * A statistical $p$-value or significance level.
+
+Downstream operational severity (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`) remains under the exclusive jurisdiction of the `IncidentEngine` and its operational policies.
+
+---
+
+### 30.11 Model Failure Safety & Degradation Strategy
+
+The `MLDetector` must fail safely under all circumstances. Under no conditions may an ML failure cause an edge agent crash, corrupt telemetry buffers, or trigger an autonomous remediation action.
+
+**Safety Rules**:
+1. **Missing or Unloaded Model**: If no model is loaded, `Detect()` returns `(nil, nil)`.
+2. **Corrupted or Checksum-Mismatched Artifact**: The detector refuses to load the model, logs an error at `WARN` level, transitions model status to `DISABLED`, and returns `(nil, nil)`.
+3. **Feature Schema Mismatch**: If input telemetry does not match `InputDimensions` or expected metrics, evaluation is safely skipped (`nil, nil`).
+4. **Invalid Values (`NaN`, `+Inf`, `-Inf`)**: Rejected immediately via domain validation; skipped without tree traversal.
+5. **Inference Timeout or Panic**: Wrapped in an internal `recover()` block. If an evaluation panics, the panic is caught, an error counter is incremented, and `(nil, nil)` is returned.
+6. **No Spurious Escalation**: A failure in the ML pipeline produces a diagnostic log event, **never** an operational `Incident` and **never** a mitigation action.
+
+---
+
+### 30.12 Multi-Detector Architecture
+
+In Phase 5.5+, the edge agent will support three complementary detectors coexisting side-by-side behind the common [`Detector`](file:///C:/AegisEdge/edge/agent/detector/detector.go#L20-L35) contract:
+
+```
+                            types.TelemetryBatch
+                                     │
+                 ┌───────────────────┼───────────────────┐
+                 ▼                   ▼                   ▼
+        ThresholdDetector   StatisticalDetector     MLDetector
+          (Static bounds)    (Univariate z-score)   (Multivariate)
+                 │                   │                   │
+                 ▼                   ▼                   ▼
+           AnomalySignal       AnomalySignal       AnomalySignal
+                 └───────────────────┬───────────────────┘
+                                     ▼
+                            MapAnomalyToIncident
+                                     ▼
+                              IncidentEngine
+                      (M-of-N Temporal Correlation)
+```
+
+* **Independent Evaluation**: Each detector evaluates telemetry independently and emits standard `AnomalySignal` events.
+* **No Score Blending**: Detector scores are **not** blended, averaged, or ensembled into a composite score. Each signal preserves its distinct `DetectionMethod` provenance.
+* **Incident Engine Correlation**: The `IncidentEngine` correlates signals across time and metrics using its deterministic $M$-of-$N$ window. A threshold breach on CPU and an ML anomaly on composite telemetry can independently contribute to incident escalation according to operational policies.
+
+---
+
+### 30.13 Cold-Start Behavior
+
+When an edge node boots or restarts:
+1. **Static Ceilings Active Immediately**: `ThresholdDetector` provides instantaneous safety protection ($W=1$) from the very first sample.
+2. **Statistical Warming Up**: `StatisticalDetector` suppresses anomalies until $N \ge \text{MinObservations}$ (e.g. 10 samples arrive).
+3. **ML Model Readiness Check**:
+   * If a validated model artifact is present on disk, it is loaded into memory, verified via SHA-256, and immediately ready to evaluate full feature vectors.
+   * If no model is present, ML detection is disabled; no synthetic training data is generated, and no cold-start retraining is attempted on the node.
+
+---
+
+### 30.14 Model Versioning & Provenance
+
+Every model artifact must include complete provenance tracking:
+* `model_id`: Stable identifier (e.g. `aegisedge-iforest-gateway`).
+* `model_version`: Semantic version string (e.g. `1.2.0`).
+* `feature_schema_version`: Compatibility key (e.g. `features.v1.0.0`).
+* `checksum_sha256`: Hexadecimal SHA-256 digest of the entire canonical manifest payload.
+* `training_dataset_id`: Audit trace linking the model to the exact historical telemetry snapshot used for training.
+
+A model artifact whose checksum does not match its payload or whose feature schema is unsupported by the agent is rejected at load time.
+
+---
+
+### 30.15 Model Security & Integrity
+
+To ensure malicious or corrupted models cannot compromise edge operations:
+1. **Cryptographic Checksum**: The agent verifies `checksum_sha256` before parsing model trees.
+2. **Strict Schema Constraints**: Tree depths, node counts, and feature indices are bounded at parse time. A manifest specifying an invalid feature index ($< 0$ or $\ge \text{InputDimensions}$) is rejected.
+3. **Memory Safety**: Because trees are pure Go data structures, traversal cannot execute arbitrary machine code, shell commands, or buffer overflows.
+
+---
+
+### 30.16 Explainability & Attribution
+
+Because operators must understand why an anomaly was raised before approving or auditing responses, `MLDetector` extracts tree path attribution:
+* **Average Path Length**: Reported in evidence (`"avg_path_length": "3.42"`).
+* **Dominant Isolating Feature**: During tree traversal, the detector tracks which feature caused the earliest split decisions. The feature most frequently responsible for early isolation is recorded in evidence (`"top_contributor": "temperature_celsius"`).
+* **Attribution Boundary**: The detector reports mathematical feature contribution; it does **not** assert unsupported causal diagnoses (e.g. it does not claim "fan failure caused CPU overheating").
+
+---
+
+### 30.17 Determinism
+
+* **Inference Invariant**: Given the same immutable model artifact and the same input feature vector $\mathbf{x}$, `MLDetector.Detect()` will produce identical traversal paths, identical path lengths, identical anomaly scores, and identical AnomalyIDs across all runs and architectures.
+* **Training vs. Inference**: While Isolation Forest training uses randomized sub-sampling and random split selection, once training completes, the resulting trees, split thresholds, and normalization bounds are frozen into the immutable manifest. Random seeds are never used during inference.
+
+---
+
+### 30.18 Edge Resource Constraints
+
+The implementation in Phase 5.5B+ must satisfy strict operational budgets:
+* **CPU Budget**: Average inference latency $< 100\,\mu\text{s}$ per feature vector on a modern x86/ARM core; $< 5\%$ CPU utilization during active 1 Hz evaluation.
+* **RAM Budget**: $< 2$ MB total memory for the model manifest, tree structures, and normalization vectors.
+* **Disk Footprint**: $< 500$ KB for the serialized manifest file.
+* **Benchmarking Obligation**: Latency and allocation budgets must be empirically measured via Go benchmarks (`go test -bench`) during Phase 5.5B before declaring production readiness.
+
+---
+
+### 30.19 Future Observability Design
+
+The ML detector will expose standard telemetry metrics once implemented:
+* `aegisedge_ml_detector_inferences_total`: Counter tracking evaluations performed.
+* `aegisedge_ml_detector_anomalies_detected_total`: Counter tracking signals emitted.
+* `aegisedge_ml_detector_inferences_skipped_total`: Counter tracking skipped evaluations (missing metrics, uninitialized model).
+* `aegisedge_ml_detector_inference_duration_seconds`: Histogram measuring evaluation latency.
+* `aegisedge_ml_detector_model_status`: Gauge reflecting current lifecycle status (`0 = MISSING`, `1 = ACTIVE`, `2 = CORRUPT`, `3 = SCHEMA_MISMATCH`).
+
+---
+
+### 30.20 Comprehensive ML Failure Matrix
+
+The following matrix documents designed behavior across thirteen edge ML operating conditions:
+
+| ID | Scenario | Local Telemetry | ML Detector Behavior | AnomalySignal Behavior | Incident Engine Impact | Safety & Recovery Semantics |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **A** | Model missing on boot | Persisted to SQLite | Skips inference; logs `INFO` | None emitted (`nil, nil`) | None; no spurious alerts | Safe degradation; Threshold and Statistical detectors active. |
+| **B** | Model file corrupted | Persisted to SQLite | Fails load; logs `WARN` | None emitted (`nil, nil`) | None; no spurious alerts | Model status marked `DISABLED`; relies on deterministic rules. |
+| **C** | Checksum mismatch | Persisted to SQLite | Rejects artifact; logs `ERROR` | None emitted (`nil, nil`) | None; no spurious alerts | Prevents execution of tampered/damaged model. |
+| **D** | Feature schema mismatch | Persisted to SQLite | Skips evaluation; logs `WARN` | None emitted (`nil, nil`) | None; no spurious alerts | Safe degradation; prevents out-of-bounds array access. |
+| **E** | Invalid telemetry (`NaN`/`Inf`) | Rejected by validation | Discards sample; logs `WARN` | None emitted (`nil, err`) | None; no spurious alerts | Invalid values rejected before reaching ML feature vector. |
+| **F** | Inference runtime panic | Persisted to SQLite | Catches via `recover()`; logs `ERROR` | None emitted (`nil, nil`) | None; no spurious alerts | Agent loop continues running; error counter incremented. |
+| **G** | Inference timeout | Persisted to SQLite | Context cancelled; returns timeout | None emitted (`nil, err`) | None; no spurious alerts | Telemetry loop never blocks waiting for inference. |
+| **H** | Missing vector metrics | Persisted to SQLite | Incomplete vector; skips evaluation | None emitted (`nil, nil`) | None; no spurious alerts | Evaluation resumes when complete metric set arrives. |
+| **I** | Agent restart recovery | Recovered from WAL | Re-verifies and reloads model | None during restart | Preserves active incidents | Cold-start safety; Threshold detector protects immediately. |
+| **J** | Model version mismatch | Persisted to SQLite | Rejects incompatible model | None emitted (`nil, nil`) | None; no spurious alerts | Requires operator/pipeline model update with matching schema. |
+| **K** | High system resource load | Persisted in batches | Throttles ML evaluation frequency | Evaluates as capacity allows | Preserves core collection | Under extreme memory pressure, ML evaluation is shed first. |
+| **L** | Nominal feature vector | Persisted to SQLite | Score $s < \tau$; classified normal | None emitted (`nil, nil`) | FSM remains `NORMAL` | Standard healthy operating path. |
+| **M** | Anomalous feature vector | Persisted to SQLite | Score $s \ge \tau$; anomaly flagged | Emits `AnomalySignal` | Evaluates $M$-of-$N$ policy | Enters Incident Engine correlation pipeline safely. |
+
+---
+
+### 30.21 Training Data, Model Drift, and Lifecycle Management
+
+While automated online learning is out of scope, the lifecycle architecture is designed for maintainability:
+1. **Baseline Dataset Freezing**: Training datasets must be extracted from verified normal operating windows, tagged with `DatasetID`, and archived in control-plane storage.
+2. **Concept & Feature Drift Detection**:
+   * Offline monitoring in the control plane compares incoming edge telemetry distributions against training baseline distributions using Population Stability Index (PSI) or Kolmogorov-Smirnov (KS) tests.
+   * If feature drift exceeds threshold ($\text{PSI} > 0.25$), a retraining alert is raised for operators.
+3. **Model Rollback**: If a newly deployed model version generates excessive false positives, the control plane dispatches a rollback directive specifying the prior stable `ModelVersion`, which the edge agent restores from its local artifact cache.
+
+---
+
+### 30.22 Implementation Roadmap: Phases 5.5B – 5.5D
+
+The technical path to operational ML anomaly detection is structured across three distinct future engineering phases:
+* **Phase 5.5B (Go Evaluation Engine & Artifact Parser)**:
+  * Implement `MLModelManifest` parser and validator in `edge/agent/detector/ml/`.
+  * Implement pure Go Isolation Forest traversal engine.
+  * Implement `MLDetector` satisfying the canonical `Detector` interface.
+  * Unit and property-based test suite verifying deterministic traversal and failure safety.
+* **Phase 5.5C (Offline Training & Packaging Tooling)**:
+  * Develop offline training CLI tool (`cmd/aegisedge-train`) to fit Isolation Forests on historical batches.
+  * Export, normalize, and cryptographically sign model manifest artifacts.
+* **Phase 5.5D (Integrated Verification & Benchmarking)**:
+  * End-to-end integration testing across the full multi-detector pipeline: Telemetry $\rightarrow$ Persist $\rightarrow$ Threshold + Statistical + ML $\rightarrow$ Incident Engine $\rightarrow$ Verification.
+  * Empirical memory and CPU profiling benchmarks under simulated edge load.
