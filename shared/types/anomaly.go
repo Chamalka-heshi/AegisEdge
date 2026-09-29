@@ -24,17 +24,19 @@ const (
 )
 
 // AnomalySignal represents a discrete mathematical deviation detected in a telemetry stream.
-// It is an intermediate domain entity emitted by detectors and consumed by the Incident Engine.
+// It is an intermediate domain entity emitted by detectors and consumed to produce an Incident:
+// MetricSample -> Detector -> AnomalySignal -> Incident.
+// AnomalySignal represents raw detector output; Incident represents the operational domain entity.
 // ADR-0009 §8 enforces strict separation between mathematical AnomalyScore [0.0, 1.0]
 // and operational IncidentSeverity (LOW, MEDIUM, HIGH, CRITICAL).
 type AnomalySignal struct {
-	// AnomalyID is the globally unique identifier for this detection instance (UUIDv4).
+	// AnomalyID is the globally unique identifier for this detection instance.
 	AnomalyID string `json:"anomaly_id"`
 
 	// NodeID identifies the edge device on which the anomaly was detected.
 	NodeID string `json:"node_id"`
 
-	// MetricName identifies the specific telemetry metric evaluated (e.g. "cpu_utilization_percent").
+	// MetricName identifies the specific telemetry metric evaluated (e.g. "cpu_usage_percent").
 	MetricName string `json:"metric_name"`
 
 	// ObservedValue is the numerical value that triggered the detection.
@@ -46,7 +48,8 @@ type AnomalySignal struct {
 	// Deviation is the mathematical distance between observed and expected (Observed - Expected).
 	Deviation float64 `json:"deviation"`
 
-	// AnomalyScore is the normalized deviation magnitude [0.0 to 1.0], or statistical z-score.
+	// AnomalyScore is the normalized threshold-distance indicator [0.0 to 1.0] (|deviation| / maxDeviation).
+	// It is NOT a probability, confidence, likelihood, or statistical significance metric.
 	AnomalyScore float64 `json:"anomaly_score"`
 
 	// DetectionMethod identifies the algorithm or strategy (e.g., "static_threshold", "ewma", "z_score").
