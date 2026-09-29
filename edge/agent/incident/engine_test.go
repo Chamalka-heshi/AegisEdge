@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
@@ -579,4 +580,291 @@ func TestIncidentEngine_ConcurrentProcessing(t *testing.T) {
 		_ = eng.GetActiveIncident(node, "cpu_usage_percent")
 		_ = eng.GetActiveIncident(node, "memory_usage_percent")
 	}
+}
+
+// TEST 16 — Comprehensive Local Incident Lifecycle according to Phase 5.3 specifications
+func TestLocalIncidentLifecycle_Comprehensive(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 29, 14, 0, 0, 0, time.UTC)
+
+	eng, err := incident.NewLocalEngine(incident.PolicyConfig{
+		M:              1,
+		N:              1,
+		WindowDuration: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// 1. Incident registration
+	incA := &types.Incident{
+		IncidentID:    "inc-phase53-001",
+		NodeID:        "node-01",
+		RuleName:      "threshold_cpu_usage_percent",
+		Severity:      types.SeverityHigh,
+		Status:        types.StatusAnomalyDetected,
+		Description:   "CPU threshold breach",
+		TriggerMetric: "cpu_usage_percent",
+		TriggerValue:  95.0,
+		Threshold:     90.0,
+		TriggeredAt:   now,
+		UpdatedAt:     now,
+	}
+
+	regInc, err := eng.RegisterIncident(ctx, incA)
+	if err != nil {
+		t.Fatalf("failed to register incident: %v", err)
+	}
+	if regInc == nil {
+		t.Fatal("expected non-nil incident on registration")
+	}
+
+	// 2. Incident retrieval
+	activeA := eng.GetActiveIncident("node-01", "cpu_usage_percent")
+	if activeA == nil {
+		t.Fatal("expected active incident from GetActiveIncident, got nil")
+	}
+	if activeA.IncidentID != "inc-phase53-001" {
+		t.Errorf("expected IncidentID inc-phase53-001, got %s", activeA.IncidentID)
+	}
+
+	// 3. Valid state transition (ANOMALY_DETECTED -> MITIGATING)
+	t1 := now.Add(time.Second)
+	mitInc, err := eng.TransitionActiveIncident(ctx, "node-01", "cpu_usage_percent", types.StatusMitigating, t1)
+	if err != nil {
+		t.Fatalf("transition to MITIGATING failed: %v", err)
+	}
+	if mitInc.Status != types.StatusMitigating {
+		t.Errorf("expected status MITIGATING, got %s", mitInc.Status)
+	}
+
+	// 4. Invalid state transition (MITIGATING -> NORMAL is invalid in FSM)
+	_, err = eng.TransitionActiveIncident(ctx, "node-01", "cpu_usage_percent", types.StatusNormal, t1.Add(time.Second))
+	if err == nil {
+		t.Error("expected error transitioning MITIGATING directly to NORMAL, got nil")
+	}
+
+	// 5. Duplicate IncidentID (idempotent re-registration)
+	t2 := now.Add(2 * time.Second)
+	dupIncA := *incA
+	dupIncA.UpdatedAt = t2
+	dupIncA.TriggerValue = 96.0
+	reReg, err := eng.RegisterIncident(ctx, &dupIncA)
+	if err != nil {
+		t.Fatalf("re-registration of same IncidentID should succeed idempotently: %v", err)
+	}
+	if reReg.IncidentID != "inc-phase53-001" {
+		t.Errorf("expected re-registered IncidentID inc-phase53-001, got %s", reReg.IncidentID)
+	}
+
+	// 6. Duplicate active incident with different IncidentID rejected
+	diffIncA := *incA
+	diffIncA.IncidentID = "inc-phase53-different"
+	_, err = eng.RegisterIncident(ctx, &diffIncA)
+	if !errors.Is(err, incident.ErrIncidentAlreadyActive) {
+		t.Errorf("expected ErrIncidentAlreadyActive when registering different ID while active, got: %v", err)
+	}
+
+	// 7. Multiple active incidents on same node with different metrics
+	incMem := &types.Incident{
+		IncidentID:    "inc-phase53-mem-001",
+		NodeID:        "node-01",
+		RuleName:      "threshold_memory_usage_percent",
+		Severity:      types.SeverityCritical,
+		Status:        types.StatusAnomalyDetected,
+		Description:   "Memory threshold breach",
+		TriggerMetric: "memory_usage_percent",
+		TriggerValue:  92.0,
+		Threshold:     85.0,
+		TriggeredAt:   now,
+		UpdatedAt:     now,
+	}
+	regMem, err := eng.RegisterIncident(ctx, incMem)
+	if err != nil {
+		t.Fatalf("failed to register memory incident on same node: %v", err)
+	}
+	if regMem == nil {
+		t.Fatal("expected non-nil memory incident")
+	}
+
+	// 8 & 9. Different nodes (same metric on different nodes isolated)
+	incNode2 := &types.Incident{
+		IncidentID:    "inc-phase53-node2-cpu",
+		NodeID:        "node-02",
+		RuleName:      "threshold_cpu_usage_percent",
+		Severity:      types.SeverityHigh,
+		Status:        types.StatusAnomalyDetected,
+		Description:   "Node 2 CPU breach",
+		TriggerMetric: "cpu_usage_percent",
+		TriggerValue:  91.0,
+		Threshold:     90.0,
+		TriggeredAt:   now,
+		UpdatedAt:     now,
+	}
+	regNode2, err := eng.RegisterIncident(ctx, incNode2)
+	if err != nil {
+		t.Fatalf("failed to register node-02 CPU incident: %v", err)
+	}
+	if regNode2 == nil {
+		t.Fatal("expected non-nil node-02 incident")
+	}
+
+	if eng.GetActiveIncident("node-01", "cpu_usage_percent") == nil {
+		t.Error("missing node-01 cpu incident")
+	}
+	if eng.GetActiveIncident("node-02", "cpu_usage_percent") == nil {
+		t.Error("missing node-02 cpu incident")
+	}
+
+	// 10. Canonical Recovery & FSM Enforcement:
+	// Transition node-01 from MITIGATING -> RECOVERED
+	t3 := now.Add(3 * time.Second)
+	recInc, err := eng.TransitionActiveIncident(ctx, "node-01", "cpu_usage_percent", types.StatusRecovered, t3)
+	if err != nil {
+		t.Fatalf("transition to RECOVERED failed: %v", err)
+	}
+	if recInc.Status != types.StatusRecovered {
+		t.Errorf("expected status RECOVERED, got %s", recInc.Status)
+	}
+	if recInc.ResolvedAt == nil {
+		t.Error("expected non-nil ResolvedAt upon recovery")
+	}
+
+	// 11. Recovered -> Normal transition
+	t4 := now.Add(4 * time.Second)
+	normInc, err := eng.TransitionActiveIncident(ctx, "node-01", "cpu_usage_percent", types.StatusNormal, t4)
+	if err != nil {
+		t.Fatalf("transition from RECOVERED to NORMAL failed: %v", err)
+	}
+	if normInc.Status != types.StatusNormal {
+		t.Errorf("expected status NORMAL, got %s", normInc.Status)
+	}
+	if eng.GetActiveIncident("node-01", "cpu_usage_percent") != nil {
+		t.Error("expected active incident to be nil after transition to NORMAL")
+	}
+
+	// Verify that direct ResolveIncident on an incident in ANOMALY_DETECTED is rejected by the canonical FSM
+	_, err = eng.ResolveIncident(ctx, "node-02", "cpu_usage_percent", t4)
+	if err == nil {
+		t.Error("expected ResolveIncident to reject direct recovery from ANOMALY_DETECTED, got nil")
+	}
+
+	// Transition node-02 from ANOMALY_DETECTED -> MITIGATING, then ResolveIncident succeeds canonically
+	_, err = eng.TransitionActiveIncident(ctx, "node-02", "cpu_usage_percent", types.StatusMitigating, t4)
+	if err != nil {
+		t.Fatalf("transition node-02 to MITIGATING failed: %v", err)
+	}
+	resolvedNode2, err := eng.ResolveIncident(ctx, "node-02", "cpu_usage_percent", t4.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ResolveIncident failed on MITIGATING incident: %v", err)
+	}
+	if resolvedNode2.Status != types.StatusRecovered {
+		t.Errorf("expected status RECOVERED on node-02, got %s", resolvedNode2.Status)
+	}
+
+	// Verify lifecycle cleanup: CloseActiveIncident on ANOMALY_DETECTED cleans up stream without forging RECOVERED
+	closedMem, err := eng.CloseActiveIncident(ctx, "node-01", "memory_usage_percent", t4.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("CloseActiveIncident failed: %v", err)
+	}
+	if closedMem.Status != types.StatusAnomalyDetected {
+		t.Errorf("expected CloseActiveIncident on ANOMALY_DETECTED not to forge RECOVERED, got %s", closedMem.Status)
+	}
+	if eng.GetActiveIncident("node-01", "memory_usage_percent") != nil {
+		t.Error("expected active incident cleared after CloseActiveIncident")
+	}
+
+	// 12. Incident identity remains stable across updates
+	// 13. Detector-generated incident accepted by engine
+	det, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
+		Version: "1.0.0",
+		Rules:   detector.DefaultRules(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create detector: %v", err)
+	}
+	sample := types.MetricSample{
+		NodeID:    "node-det-01",
+		Name:      "cpu_usage_percent",
+		Value:     98.0,
+		Timestamp: now,
+	}
+	sig, err := det.Detect(ctx, sample)
+	if err != nil || sig == nil {
+		t.Fatalf("detector failed to create anomaly signal: %v", err)
+	}
+	mappedInc, err := det.MapToIncident(sig)
+	if err != nil || mappedInc == nil {
+		t.Fatalf("MapToIncident failed: %v", err)
+	}
+	regDetInc, err := eng.RegisterIncident(ctx, mappedInc)
+	if err != nil {
+		t.Fatalf("engine failed to register detector-generated incident: %v", err)
+	}
+	if regDetInc.IncidentID != mappedInc.IncidentID {
+		t.Errorf("expected IncidentID %s, got %s", mappedInc.IncidentID, regDetInc.IncidentID)
+	}
+
+	// 14. Detector repeated breach does not create duplicate active incidents
+	sample2 := types.MetricSample{
+		NodeID:    "node-det-01",
+		Name:      "cpu_usage_percent",
+		Value:     99.0, // persistent breach
+		Timestamp: now.Add(time.Second),
+	}
+	sig2, err := det.Detect(ctx, sample2)
+	if err != nil {
+		t.Fatalf("unexpected error on repeated breach: %v", err)
+	}
+	if sig2 != nil {
+		t.Errorf("expected nil AnomalySignal due to repeated breach suppression, got: %+v", sig2)
+	}
+
+	// 15. Nil/invalid incident rejected
+	_, err = eng.RegisterIncident(ctx, nil)
+	if !errors.Is(err, incident.ErrNilIncident) {
+		t.Errorf("expected ErrNilIncident on nil registration, got %v", err)
+	}
+
+	// 16. Invalid incident fields rejected
+	badInc := *mappedInc
+	badInc.IncidentID = ""
+	_, err = eng.RegisterIncident(ctx, &badInc)
+	if err == nil {
+		t.Error("expected error on incident with empty IncidentID, got nil")
+	}
+
+	badStatusInc := *mappedInc
+	badStatusInc.Status = types.StatusRecovered // cannot register recovered incident
+	_, err = eng.RegisterIncident(ctx, &badStatusInc)
+	if !errors.Is(err, incident.ErrInvalidIncidentStatus) {
+		t.Errorf("expected ErrInvalidIncidentStatus, got %v", err)
+	}
+
+	// 17. Concurrent access with race detection
+	var wg sync.WaitGroup
+	const concurrentWorkers = 20
+	wg.Add(concurrentWorkers)
+	for i := 0; i < concurrentWorkers; i++ {
+		go func(workerID int) {
+			defer wg.Done()
+			streamMetric := fmt.Sprintf("metric_worker_%d", workerID%5)
+			cInc := &types.Incident{
+				IncidentID:    fmt.Sprintf("inc-conc-%d", workerID),
+				NodeID:        "node-conc",
+				RuleName:      "threshold_" + streamMetric,
+				Severity:      types.SeverityMedium,
+				Status:        types.StatusAnomalyDetected,
+				Description:   "Concurrent breach",
+				TriggerMetric: streamMetric,
+				TriggerValue:  95.0,
+				Threshold:     90.0,
+				TriggeredAt:   now,
+				UpdatedAt:     now,
+			}
+			_, _ = eng.RegisterIncident(ctx, cInc)
+			_ = eng.GetActiveIncident("node-conc", streamMetric)
+		}(i)
+	}
+	wg.Wait()
 }

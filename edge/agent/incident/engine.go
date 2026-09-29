@@ -16,14 +16,17 @@ import (
 
 // Common incident engine domain errors.
 var (
-	ErrNilAnomalySignal    = errors.New("anomaly signal cannot be nil")
-	ErrInvalidPolicyConfig = errors.New("invalid incident policy configuration: M must be >= 1 and <= N")
-	ErrStaleAnomalySignal  = errors.New("anomaly signal timestamp predates observation window")
-	ErrNoActiveIncident    = errors.New("no active incident found for correlation key")
+	ErrNilAnomalySignal      = errors.New("anomaly signal cannot be nil")
+	ErrNilIncident           = errors.New("incident cannot be nil")
+	ErrInvalidIncidentStatus = errors.New("cannot register incident: status must be ANOMALY_DETECTED")
+	ErrIncidentAlreadyActive = errors.New("an active incident already exists for this node and metric stream")
+	ErrInvalidPolicyConfig   = errors.New("invalid incident policy configuration: M must be >= 1 and <= N")
+	ErrStaleAnomalySignal    = errors.New("anomaly signal timestamp predates observation window")
+	ErrNoActiveIncident      = errors.New("no active incident found for correlation key")
 )
 
 // IncidentEngine defines the boundary for local edge incident correlation and lifecycle management.
-// It evaluates AnomalySignals against an M-of-N sliding window policy, generating formal Incident objects.
+// It manages incident registration, state transitions according to the Incident FSM, and recovery.
 type IncidentEngine interface {
 	// Process evaluates an AnomalySignal against the correlation policy.
 	// Returns:
@@ -32,14 +35,23 @@ type IncidentEngine interface {
 	// - (nil, err) if validation failed or an error occurred during evaluation.
 	Process(ctx context.Context, sig *types.AnomalySignal) (*types.Incident, error)
 
+	// RegisterIncident registers an externally detected Incident into the local lifecycle manager.
+	RegisterIncident(ctx context.Context, inc *types.Incident) (*types.Incident, error)
+
 	// GetActiveIncident returns the active incident for the specified node and metric, or nil if none exists.
 	GetActiveIncident(nodeID, metricName string) *types.Incident
 
 	// TransitionActiveIncident transitions an active incident to a new valid status in accordance with the Incident FSM.
 	TransitionActiveIncident(ctx context.Context, nodeID, metricName string, target types.IncidentStatus, now time.Time) (*types.Incident, error)
 
-	// CloseActiveIncident recovers and closes an active incident for the specified correlation stream.
+	// CloseActiveIncident removes the active incident from the local stream and resets observations (stream lifecycle cleanup).
+	// If the incident is in MITIGATING or ESCALATED, it canonically transitions to RECOVERED;
+	// if in ANOMALY_DETECTED, it cleans up the stream without forging an invalid transition.
 	CloseActiveIncident(ctx context.Context, nodeID, metricName string, now time.Time) (*types.Incident, error)
+
+	// ResolveIncident transitions an active incident to RECOVERED according to the canonical Incident FSM.
+	// Returns ErrInvalidStateTransition if called directly on an incident in ANOMALY_DETECTED.
+	ResolveIncident(ctx context.Context, nodeID, metricName string, now time.Time) (*types.Incident, error)
 
 	// RecoverFromStore restores active incidents and recent correlation observations from SQLite into memory.
 	RecoverFromStore(ctx context.Context) (int, int, error)
@@ -429,6 +441,70 @@ func (e *LocalEngine) Process(ctx context.Context, sig *types.AnomalySignal) (*t
 	return inc, nil
 }
 
+// RegisterIncident registers an externally detected Incident (such as mapped from an AnomalySignal)
+// into the local incident lifecycle.
+// It fails closed: nil incidents or incidents failing validation are rejected.
+// Status must be ANOMALY_DETECTED.
+// If an active incident with the same IncidentID already exists, it updates timestamps idempotently.
+// If an active incident with a different IncidentID already exists, it returns ErrIncidentAlreadyActive.
+func (e *LocalEngine) RegisterIncident(ctx context.Context, inc *types.Incident) (*types.Incident, error) {
+	if inc == nil {
+		return nil, ErrNilIncident
+	}
+	if err := inc.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid incident payload: %w", err)
+	}
+	if inc.Status != types.StatusAnomalyDetected {
+		return nil, fmt.Errorf("%w: got %s", ErrInvalidIncidentStatus, inc.Status)
+	}
+
+	correlationKey := inc.NodeID + ":" + inc.TriggerMetric
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	st, exists := e.streams[correlationKey]
+	if !exists {
+		st = &streamState{
+			nodeID:        inc.NodeID,
+			metricName:    inc.TriggerMetric,
+			observations:  make([]observation, 0, e.cfg.N),
+			seenAnomalies: make(map[string]time.Time),
+		}
+		e.streams[correlationKey] = st
+	}
+
+	// Active incident protection
+	if st.activeIncident != nil && isActiveStatus(st.activeIncident.Status) {
+		if st.activeIncident.IncidentID == inc.IncidentID {
+			// Idempotent re-registration of the same active incident
+			st.activeIncident.UpdatedAt = inc.UpdatedAt
+			st.activeIncident.TriggerValue = inc.TriggerValue
+			return st.activeIncident, nil
+		}
+		return nil, fmt.Errorf("%w: existing active incident %s", ErrIncidentAlreadyActive, st.activeIncident.IncidentID)
+	}
+
+	// Register new active incident
+	incCopy := *inc
+	if inc.Evidence != nil {
+		incCopy.Evidence = copyMap(inc.Evidence)
+	}
+
+	if e.cfg.Store != nil {
+		isNew, err := e.cfg.Store.PersistIncidentEvaluation(ctx, nil, &incCopy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to persist registered incident: %w", err)
+		}
+		if !isNew {
+			return st.activeIncident, nil
+		}
+	}
+
+	st.activeIncident = &incCopy
+	return st.activeIncident, nil
+}
+
 // GetActiveIncident retrieves a copy of the active incident for a given stream, or nil if none.
 func (e *LocalEngine) GetActiveIncident(nodeID, metricName string) *types.Incident {
 	e.mu.RLock()
@@ -436,7 +512,7 @@ func (e *LocalEngine) GetActiveIncident(nodeID, metricName string) *types.Incide
 
 	key := nodeID + ":" + metricName
 	st, exists := e.streams[key]
-	if !exists || st.activeIncident == nil {
+	if !exists || st.activeIncident == nil || !isActiveStatus(st.activeIncident.Status) {
 		return nil
 	}
 
@@ -474,15 +550,21 @@ func (e *LocalEngine) TransitionActiveIncident(ctx context.Context, nodeID, metr
 
 	_ = st.activeIncident.TransitionTo(target, now)
 	inc := st.activeIncident
-	if target == types.StatusRecovered || target == types.StatusNormal {
+	if target == types.StatusNormal {
 		st.activeIncident = nil
+		st.observations = nil
+	} else if target == types.StatusRecovered {
 		st.observations = nil
 	}
 
 	return inc, nil
 }
 
-// CloseActiveIncident transitions an active incident to RECOVERED and resets the correlation stream.
+// CloseActiveIncident resets the correlation stream and removes the active incident from memory as a lifecycle cleanup mechanism.
+// It does NOT falsely claim a canonical RECOVERED transition when the incident is in ANOMALY_DETECTED,
+// and it never automatically introduces MITIGATING or ESCALATED.
+// If the incident is already in a state that permits RECOVERED (MITIGATING or ESCALATED), it applies that canonical transition.
+// If the incident is in ANOMALY_DETECTED, it cleans up the active stream state without forging an invalid FSM transition.
 func (e *LocalEngine) CloseActiveIncident(ctx context.Context, nodeID, metricName string, now time.Time) (*types.Incident, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -493,31 +575,33 @@ func (e *LocalEngine) CloseActiveIncident(ctx context.Context, nodeID, metricNam
 		return nil, ErrNoActiveIncident
 	}
 
-	cp := *st.activeIncident
-	if cp.Status == types.StatusAnomalyDetected {
-		if err := cp.TransitionTo(types.StatusMitigating, now); err != nil {
+	inc := st.activeIncident
+	if inc.Status.CanTransitionTo(types.StatusRecovered) {
+		if err := inc.TransitionTo(types.StatusRecovered, now); err != nil {
 			return nil, err
 		}
-	}
-	if err := cp.TransitionTo(types.StatusRecovered, now); err != nil {
-		return nil, err
-	}
-
-	if e.cfg.Store != nil {
-		if err := e.cfg.Store.UpdateIncidentStatus(ctx, cp.IncidentID, cp.Status, cp.UpdatedAt, cp.ResolvedAt); err != nil {
-			return nil, fmt.Errorf("failed to persist incident closure: %w", err)
+		if e.cfg.Store != nil {
+			if err := e.cfg.Store.UpdateIncidentStatus(ctx, inc.IncidentID, inc.Status, inc.UpdatedAt, inc.ResolvedAt); err != nil {
+				return nil, fmt.Errorf("failed to persist incident closure: %w", err)
+			}
 		}
+	} else {
+		// Non-canonical recovery: do not falsely claim RECOVERED status or automatically inject MITIGATING.
+		// Simply update timestamp and clean up active stream state.
+		inc.UpdatedAt = now
 	}
-
-	inc := st.activeIncident
-	if inc.Status == types.StatusAnomalyDetected {
-		_ = inc.TransitionTo(types.StatusMitigating, now)
-	}
-	_ = inc.TransitionTo(types.StatusRecovered, now)
 
 	st.activeIncident = nil
 	st.observations = nil
 	return inc, nil
+}
+
+// ResolveIncident transitions an active incident to RECOVERED according to canonical FSM rules.
+// Direct transition from ANOMALY_DETECTED is rejected with ErrInvalidStateTransition because
+// the canonical FSM requires an incident to enter MITIGATING or ESCALATED prior to recovery.
+// It never automatically introduces MITIGATING or ESCALATED.
+func (e *LocalEngine) ResolveIncident(ctx context.Context, nodeID, metricName string, now time.Time) (*types.Incident, error) {
+	return e.TransitionActiveIncident(ctx, nodeID, metricName, types.StatusRecovered, now)
 }
 
 // insertObservation adds an observation in chronological order and trims old entries.
