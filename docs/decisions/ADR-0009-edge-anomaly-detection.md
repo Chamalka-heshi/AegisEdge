@@ -767,26 +767,26 @@ To select an initial ML approach appropriate for resource-constrained edge compu
 
 | Evaluation Criteria | A. Isolation Forest (iForest) | B. Deep Autoencoder (PyTorch/ONNX) | C. One-Class SVM (OC-SVM) | D. Statistical Baseline (Phase 5.4) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Edge Inference Suitability** | **Excellent**: Low complexity ($O(t \cdot \log \psi)$ tree traversal). | Poor–Moderate: Matrix multiplications require neural runtime. | Moderate: Kernel evaluation against support vectors ($O(N_{sv} \cdot d)$). | **Excellent**: $O(1)$ scalar arithmetic. |
+| **Edge Inference Suitability** | **Strong**: Evaluates one path through each of $T$ trees; expected depth relates to subsample size $\psi$, subject to empirical benchmarking. | Poor–Moderate: Matrix multiplications require neural runtime. | Moderate: Kernel evaluation against support vectors ($O(N_{sv} \cdot d)$). | **Excellent**: $O(1)$ scalar arithmetic. |
 | **Training Requirements** | Low: Unsupervised, sub-sampled ($n=256$), fast convergence. | High: Iterative backpropagation, hyperparameter tuning, GPU beneficial. | Moderate: Quadratic in samples $O(n^2)$ without approximation. | None: Dynamic streaming calculation. |
-| **Computational Cost (CPU)** | **Minimal**: Integer/float threshold comparisons per tree node. | Moderate–High: Dense floating-point tensor operations. | Moderate: Dot products across high-dimensional support vectors. | **Minimal**: Scalar mean and variance. |
-| **Memory Footprint** | **Tiny**: 100 trees $\times$ depth 8 $\approx$ 200–500 KB total. | Heavy: 15–100 MB for runtime + model weights. | Moderate: Scales with number of support vectors (1–10 MB). | **Negligible**: $< 2$ KB per metric stream. |
-| **Explainability** | **High**: Tree path lengths, split thresholds, and isolating features. | Low: Latent space reconstruction error is opaque ("black box"). | Low–Moderate: Distance to hyperplane in kernel feature space. | **Complete**: Exact mean, stddev, and z-score distance. |
+| **Computational Cost (CPU)** | **Minimal**: Integer/float threshold comparisons per tree node; benchmarks required. | Moderate–High: Dense floating-point tensor operations. | Moderate: Dot products across high-dimensional support vectors. | **Minimal**: Scalar mean and variance. |
+| **Memory Footprint** | **Low**: Tree representation scales with tree count and depth; to be established through benchmarks. | Heavy: 15–100 MB for runtime + model weights. | Moderate: Scales with number of support vectors (1–10 MB). | **Negligible**: $< 2$ KB per metric stream. |
+| **Explainability** | **High**: Tree path lengths, split thresholds, and path features. | Low: Latent space reconstruction error is opaque ("black box"). | Low–Moderate: Distance to hyperplane in kernel feature space. | **Complete**: Exact mean, stddev, and z-score distance. |
 | **Dependency Complexity** | **Zero Native Dependencies**: Evaluated in pure Go via serialized decision trees. | Severe: Requires Cgo, ONNX Runtime (`.so`/`.dll`), or Python daemon. | High: Requires native LibSVM/Cgo bindings for non-linear kernels. | **Zero**: Pure Go standard library. |
 | **Offline Operation** | **Native**: Runs entirely self-contained in process memory. | Native (if runtime packaged), but fragile to shared library drift. | Native (if compiled), but heavy memory retention. | **Native**: 100% offline. |
 | **Small-Data Behavior** | **Robust**: Standard sub-sample size $\psi=256$ prevents swamping/masking. | Poor: Prone to overfitting or failure to reconstruct without large datasets. | Sensitive to parameter $\nu$ and kernel bandwidth $\gamma$. | Limited to univariate rolling window. |
-| **Model Update Complexity** | Simple: JSON/binary artifact replacement over HTTP/NATS. | Complex: Weight checkpointing, tensor format versioning. | Moderate: Dual coefficient and support vector serialization. | Instant: Runtime parameter update. |
-| **Deterministic Inference** | **100% Deterministic**: Immutable tree structure and fixed split points. | Dependent on floating-point SIMD/BLAS implementation. | **100% Deterministic** once support vectors are fixed. | **100% Deterministic**. |
+| **Model Update Complexity** | Simple: Local manifest replacement; model distribution mechanism is future design. | Complex: Weight checkpointing, tensor format versioning. | Moderate: Dual coefficient and support vector serialization. | Instant: Runtime parameter update. |
+| **Deterministic Inference** | Given the same immutable model artifact, feature schema, normalization parameters, and feature vector, inference is designed to produce the same result. | Dependent on floating-point SIMD/BLAS implementation. | Deterministic once support vectors are fixed. | **Deterministic**. |
 | **Ease of Go Integration** | **Trivial**: Can be represented as a slice of Go structs with integer indices. | Difficult: Requires Cgo bindings, cross-compilation toolchains. | Moderate: Requires Cgo or custom Go kernel implementation. | **Native**. |
 
 #### Concrete Selection Decision: Isolation Forest (iForest)
 AegisEdge formally selects the **Isolation Forest** ensemble as its initial machine learning anomaly detection algorithm for Phase 5.5.
 
 **Technical Rationale**:
-1. **Zero External Runtime Footprint**: Unlike neural network autoencoders that require massive C++ runtimes (ONNX Runtime, LibTorch) with complex Cgo cross-compilation and shared library dependencies, an Isolation Forest consists strictly of binary decision trees. These can be evaluated in pure Go with zero Cgo dependencies and minimal CPU overhead.
-2. **Sub-Sampling Efficiency**: An Isolation Forest operates by isolating anomalies rather than profiling normal data points. Because anomalies have few similar points and distinct values, they are isolated close to the root of the tree ($E(h(x)) \ll c(\psi)$). Standard sub-sample sizes ($\psi = 256$) are small, training completes in seconds on modest hardware, and inference requires only $O(t \cdot \log \psi)$ comparisons per sample.
+1. **Zero External Runtime Footprint**: Unlike neural network autoencoders that require massive C++ runtimes (ONNX Runtime, LibTorch) with complex Cgo cross-compilation and shared library dependencies, an Isolation Forest consists strictly of binary decision trees. These can be evaluated in pure Go with zero Cgo dependencies.
+2. **Sub-Sampling Efficiency**: An Isolation Forest operates by isolating anomalies rather than profiling normal data points. Standard sub-sample sizes ($\psi = 256$) isolate anomalous points with fewer split partitions. Inference traverses one path through each of $T$ trees; expected path depth is related to the isolation subsample size, while actual depth depends on the trained trees. Actual performance will be established through benchmarks.
 3. **Multivariate Correlation**: While Phase 5.4 statistical z-scores evaluate single metric streams independently, an Isolation Forest evaluates a unified $d$-dimensional feature vector ($d=4$: CPU, Memory, Disk, Temperature). It detects multi-variant anomalies (e.g., moderate CPU elevation combined with rapid temperature rise and high memory pressure) where no individual metric crosses a univariate threshold.
-4. **Predictable Memory & Execution Bounds**: A forest of 100 trees with maximum depth $\lceil \log_2(256) \rceil = 8$ contains at most $100 \times (2^9 - 1) \approx 51,100$ nodes, consuming under 500 KB of RAM. Evaluation executes in tens of microseconds on embedded edge cores.
+4. **Predictable Tree Traversal**: A forest of $T$ trees traverses discrete binary decision paths. No numerical performance guarantees are established in Phase 5.5A. Phase 5.5B must empirically benchmark inference latency, CPU usage, memory consumption, model artifact size, and throughput before performance budgets are established.
 
 ---
 
@@ -800,12 +800,12 @@ AegisEdge enforces a strict structural separation between where models are train
   2. Filter, clean, and validate training dataset (DatasetID, Version)
   3. Train Isolation Forest (Python/Scikit-Learn or Go CLI tooling)
   4. Extract feature normalization bounds (mean, stddev / min, max)
-  5. Export immutable, signed Model Manifest (JSON/CBOR + SHA-256)
+  5. Export immutable Model Manifest (JSON/CBOR + SHA-256 checksum)
                        │
-                       │ Secure Model Distribution (Signed Artifact)
+                       │ Model Distribution (Future design; telemetry sync does not currently support model distribution)
                        ▼
 [ Edge Node (Autonomous Agent) ]
-  1. Verify manifest integrity (SHA-256 checksum & signature)
+  1. Verify manifest integrity (SHA-256 checksum; cryptographic signing is future functionality)
   2. Validate feature schema version compatibility
   3. Deserialize trees into pure Go memory structures
   4. Local Real-Time Inference: Telemetry -> Features -> Tree Traversal -> AnomalySignal
@@ -815,7 +815,7 @@ AegisEdge enforces a strict structural separation between where models are train
 * **Where Training Occurs**: Strictly centralized in the control-plane or an offline ML pipeline. Edge nodes **never** execute training algorithms, backpropagation, or tree generation.
 * **What Data Is Used**: Validated historical telemetry batches previously ingested and persisted in control-plane storage, representing known normal operating baselines.
 * **When Training Happens**: Asynchronous, scheduled batch jobs or operator-triggered pipeline runs.
-* **How Models Reach the Edge**: Packaged as immutable, versioned model manifests distributed over existing sync/configuration channels (or pre-baked into container/OS images).
+* **How Models Reach the Edge**: Model distribution over telemetry sync or NATS is a future design (telemetry sync does not currently support model distribution). In the near term, models are pre-baked or deployed locally as filesystem artifacts.
 * **Behavior If No Model Exists**: If an edge node boots without an ML model manifest, the `MLDetector` enters the `MODEL_MISSING` state and skips inference. The node remains fully protected by the deterministic `ThresholdDetector` and `StatisticalDetector`.
 * **Compatibility Verification**: The model manifest contains an explicit `feature_schema_version`. If the edge agent's telemetry generator does not match the model's feature schema, the model is rejected.
 
@@ -1051,27 +1051,23 @@ To ensure malicious or corrupted models cannot compromise edge operations:
 
 ### 30.16 Explainability & Attribution
 
-Because operators must understand why an anomaly was raised before approving or auditing responses, `MLDetector` extracts tree path attribution:
+Because operators must understand why an anomaly was raised before approving or auditing responses, `MLDetector` extracts tree path diagnostic information:
 * **Average Path Length**: Reported in evidence (`"avg_path_length": "3.42"`).
-* **Dominant Isolating Feature**: During tree traversal, the detector tracks which feature caused the earliest split decisions. The feature most frequently responsible for early isolation is recorded in evidence (`"top_contributor": "temperature_celsius"`).
-* **Attribution Boundary**: The detector reports mathematical feature contribution; it does **not** assert unsupported causal diagnoses (e.g. it does not claim "fan failure caused CPU overheating").
+* **Diagnostic Path Features**: Diagnostic information may identify features encountered along anomalous tree paths. This must not be interpreted as causal attribution.
+* **Attribution Boundary**: The detector reports mathematical feature isolation metrics; it does **not** assert causal diagnoses (e.g. it does not claim "fan failure caused CPU overheating").
 
 ---
 
 ### 30.17 Determinism
 
-* **Inference Invariant**: Given the same immutable model artifact and the same input feature vector $\mathbf{x}$, `MLDetector.Detect()` will produce identical traversal paths, identical path lengths, identical anomaly scores, and identical AnomalyIDs across all runs and architectures.
+* **Inference Invariant**: Given the same immutable model artifact, feature schema, normalization parameters, and feature vector, inference is designed to produce the same result.
 * **Training vs. Inference**: While Isolation Forest training uses randomized sub-sampling and random split selection, once training completes, the resulting trees, split thresholds, and normalization bounds are frozen into the immutable manifest. Random seeds are never used during inference.
 
 ---
 
 ### 30.18 Edge Resource Constraints
 
-The implementation in Phase 5.5B+ must satisfy strict operational budgets:
-* **CPU Budget**: Average inference latency $< 100\,\mu\text{s}$ per feature vector on a modern x86/ARM core; $< 5\%$ CPU utilization during active 1 Hz evaluation.
-* **RAM Budget**: $< 2$ MB total memory for the model manifest, tree structures, and normalization vectors.
-* **Disk Footprint**: $< 500$ KB for the serialized manifest file.
-* **Benchmarking Obligation**: Latency and allocation budgets must be empirically measured via Go benchmarks (`go test -bench`) during Phase 5.5B before declaring production readiness.
+No numerical performance guarantees are established in Phase 5.5A. Phase 5.5B must empirically benchmark inference latency, CPU usage, memory consumption, model artifact size, and throughput before performance budgets are established.
 
 ---
 
@@ -1129,7 +1125,7 @@ The technical path to operational ML anomaly detection is structured across thre
   * Unit and property-based test suite verifying deterministic traversal and failure safety.
 * **Phase 5.5C (Offline Training & Packaging Tooling)**:
   * Develop offline training CLI tool (`cmd/aegisedge-train`) to fit Isolation Forests on historical batches.
-  * Export, normalize, and cryptographically sign model manifest artifacts.
+  * Export, normalize, and generate SHA-256 checksum for model manifest artifacts (cryptographic signing is future functionality).
 * **Phase 5.5D (Integrated Verification & Benchmarking)**:
   * End-to-end integration testing across the full multi-detector pipeline: Telemetry $\rightarrow$ Persist $\rightarrow$ Threshold + Statistical + ML $\rightarrow$ Incident Engine $\rightarrow$ Verification.
   * Empirical memory and CPU profiling benchmarks under simulated edge load.
