@@ -1068,3 +1068,155 @@ func TestThresholdDetector_DetectBatch(t *testing.T) {
 		t.Error("expected error on invalid batch, got nil")
 	}
 }
+
+// TestIncidentMapping_ContractAndLifecycle verifies AnomalySignal -> Incident mapping according to Phase 5.2.
+func TestIncidentMapping_ContractAndLifecycle(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+
+	highCPU := 90.0
+	recCPU := 80.0
+	expCPU := 50.0
+
+	det, err := NewThresholdDetector(ThresholdDetectorConfig{
+		Version: "1.0.0",
+		Rules: []ThresholdRule{
+			{
+				MetricName:             "cpu_usage_percent",
+				UpperThreshold:         &highCPU,
+				UpperRecoveryThreshold: &recCPU,
+				ExpectedValue:          &expCPU,
+				DisallowNegative:       true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create detector: %v", err)
+	}
+
+	// 1. Threshold breach creates an AnomalySignal
+	sampleBreach := types.MetricSample{
+		NodeID:    "node-alpha-99",
+		Name:      "cpu_usage_percent",
+		Value:     95.5,
+		Timestamp: now,
+	}
+	sig, err := det.Detect(ctx, sampleBreach)
+	if err != nil {
+		t.Fatalf("unexpected detection error: %v", err)
+	}
+	if sig == nil {
+		t.Fatal("expected non-nil AnomalySignal on threshold breach")
+	}
+
+	// 2. Confirmed AnomalySignal maps to an Incident
+	inc, err := det.MapToIncident(sig)
+	if err != nil {
+		t.Fatalf("MapToIncident failed: %v", err)
+	}
+	if inc == nil {
+		t.Fatal("expected non-nil Incident from mapping")
+	}
+
+	// 3. Incident.NodeID matches AnomalySignal.NodeID
+	if inc.NodeID != sig.NodeID {
+		t.Errorf("NodeID mismatch: got %q, want %q", inc.NodeID, sig.NodeID)
+	}
+
+	// 4. Incident.TriggerMetric matches MetricName
+	if inc.TriggerMetric != sig.MetricName {
+		t.Errorf("TriggerMetric mismatch: got %q, want %q", inc.TriggerMetric, sig.MetricName)
+	}
+
+	// 5. Incident.TriggerValue matches ObservedVal
+	if inc.TriggerValue != sig.ObservedValue {
+		t.Errorf("TriggerValue mismatch: got %f, want %f", inc.TriggerValue, sig.ObservedValue)
+	}
+
+	// 6. Incident.Threshold matches ThresholdVal
+	if inc.Threshold != sig.ExpectedValue {
+		t.Errorf("Threshold mismatch: got %f, want %f", inc.Threshold, sig.ExpectedValue)
+	}
+
+	// 7. Incident.RuleName is correct
+	expectedRuleName := "threshold_cpu_usage_percent"
+	if inc.RuleName != expectedRuleName {
+		t.Errorf("RuleName mismatch: got %q, want %q", inc.RuleName, expectedRuleName)
+	}
+
+	// 8. Incident.Severity is correct
+	expectedSeverity := MapSeverity(sig.AnomalyScore)
+	if inc.Severity != expectedSeverity {
+		t.Errorf("Severity mismatch: got %v, want %v", inc.Severity, expectedSeverity)
+	}
+
+	// 9. Incident.Status is ANOMALY_DETECTED
+	if inc.Status != types.StatusAnomalyDetected {
+		t.Errorf("Status mismatch: got %v, want %v", inc.Status, types.StatusAnomalyDetected)
+	}
+
+	// 10. Incident contains appropriate evidence
+	if inc.Evidence == nil {
+		t.Fatal("expected non-nil Evidence map")
+	}
+	if inc.Evidence["anomaly_id"] != sig.AnomalyID {
+		t.Errorf("Evidence anomaly_id mismatch: got %q, want %q", inc.Evidence["anomaly_id"], sig.AnomalyID)
+	}
+	if inc.Evidence["direction"] != "upper" {
+		t.Errorf("Evidence direction mismatch: got %q, want 'upper'", inc.Evidence["direction"])
+	}
+	if inc.Evidence["detection_method"] != types.DetectionMethodStaticThreshold {
+		t.Errorf("Evidence detection_method mismatch: got %q, want %q", inc.Evidence["detection_method"], types.DetectionMethodStaticThreshold)
+	}
+
+	// 11. Invalid anomaly signal cannot produce an invalid Incident
+	t.Run("invalid_anomaly_signal_rejected", func(t *testing.T) {
+		// Nil signal
+		_, err := MapAnomalyToIncident(nil)
+		if err == nil {
+			t.Error("expected error mapping nil AnomalySignal, got nil")
+		}
+
+		// Empty AnomalyID
+		badSig := *sig
+		badSig.AnomalyID = ""
+		_, err = MapAnomalyToIncident(&badSig)
+		if err == nil {
+			t.Error("expected error mapping signal with empty AnomalyID, got nil")
+		}
+
+		// Empty NodeID
+		badSig2 := *sig
+		badSig2.NodeID = ""
+		_, err = MapAnomalyToIncident(&badSig2)
+		if err == nil {
+			t.Error("expected error mapping signal with empty NodeID, got nil")
+		}
+
+		// NaN value
+		badSig3 := *sig
+		badSig3.ObservedValue = math.NaN()
+		_, err = MapAnomalyToIncident(&badSig3)
+		if err == nil {
+			t.Error("expected error mapping signal with NaN ObservedValue, got nil")
+		}
+	})
+
+	// 12. Repeated breach suppression does not create repeated incidents from the same active breach
+	t.Run("repeated_breach_suppression", func(t *testing.T) {
+		// Second sample in same breach episode
+		sample2 := types.MetricSample{
+			NodeID:    "node-alpha-99",
+			Name:      "cpu_usage_percent",
+			Value:     97.0, // still breached
+			Timestamp: now.Add(time.Second),
+		}
+		sig2, err := det.Detect(ctx, sample2)
+		if err != nil {
+			t.Fatalf("unexpected error on second sample: %v", err)
+		}
+		if sig2 != nil {
+			t.Fatalf("expected nil AnomalySignal due to breach suppression, got: %+v", sig2)
+		}
+	})
+}

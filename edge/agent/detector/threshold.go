@@ -162,13 +162,18 @@ type IDGeneratorFunc func(nodeID, metricName, version string, timestamp time.Tim
 
 // ThresholdDetector implements a deterministic, offline static threshold anomaly detector.
 // In accordance with ADR-0009 §10, §11, §18, and §20:
-// - Evaluates single-sample (W=1) telemetry instantaneously (zero warmup lag).
-// - Operates 100% offline with zero external network, NATS, or cloud dependencies.
-// - Supports upper ceilings, lower floors, and dual-threshold hysteresis recovery bands.
-// - Emits ONE AnomalySignal when a breach onset occurs; avoids duplicate signals for a continuously active breach.
-// - Clears the active breach when the metric reaches the recovery threshold; permits new anomaly on subsequent breach.
-// - Derives AnomalyID deterministically from stable domain context (node, metric, timestamp, value, version).
-// - Normalizes mathematical AnomalyScore in [0.0, 1.0] independently of incident severity.
+//   - Data Flow: MetricSample -> Detector -> AnomalySignal -> Incident.
+//     AnomalySignal represents raw detector output; Incident represents the operational domain entity.
+//   - Network Independence: Detection is network-independent because evaluation occurs locally on the edge node with zero external network, NATS, or cloud dependencies.
+//   - Instant Cold-Start: Evaluates single-sample (W=1) telemetry instantaneously (zero warmup lag).
+//   - Dual-Threshold Hysteresis Bands: Supports upper ceilings, lower floors, and recovery thresholds.
+//   - Breach Onset: Emits ONE AnomalySignal upon initial breach crossing (nominal -> breached).
+//   - Repeated-Breach Suppression: Returns (nil, nil) for ongoing active breaches to prevent alert flooding.
+//   - Recovery Threshold: Clears active breach when readings drop <= recovery (upper) or rise >= recovery (lower).
+//   - In-Memory State: Breach states are held in-memory; state resets to nominal on process restart (no persistence across restart).
+//   - Identity Determinism: Derives AnomalyID deterministically from stable domain context (node, metric, timestamp, value, version).
+//   - Normalized AnomalyScore: Represents a deterministic threshold-distance indicator in [0.0, 1.0] (|deviation| / maxDeviation).
+//     It is NOT a probability, confidence, likelihood, or statistical significance metric.
 type ThresholdDetector struct {
 	mu          sync.RWMutex
 	name        string
@@ -535,4 +540,101 @@ func DefaultRules() []ThresholdRule {
 			DisallowNegative:       false,
 		},
 	}
+}
+
+// DeriveIncidentID generates a stable, deterministic IncidentID derived from an AnomalyID.
+// If the AnomalyID follows the "ano-" convention, it maps directly to "inc-".
+// Otherwise, it computes a deterministic SHA-256 hash prefix.
+func DeriveIncidentID(anomalyID string) string {
+	trimmed := strings.TrimSpace(anomalyID)
+	if strings.HasPrefix(trimmed, "ano-") {
+		return "inc-" + strings.TrimPrefix(trimmed, "ano-")
+	}
+	h := sha256.Sum256([]byte(trimmed))
+	return fmt.Sprintf("inc-%x", h[:12])
+}
+
+// MapSeverity provides a deterministic mapping from AnomalyScore [0.0, 1.0] (threshold distance indicator)
+// to standard types.IncidentSeverity:
+// - Score >= 0.85 => CRITICAL
+// - Score >= 0.60 => HIGH
+// - Score >= 0.30 => MEDIUM
+// - Score <  0.30 => LOW
+func MapSeverity(score float64) types.IncidentSeverity {
+	switch {
+	case score >= 0.85:
+		return types.SeverityCritical
+	case score >= 0.60:
+		return types.SeverityHigh
+	case score >= 0.30:
+		return types.SeverityMedium
+	default:
+		return types.SeverityLow
+	}
+}
+
+// MapAnomalyToIncident converts a confirmed AnomalySignal into a formal types.Incident domain object.
+// In accordance with ADR-0009 and Phase 5.2 requirements:
+// - Status is initialized strictly in the ANOMALY_DETECTED state.
+// - IncidentID is deterministically derived from AnomalyID.
+// - Severity is mapped deterministically from AnomalyScore or preserved from Evidence["severity"].
+// - TriggerMetric, TriggerValue, Threshold, NodeID, TriggeredAt, UpdatedAt are populated from the signal.
+// - Evidence map is cloned and enriched with anomaly context.
+// - Performs no persistence, no mitigation, and no escalation.
+// - Validates the resulting Incident against domain rules before returning.
+func MapAnomalyToIncident(sig *types.AnomalySignal) (*types.Incident, error) {
+	if sig == nil {
+		return nil, errors.New("anomaly signal cannot be nil")
+	}
+	if err := sig.Validate(); err != nil {
+		return nil, fmt.Errorf("cannot map invalid anomaly signal to incident: %w", err)
+	}
+
+	evidence := make(map[string]string, len(sig.Evidence)+4)
+	for k, v := range sig.Evidence {
+		evidence[k] = v
+	}
+	evidence["anomaly_id"] = sig.AnomalyID
+	evidence["anomaly_score"] = fmt.Sprintf("%.4f", sig.AnomalyScore)
+	evidence["detection_method"] = sig.DetectionMethod
+	evidence["detector_version"] = sig.DetectorVersion
+
+	severity := MapSeverity(sig.AnomalyScore)
+	if customSev, ok := sig.Evidence["severity"]; ok && types.IncidentSeverity(customSev).IsValid() {
+		severity = types.IncidentSeverity(customSev)
+	}
+
+	ruleName := fmt.Sprintf("threshold_%s", sig.MetricName)
+	if customRule, ok := sig.Evidence["rule_name"]; ok && strings.TrimSpace(customRule) != "" {
+		ruleName = customRule
+	}
+
+	desc := fmt.Sprintf("Threshold breach detected on %s: observed %.4f (threshold %.4f)",
+		sig.MetricName, sig.ObservedValue, sig.ExpectedValue)
+
+	inc := &types.Incident{
+		IncidentID:    DeriveIncidentID(sig.AnomalyID),
+		NodeID:        sig.NodeID,
+		RuleName:      ruleName,
+		Severity:      severity,
+		Status:        types.StatusAnomalyDetected,
+		Description:   desc,
+		TriggerMetric: sig.MetricName,
+		TriggerValue:  sig.ObservedValue,
+		Threshold:     sig.ExpectedValue,
+		Evidence:      evidence,
+		TriggeredAt:   sig.DetectedAt,
+		UpdatedAt:     sig.DetectedAt,
+	}
+
+	if err := inc.Validate(); err != nil {
+		return nil, fmt.Errorf("mapped incident failed domain validation: %w", err)
+	}
+
+	return inc, nil
+}
+
+// MapToIncident converts an AnomalySignal produced by this detector to a formal Incident.
+func (d *ThresholdDetector) MapToIncident(sig *types.AnomalySignal) (*types.Incident, error) {
+	return MapAnomalyToIncident(sig)
 }
