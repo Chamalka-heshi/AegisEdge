@@ -712,21 +712,25 @@ The detector maintains an isolated, bounded slice of recent float64 observations
 
 This section establishes the formal architectural design for incorporating Machine Learning (ML) based anomaly detection into AegisEdge.
 
-$$\textbf{PHASE 5.5A STATUS: DESIGN ONLY}$$
-* **No ML code, models, or dependencies are introduced in this phase.**
-* **No Python, Cgo, ONNX runtime, TensorFlow Lite, PyTorch, or external C libraries are added.**
-* **No Go detector implementations or SQLite schemas are modified.**
+$$\textbf{PHASE 5.5C STATUS: OFFLINE TRAINING CLI IMPLEMENTED}$$
+* Dedicated offline Isolation Forest model training package implemented under `services/control-plane/training/` (`dataset.go`, `trainer.go`, `serializer.go`, `training_test.go`).
+* Dedicated CLI tool implemented under `services/control-plane/cmd/aegisedge-train/` (`main.go`, `main_test.go`).
+* Produces immutable `MLModelManifest` artifacts verified 100% compatible with the Phase 5.5B edge inference engine.
+* Zero external runtimes: No Python, Cgo, ONNX runtime, TensorFlow, PyTorch, or scikit-learn.
+* Zero modifications to SQLite, NATS, HTTP synchronization, or canonical Incident FSM.
 
-$$\textbf{IMPLEMENTED NOW (Phases 5.1 – 5.4)}$$
+$$\textbf{IMPLEMENTED NOW (Phases 5.1 – 5.5C)}$$
 1. **Deterministic Static Threshold Detection (`ThresholdDetector`)**: Instant cold-start ($W=1$), absolute ceilings/floors, hysteresis recovery bands, rate-of-change limits.
 2. **Deterministic Rolling Statistical Detection (`StatisticalDetector`)**: Multi-sample rolling window ($W \le 20$), uncontaminated sample mean and standard deviation, z-score breach evaluation, zero-variance handling.
-3. **Local Incident Lifecycle Engine (`IncidentEngine`)**: $M$-of-$N$ temporal correlation, deduplication, deterministic FSM transitions (`NORMAL` $\rightarrow$ `ANOMALY_DETECTED` $\rightarrow$ `MITIGATING` $\rightarrow$ `RECOVERED` $\rightarrow$ `NORMAL`).
+3. **Pure-Go Isolation Forest Anomaly Detection (`MLDetector`)**: Native Go binary decision tree traversal, dedicated immutable model manifest representation, strict validation, deterministic feature extraction (canonical 4D telemetry) and normalization, standard $c(\psi)$ path-length and $s(\mathbf{x}, \psi) = 2^{-E(h)/c(\psi)}$ scoring, deterministic AnomalyID generation, fail-safe degradation without false alarms.
+4. **Offline Isolation Forest Training CLI (`aegisedge-train`)**: Pure Go offline training on validated 4D CSV telemetry datasets, frozen normalization parameter calculation, deterministic PRNG seed reproducibility, automated model manifest validation, round-trip serialization, and post-write verification.
+5. **Local Incident Lifecycle Engine (`IncidentEngine`)**: $M$-of-$N$ temporal correlation, deduplication, deterministic FSM transitions (`NORMAL` $\rightarrow$ `ANOMALY_DETECTED` $\rightarrow$ `MITIGATING` $\rightarrow$ `RECOVERED` $\rightarrow$ `NORMAL`).
 
-$$\textbf{DESIGNED HERE (Phase 5.5A Target Architecture for Phase 5.5B+)}$$
-1. **Multivariate ML Detector (`MLDetector`)**: Coexists behind the existing `Detector` interface; consumes multi-metric feature vectors from edge telemetry.
-2. **Offline-Trained, Pure-Go Evaluated Isolation Forest**: Pre-trained tree ensemble serialized into an immutable, versioned manifest and traversed via native Go code (zero native C/Python dependencies).
-3. **Strict Boundary Decoupling**: Centralized offline training vs. localized edge inference.
-4. **Resilient Failure Safety**: If the ML model is missing, corrupt, incompatible, or times out, ML inference is skipped without emitting an anomaly or triggering remediation; the deterministic threshold and statistical detectors remain fully active.
+$$\textbf{STILL FUTURE (Phase 5.5D+ Target Architecture)}$$
+1. **Centralized Model Registry & Lifecycle Pipelines**: Production storage and cataloging of trained model versions.
+2. **Cryptographic Model Signing**: Digital signature generation and verification beyond SHA-256 integrity checksums.
+3. **Model Distribution & Sync Protocol**: Secure deployment over telemetry sync or NATS (telemetry sync does not currently support model distribution).
+4. **Model Drift Monitoring & Automated Rollback**: Online drift detection (PSI/KS tests) and rollback directives.
 
 ---
 
@@ -1117,15 +1121,18 @@ While automated online learning is out of scope, the lifecycle architecture is d
 
 ### 30.22 Implementation Roadmap: Phases 5.5B – 5.5D
 
-The technical path to operational ML anomaly detection is structured across three distinct future engineering phases:
-* **Phase 5.5B (Go Evaluation Engine & Artifact Parser)**:
-  * Implement `MLModelManifest` parser and validator in `edge/agent/detector/ml/`.
-  * Implement pure Go Isolation Forest traversal engine.
-  * Implement `MLDetector` satisfying the canonical `Detector` interface.
-  * Unit and property-based test suite verifying deterministic traversal and failure safety.
-* **Phase 5.5C (Offline Training & Packaging Tooling)**:
-  * Develop offline training CLI tool (`cmd/aegisedge-train`) to fit Isolation Forests on historical batches.
-  * Export, normalize, and generate SHA-256 checksum for model manifest artifacts (cryptographic signing is future functionality).
-* **Phase 5.5D (Integrated Verification & Benchmarking)**:
+The technical path to operational ML anomaly detection is structured across distinct engineering phases:
+* **Phase 5.5B (Go Evaluation Engine & Artifact Parser — COMPLETED)**:
+  * Implemented `MLModelManifest` representation, parser, safety limits, and validator in `edge/agent/detector/ml_model.go`.
+  * Implemented pure Go Isolation Forest traversal and scoring engine in `edge/agent/detector/ml.go`.
+  * Implemented `MLDetector` satisfying the canonical `Detector` interface.
+  * Comprehensive test suite verifying deterministic traversal, mathematical formulas, and failure safety in `edge/agent/detector/ml_test.go`.
+* **Phase 5.5C (Offline Training & Packaging Tooling — COMPLETED)**:
+  * Implemented CSV dataset parser, validation, and canonical 4D feature alignment in `services/control-plane/training/dataset.go`.
+  * Implemented pure Go Isolation Forest trainer with deterministic PRNG seed and frozen normalization in `services/control-plane/training/trainer.go`.
+  * Implemented deterministic model serializer, validation, and post-write verification in `services/control-plane/training/serializer.go`.
+  * Implemented offline training CLI `aegisedge-train` in `services/control-plane/cmd/aegisedge-train/main.go`.
+  * End-to-end compatibility and byte-for-byte determinism test suite in `services/control-plane/training/training_test.go`.
+* **Phase 5.5D (Integrated Verification & Benchmarking — FUTURE)**:
   * End-to-end integration testing across the full multi-detector pipeline: Telemetry $\rightarrow$ Persist $\rightarrow$ Threshold + Statistical + ML $\rightarrow$ Incident Engine $\rightarrow$ Verification.
   * Empirical memory and CPU profiling benchmarks under simulated edge load.
