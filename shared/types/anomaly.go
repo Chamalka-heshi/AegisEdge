@@ -20,8 +20,9 @@ var (
 
 // Standard detection method identifiers.
 const (
-	DetectionMethodStaticThreshold = "static_threshold"
-	DetectionMethodZScore          = "z_score"
+	DetectionMethodStaticThreshold   = "static_threshold"
+	DetectionMethodZScore            = "z_score"
+	DetectionMethodMLIsolationForest = "ml_isolation_forest"
 )
 
 // AnomalySignal represents a discrete mathematical deviation detected in a telemetry stream.
