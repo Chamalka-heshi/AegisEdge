@@ -256,9 +256,9 @@ flowchart TD
 
 AegisEdge adopts a three-tier layered intelligence strategy unified behind a single `AnomalyDetector` conceptual interface:
 
-1. **Layer 1: Deterministic Threshold Rules (Target: Phase 5.2)**: Static bounds checking ($O(1)$ evaluation) for hard resource saturation (`cpu > 90%`, `disk > 95%`, `memory > 92%`). Zero ML dependencies, fully deterministic, instant evaluation. *(Initial design examples — not empirically validated production thresholds.)*
-2. **Layer 2: Rolling Statistical Anomaly Detection (Target: Future Phase 5.4)**: Sliding-window statistical tracking (EWMA, rolling z-score drift $|Z| \ge 3.0$, and rate-of-change $\frac{\Delta y}{\Delta t}$). Detects progressive resource leaks, sudden spikes, and trend shifts without hardcoded static limits. *(Initial design examples — not empirically validated production thresholds.)*
-3. **Layer 3: Lightweight Edge ML Inference (Target: Future Phase 5.5)**: Compact multi-variate unsupervised models (Isolation Forest / Autoencoder / ONNX) trained centrally in the cloud/control plane and executed locally at the edge for complex cross-metric correlations.
+1. **Layer 1: Deterministic Threshold Rules (IMPLEMENTED — Phase 5.2/5.3)**: Static bounds checking ($O(1)$ evaluation) for hard resource saturation (`cpu > 90%`, `disk > 95%`, `memory > 92%`). Zero ML dependencies, fully deterministic, instant evaluation.
+2. **Layer 2: Rolling Statistical Anomaly Detection (IMPLEMENTED — Phase 5.4)**: Sliding-window statistical tracking (population standard deviation, rolling z-score drift $|Z| \ge 3.0$). Detects progressive resource leaks, sudden spikes, and trend shifts without hardcoded static limits.
+3. **Layer 3: Pure-Go Multivariate ML Inference & Offline Training (IMPLEMENTED — Phase 5.5B/5.5C; Distribution & Rollback DESIGNED — Phase 5.5D)**: Pure-Go Isolation Forest traversal engine (`MLDetector` in `edge/agent/detector/ml.go`) evaluating 4D telemetry vectors in real time, accompanied by an offline training CLI (`aegisedge-train` in `services/control-plane/cmd/aegisedge-train/`). Model distribution, staging, atomic activation, and autonomous rollback are designed in Phase 5.5D ([ADR-0009 §31](../decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
 
 ### 9.3 False-Positive Suppression Pipeline (Design Specification)
 
@@ -463,8 +463,12 @@ flowchart TD
 | **Telemetry Ingestion & SQLite WAL** | **CURRENTLY IMPLEMENTED** | Phase 1–2 |
 | **Upstream HTTP / NATS JetStream Sync** | **CURRENTLY IMPLEMENTED** | Phase 3–4 |
 | **Deterministic Threshold Anomaly Detection** | **CURRENTLY IMPLEMENTED** | Phase 5.1–5.3 |
+| **Rolling Statistical Anomaly Detection** | **CURRENTLY IMPLEMENTED** | Phase 5.4 |
 | **Local Incident Correlation ($M$-of-$N$)** | **CURRENTLY IMPLEMENTED** | Phase 5.4 |
 | **Durable Incident Persistence & Restart Recovery** | **CURRENTLY IMPLEMENTED** | Phase 5.5 |
+| **Pure-Go Isolation Forest Inference Engine** | **CURRENTLY IMPLEMENTED** | Phase 5.5B |
+| **Offline Model Training Tooling CLI** | **CURRENTLY IMPLEMENTED** | Phase 5.5C |
+| **ML Model Distribution, Staging & Rollback** | *DESIGNED (Future Implementation)* | Phase 5.5D |
 | **Deterministic Response Policy Engine** | *DESIGNED (Future Implementation)* | Phase 6.2 |
 | **Fail-Closed Safety Validator** | *DESIGNED (Future Implementation)* | Phase 6.2 |
 | **Simulated Action Executor & Dry-Run Mode** | *DESIGNED (Future Implementation)* | Phase 6.3 |
@@ -483,3 +487,48 @@ $$\textbf{INCIDENT} \longrightarrow \textbf{RESPONSE POLICY} \longrightarrow \te
 5. **Ambiguous State Safety**: If an action times out or the process crashes during execution, execution cancellation is requested where supported. If execution state cannot be confirmed, the action enters `UNKNOWN_RECONCILIATION_REQUIRED` (an action execution state, not an `IncidentStatus`) and the driving incident transitions to `IncidentStatus = ESCALATED`. The system **never blindly retries** an ambiguous execution. Future actuator-specific reconciliation will determine whether the action executed successfully.
 6. **Strict Pipeline Isolation**: A failure in response policy, safety validation, or actuation can never roll back or corrupt committed telemetry batches or incident records. Upstream synchronization proceeds unaffected.
 7. **Offline Autonomy**: All response evaluation, validation, and simulated actuation execute entirely locally without cloud, internet, control plane, or external dependencies.
+
+---
+
+## 14. ML Model Distribution, Activation & Rollback Architecture (Phase 5.5D — Design Only)
+
+Phase 5.5D establishes the architecture, trust boundaries, multi-stage validation gates, and crash-resilient rollback mechanisms for deploying machine learning models to autonomous edge nodes ([ADR-0009 §31](../decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
+
+```mermaid
+flowchart TD
+    subgraph ControlPlane ["Central Control Plane / Training & Packaging"]
+        TRAIN["Training Environment\n(aegisedge-train) [IMPLEMENTED]"] --> ART["Model Artifact Created\n(Isolation Forest JSON) [IMPLEMENTED]"]
+        ART --> INT["Integrity / Future Signature\n(SHA-256 [IMPLEMENTED] / Ed25519 [DESIGNED])"]
+        INT --> DIST["Distribution Channel\n(Dedicated Transport) [DESIGNED]"]
+    end
+
+    subgraph EdgeNode ["Edge Node (Autonomous Agent)"]
+        DIST -. "Downstream Distribution" .-> VER["Edge Verification\n(Integrity, Schema & Structural Checks) [DESIGNED]"]
+        VER --> STAGE["Staging Sandbox\n(Isolated Candidate) [DESIGNED]"]
+        STAGE --> ACT["Atomic Activation\n(Pointer Swap & Platform Replacement) [DESIGNED]"]
+        ACT --> INF["Local Inference Runtime\n(MLDetector Engine) [IMPLEMENTED]"]
+        ACT --> PREV["Previous Model Retention\n(model_previous.json) [DESIGNED]"]
+        PREV -. "Local Rollback" .-> ACT
+    end
+```
+
+### Core Architecture & Operating Invariants:
+
+1. **Central Safety Invariant**:
+   $$\textbf{"An edge node must never replace its active model with an unverified, incompatible, malformed, or unsupported model."}$$
+2. **MODEL AVAILABLE $\neq$ MODEL ACTIVE**:
+   The presence or announcement of an available candidate model in the control plane or local staging grants zero authority for edge execution. Only successful verification, validation, and atomic promotion permit real-time inference.
+3. **Strict Decoupling from Telemetry Synchronization**:
+   Model deployment operates across a separate downstream channel. It does not depend on, block, or reuse telemetry `BatchID`, monotonic sequence numbers, or telemetry ACK semantics. The existing telemetry path (`SQLite -> PENDING -> NATS/HTTP -> Control Plane`) remains completely independent. Repeated delivery of the same valid model artifact must not cause an unsafe or inconsistent activation.
+4. **Offline Autonomy Invariant**:
+   $$\textbf{CONTROL PLANE OFFLINE } \longrightarrow \textbf{ ACTIVE MODEL REMAINS ACTIVE } \longrightarrow \textbf{ LOCAL DETECTION CONTINUES}$$
+   If the control plane, registry, or network is unavailable, the edge agent continues anomaly detection using its currently validated active model, subject to local hardware, storage, and runtime availability.
+5. **Crash-Resilient Activation Architecture (Proposed Design)**:
+   * **In-Memory**: Activation is proposed to use an atomic pointer swap (e.g. `sync/atomic.Pointer`) in a future implementation phase. Lock-free in-memory activation is a proposed design and is not currently implemented; zero-downtime activation is not claimed.
+   * **Filesystem**: Future implementation designs should evaluate platform-appropriate atomic replacement semantics where available. Recovery must identify and load a valid model, while exact crash-consistency depends on the filesystem and storage platform and must be validated during implementation. The architecture aims to prevent partially written candidate artifacts from becoming active, subject to OS, filesystem, and storage hardware behavior. Transactional filesystem semantics are not claimed.
+6. **Autonomous Disconnected Rollback (Proposed Design)**:
+   The edge node retains a validated historical baseline (`previous`). Rollback triggers in Phase 5.5D are designed for pre-activation validation failure, activation state transition failure, startup corruption, or explicit operator rollback. Automatic runtime accuracy or panic-based rollback are future policy candidates.
+7. **Integrity vs. Authenticity**:
+   The current SHA-256 checksum strictly guarantees file integrity against corruption, bit-rot, and truncation. SHA-256 alone does NOT provide origin authentication, non-repudiation, publisher identity, or replay/downgrade protection. Cryptographic authenticity via asymmetric signatures (e.g. Ed25519) is strictly future design.
+8. **Potential Future Degradation Hierarchy**:
+   Active ML model $\rightarrow$ Previous validated ML model $\rightarrow$ Statistical detector $\rightarrow$ Threshold detector. Automatic runtime detector failover is future work and is not implemented in Phase 5.5D. The existing `ThresholdDetector`, `StatisticalDetector`, and `MLDetector` are separate existing components; their automatic runtime orchestration is not yet implemented.

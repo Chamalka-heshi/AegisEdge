@@ -1133,6 +1133,438 @@ The technical path to operational ML anomaly detection is structured across dist
   * Implemented deterministic model serializer, validation, and post-write verification in `services/control-plane/training/serializer.go`.
   * Implemented offline training CLI `aegisedge-train` in `services/control-plane/cmd/aegisedge-train/main.go`.
   * End-to-end compatibility and byte-for-byte determinism test suite in `services/control-plane/training/training_test.go`.
-* **Phase 5.5D (Integrated Verification & Benchmarking — FUTURE)**:
-  * End-to-end integration testing across the full multi-detector pipeline: Telemetry $\rightarrow$ Persist $\rightarrow$ Threshold + Statistical + ML $\rightarrow$ Incident Engine $\rightarrow$ Verification.
-  * Empirical memory and CPU profiling benchmarks under simulated edge load.
+* **Phase 5.5D (ML Model Distribution & Deployment Architecture — CURRENT DESIGN PHASE)**:
+  * Architectural specification for secure, offline-resilient model distribution, local staging, atomic activation, and rollback management (detailed in Section 31 below).
+  * Design-only phase: establishes lifecycle invariants, trust boundaries, multi-stage validation gates, failure matrices, and security models without introducing runtime deployment code.
+
+---
+
+## 31. Phase 5.5D — ML Model Distribution & Deployment Architecture
+
+**Status**: Accepted Architecture & Design Specification (Phase 5.5D — Design Only)
+**Date**: 2026-10-01
+**Deciders**: AegisEdge Engineering Team
+**Scope**: Offline-Resilient ML Model Distribution, Staging, Validation, Activation & Rollback
+
+### Architectural Notice & Scope Boundaries
+* **Design-Only Phase**: Phase 5.5D establishes the architectural and security contracts for distributing trained Isolation Forest model artifacts from the control plane to autonomous edge nodes.
+* **No Runtime Deployment Code**: This phase does NOT implement model distribution network transport, downloading daemons, signing infrastructure, model registry services, edge model manager code, HTTP/NATS distribution endpoints, AWS/S3 storage, containerization, automatic retraining, or automatic accuracy-based rollback engines.
+* **Preservation of Core Principle**:
+  $$\textbf{EDGE OPERATES OFFLINE } \longrightarrow \textbf{ PERSISTS LOCALLY } \longrightarrow \textbf{ DETECTS LOCALLY } \longrightarrow \textbf{ SYNCHRONIZES WHEN CONNECTED}$$
+  The existing pure-Go ML inference engine (`MLDetector`) must continue operating locally in-memory without requiring control-plane connectivity.
+
+---
+
+### 31.1 Model Lifecycle
+
+The lifecycle of an Isolation Forest model artifact spans offline construction, distribution, edge validation, and execution:
+
+```
+[Training & Packaging Environment]
+        TRAINED
+           ↓
+    ARTIFACT CREATED
+           ↓
+   INTEGRITY VERIFIED (Canonical JSON SHA-256)
+           ↓
+        SIGNED (Future Ed25519)
+           ↓
+ REGISTERED / AVAILABLE (Model Registry)
+           ↓
+[Distribution Channel]
+      DISTRIBUTED (Dedicated Transport)
+           ↓
+[Edge Node Autonomous Runtime]
+      DOWNLOADED (To Staging Sandbox)
+           ↓
+       VERIFIED (Transport & Checksum Integrity)
+           ↓
+      VALIDATED (Structural, Schema & Resource Limits)
+           ↓
+        STAGED (Isolated Ready Candidate)
+           ↓
+       ACTIVATED (Atomic Pointer Swap & Platform Replacement)
+```
+
+#### Rejection & Failure States
+Whenever a candidate model artifact fails any verification, validation, or activation stage, it transitions into an explicit rejection state:
+* `DOWNLOAD_FAILED`: Network timeout, transfer truncation, or transport connection reset during delivery.
+* `VERIFICATION_FAILED`: File envelope corruption, malformed JSON syntax, or canonical JSON SHA-256 checksum mismatch.
+* `VALIDATION_FAILED`: Tree structure bounds exceeded (tree count, depth, nodes), non-finite split values (`NaN`/`Inf`), graph cycles, or unreachable nodes detected.
+* `INCOMPATIBLE`: Algorithm mismatch (not `isolation_forest`), feature schema mismatch (not `features.v1.0.0`), dimension mismatch ($\ne 4$), or unsupported metric names.
+* `REJECTED`: General rejection state following dry-run failure or unauthorized downgrade attempt.
+
+#### Non-Interference Invariant
+$$\textbf{A failed candidate MUST NOT replace the currently active known-good model.}$$
+If a candidate enters any failure or rejection state:
+1. The candidate artifact in the staging sandbox is quarantined or discarded.
+2. The currently active model remains loaded in memory and continues evaluating incoming telemetry without interruption.
+3. No partial state, broken tree structures, or unverified configurations are ever exposed to the inference loop.
+
+---
+
+### 31.2 Active / Previous / Staged Model Concept (Future Model-Management Architecture)
+
+In the current Phase 5.5B/5.5C implementation, models are loaded from a static filesystem path at process initialization. For future deployment phases (Phase 5.6+), to ensure deterministic execution and recovery without network access, the edge agent model-management architecture conceptually defines three roles:
+
+* **Active Model (`active`)**: In future architecture, the validated model artifact currently loaded into the running `MLDetector` instance. Read-only during inference; serves real-time telemetry evaluations.
+* **Previous Known-Good Model (`previous`)**: In future architecture, the last successfully running model artifact retained locally as an immediate fallback target. Enables local rollback without network connectivity.
+* **Staged Candidate (`staged`)**: In future architecture, a newly received artifact isolated in a staging sandbox while undergoing the multi-stage validation sequence. Completely isolated from the inference engine.
+
+#### Conceptual Lifecycle State Transitions (Future Design)
+Before an activation event:
+* `active` = `model-X`
+* `previous` = `model-W` (or empty on initial installation)
+* `staged` = `model-Y` (undergoing validation)
+
+During proposed atomic activation:
+1. Candidate `model-Y` passes all validation gates and dry-run inference.
+2. Existing `active` (`model-X`) is designated as the new `previous` fallback.
+3. Candidate `model-Y` is promoted to `active`.
+4. Staging area is cleared:
+   * `active` = `model-Y`
+   * `previous` = `model-X`
+   * `staged` = `none`
+
+If validation or activation of `model-Y` fails:
+* Candidate `model-Y` is discarded from staging.
+* State remains:
+  * `active` = `model-X`
+  * `previous` = `model-W`
+  * `staged` = `none`
+
+*Note: This section defines conceptual lifecycle states for future implementation. No filesystem manager, staging daemon, or activation engine is implemented in Phase 5.5D.*
+
+---
+
+### 31.3 Model Integrity vs. Authenticity
+
+A secure distribution architecture must explicitly distinguish between data integrity and cryptographic authenticity:
+
+```
++-----------------------------------------------------------------------------------------+
+|                                INTEGRITY vs AUTHENTICITY                                |
++-----------------------------+-----------------------------------------------------------+
+| SHA-256 Checksum            | * Detects artifact corruption, bit-rot, and truncation.   |
+| (Implemented in Phase 5.5B) | * Verifies that the received bytes match the digest.       |
+|                             | * Does NOT prove who authored or built the model.         |
+|                             | * Does NOT provide non-repudiation or origin validation.  |
+|                             | * Does NOT prevent replay or downgrade attacks on its own.|
++-----------------------------+-----------------------------------------------------------+
+| Ed25519 Digital Signature   | * Cryptographically authenticates publisher identity.     |
+| (Future Implementation)     | * Proves artifact was approved by trusted control-plane.  |
+|                             | * Provides tamper-evidence coupled to publisher key.     |
+|                             | * Requires trusted public key distribution & management.  |
++-----------------------------+-----------------------------------------------------------+
+```
+
+* **Current Implementation Boundary**: The canonical JSON SHA-256 checksum implemented in Phase 5.5B and Phase 5.5C (`ComputeChecksum`, `DeserializeModel`) serves strictly as an **integrity and corruption-detection mechanism**.
+* **Future Security Boundary**: Cryptographic signing using asymmetric keys (such as Ed25519) is a **future design requirement** and is not currently implemented in the repository. The edge agent does not claim cryptographic authentication in Phase 5.5D.
+
+---
+
+### 31.4 Trust Boundary
+
+The intended model distribution trust flow establishes strict separation between model creation and edge execution:
+
+```
+[Trusted Training Environment]
+   ├── Historical Telemetry Dataset (Validated & Tagged)
+   └── aegisedge-train CLI (Deterministic Isolation Forest)
+              ↓ (Raw Model Artifact)
+[Signing Authority (Future Phase)]
+   └── Offline Private Key (Cryptographic Signature Generation)
+              ↓ (Signed Model Bundle [Future Phase])
+[Model Registry & Distribution Layer (Future Phase)]
+   └── Central Storage, Version Catalog & Transport Gateway
+              ↓ (Downstream Network Distribution)
+[Edge Node Perimeter]
+   ├── Independent Edge Verification (Never blind trust)
+   ├── Transport & SHA-256 Integrity Verification
+   ├── Signature Verification (Future Key Validation)
+   ├── Structural & Schema Boundary Enforcement
+   ├── Synthetic Dry-Run Inference Pass
+              ↓ (Passes All Gates)
+[Staging Sandbox]
+              ↓ (Atomic Activation)
+[Active Inference Engine (MLDetector)]
+```
+
+#### Core Trust Invariant:
+$$\textbf{The edge node does NOT blindly trust a model merely because it was delivered by the control plane.}$$
+Every edge node must independently verify, validate, and test every candidate artifact locally before granting execution authority.
+
+---
+
+### 31.5 Model Compatibility Validation
+
+Before any candidate model can be activated, it must be evaluated against the strict domain contracts established in Phase 5.5B (`edge/agent/detector/ml_model.go`) and Phase 5.5C:
+
+#### 1. Implemented Validation Checks (Current Codebase)
+* **Model Identity & Version**: `ModelID` and `ModelVersion` must be non-empty strings.
+* **Algorithm Compatibility**: `Algorithm` must strictly equal `"isolation_forest"`.
+* **Feature Schema Compatibility**: `FeatureSchemaVersion` must strictly equal `"features.v1.0.0"`.
+* **Input Dimensions & Metric Ordering**: `InputDimensions` must equal 4, and `SupportedMetrics` must match the canonical slice:
+  `["cpu_usage_percent", "memory_usage_percent", "disk_usage_percent", "temperature_celsius"]`.
+* **Normalization Parameters**: Exactly 4 entries corresponding to `SupportedMetrics`, each containing finite float values (`mean`, `std_dev`, `min`, `max`) with $\text{std\_dev} \ge 0$ and $\text{max} \ge \text{min}$.
+* **Decision Threshold**: `DecisionThreshold` must be a valid finite float strictly within the open interval $(0.0, 1.0)$.
+* **Subsample Size**: `SubSampleSize` must satisfy $2 \le \psi \le \text{MaxSubSampleSize}\ (10000)$.
+* **Model Status**: `Status` must be `"ACTIVE"`.
+* **Structural Safety Limits (edge/agent/detector/ml_model.go)**:
+  * Tree count: $1 \le T \le \text{MaxTrees}\ (1000)$.
+  * Nodes per tree: $1 \le N_{\text{tree}} \le \text{MaxNodesPerTree}\ (2048)$.
+  * Cumulative node count: $\sum N_{\text{tree}} \le \text{MaxTotalNodes}\ (100000)$.
+  * Tree path depth: $\text{Depth} \le \text{MaxTreeDepth}\ (50)$.
+  * Input dimensions: $1 \le \text{InputDimensions} \le \text{MaxInputDimensions}\ (64)$ (canonical 4 dimensions enforced in Phase 5.5B).
+  * Subsample size: $2 \le \psi \le \text{MaxSubSampleSize}\ (10000)$.
+* **Graph Integrity**:
+  * Internal nodes: Valid split feature index ($0 \le f < 4$), finite split value, valid left/right child indices with $\text{LeftChild} \ne \text{RightChild}$.
+  * Leaf nodes: $\text{LeftChild} == -1$, $\text{RightChild} == -1$, $\text{FeatureIndex} == -1$, $\text{Size} \ge 1$.
+  * Acyclicity: Graph traversal must contain zero cycles.
+  * Node reachability: Every node in `Nodes` slice must be reachable from `RootIndex`.
+* **Canonical Checksum Integrity**: Canonical JSON hash must match `ChecksumSHA256`.
+
+#### 2. Future Distribution Validation Checks (Designed for Phase 5.6)
+* **Cryptographic Signature Verification**: Valid Ed25519 signature verified against local trusted public key keystore (future design).
+* **Agent Version Compatibility**: Model manifest specifies minimum and maximum supported edge agent version numbers (future design).
+* **Version Monotonicity / Rollback Authorization (Future Deployment Policy)**: Candidate `ModelVersion` would be compared against the active version ($V_{\text{candidate}} > V_{\text{active}}$) using authenticated metadata; not currently enforced in Phase 5.5D.
+
+---
+
+### 31.6 Atomic Activation (Proposed Future Architecture)
+
+An edge node must never enter a state where an invalid, corrupted, or partially written model becomes active. In Phase 5.5D, atomic activation is a design concept for future implementation (Phase 5.6+); the current codebase loads a single static model at startup.
+
+```
+Incoming Download ──> Staging Sandbox ──> Multi-Stage Validation ──> Atomic Swap ──> Active Runtime
+                            │                      │
+                     (Failure/Abort)        (Validation Error)
+                            │                      │
+                            ▼                      ▼
+                    Discard Candidate      Quarantine Candidate
+                    (Active Unchanged)     (Active Unchanged)
+```
+
+#### Activation Mechanics (Future Implementation Considerations)
+1. **Isolated Ingestion**: In future architecture, artifacts would be downloaded into an isolated temporary file in staging (e.g. `staging/candidate.tmp`).
+2. **In-Staging Validation**: Verification, parsing, structural validation, and dry-run execution occur entirely on the staging file.
+3. **Platform-Appropriate Replacement (Future Implementation Consideration)**:
+   * Future implementation designs should evaluate platform-specific replacement mechanisms (such as atomic file replacement semantics via `rename(2)` on POSIX systems or replacement APIs such as `ReplaceFileW` on Windows). These are candidate design options to be investigated in future phases, not currently implemented mechanisms.
+   * *Crash-Consistency Clarification*: Crash-consistency behavior across power loss, OS crashes, or hardware write-cache delays depends on the OS, filesystem, and storage hardware platform, and must be validated during implementation. Transactional filesystem semantics are **not** claimed. The architecture aims to prevent partially written candidate artifacts from becoming active.
+4. **In-Memory Pointer Swap (Future Implementation Consideration)**:
+   * Future implementation designs may evaluate managing dynamic model swaps via an atomic pointer mechanism (such as `sync/atomic.Pointer[IsolationForestModel]` or explicit synchronization primitives). Neither lock-free pointer swapping nor dynamic runtime model swapping is implemented in the repository today.
+5. **Activation Failure Safety**:
+   * If any step during validation or replacement fails, the candidate is discarded.
+   * In a future implementation, the active model remains untouched, avoiding disruption to continuous detection.
+
+---
+
+### 31.7 Rollback Architecture (Proposed Future Capability)
+
+Local rollback is a proposed future capability to ensure that an edge node can recover if an updated model fails during deployment. No rollback manager or fallback state machine is implemented in Phase 5.5D.
+
+#### Proposed Retention of Previous Known-Good Model
+* In future deployment architecture, the edge agent will be designed to retain one previous validated model artifact (`previous`) on local disk.
+* Retaining this artifact would allow the edge node to revert locally without requiring network access, control-plane availability, or remote artifact downloads.
+
+#### Proposed Rollback Scenarios & Triggers (Future Design)
+1. **Pre-Activation Failure**: If a candidate model fails validation or dry-run testing before activation, the candidate is rejected. The active model remains active; **no rollback is involved** because the operational state was never modified.
+2. **Activation State Transition Failure**: If the proposed filesystem replacement or in-memory pointer swap fails during activation, the agent would restore the prior state from `previous`.
+3. **Startup Corruption of Active File**: If the node reboots and finds the `active` model file corrupted or failing checksum verification, future recovery logic would fall back to `previous`.
+4. **Explicit Operator Rollback Directive**: An authorized operator dispatches a signed command instructing the agent to restore the previous validated model version.
+
+#### Edge Cases in Rollback Execution
+* **Rollback Requested While Disconnected**: In the proposed design, if an edge node is operating offline during an operational fault, local rollback would restore the `previous` model directly from local disk. No connection to the control plane is required.
+* **Previous Model Unavailable**: If the previous model artifact is missing, unreadable, or corrupted:
+  * The agent would log an alert and preserve the current in-memory model if still functioning.
+  * If the active model cannot run, the agent would disable ML detection and fall back to deterministic rule-based detectors (`ThresholdDetector` and `StatisticalDetector`).
+* **Automated Rollback Policy Disclaimer**: Automated rollback based on dynamic output drift, false-positive rates, or runtime accuracy is **not designed or implemented**. Rollback triggers in this architecture are strictly confined to validation, integrity, compatibility, activation, and explicit operator commands.
+
+---
+
+### 31.8 Offline / Disconnected Behavior
+
+AegisEdge's primary operational invariant is local edge autonomy:
+
+```
+[Edge Node Disconnected from Network]
+   ├── Active Model Continues In-Memory Inference
+   ├── Metric Collection Continues (100% Local)
+   ├── SQLite WAL Durability Persists Telemetry & Incidents
+   ├── Local Threshold & Statistical Detectors Active
+   └── In-Flight or Pending Model Downloads Suspended Safely
+```
+
+* **Continuous Local Inference**: When network connectivity is lost (control plane down, NATS broker unavailable, physical uplink severed), the edge agent continues evaluating real-time telemetry against the currently validated active model.
+* **Decoupled Operation**: Incomplete or pending model updates have zero effect on local inference. An edge device never halts anomaly detection because an update failed or was paused.
+* **Reconnection Behavior**:
+  * When network connectivity returns, the edge agent can check for model updates.
+  * Reconnection does **not** bypass local validation: any candidate received after reconnection must pass the complete multi-stage verification pipeline before activation.
+
+---
+
+### 31.9 Model Distribution is Separate from Telemetry
+
+A critical architectural requirement is the complete separation of model distribution from operational telemetry synchronization:
+
+```
++-----------------------------------------------------------------------------------------+
+|                        SEPARATION OF CONCERNS: TELEMETRY vs ML MODELS                   |
++--------------------------+--------------------------------------------------------------+
+| Operational Telemetry    | * Direction: Edge-to-Cloud (Upstream).                      |
+| Pipeline                 | * Transport: SQLite WAL -> HTTP / NATS JetStream Stream.     |
+|                          | * Identity: BatchID, Monotonic SequenceNumber, EventID.      |
+|                          | * Semantics: At-least-once streaming, broker deduplication.  |
++--------------------------+--------------------------------------------------------------+
+| ML Model Distribution    | * Direction: Cloud-to-Edge (Downstream).                    |
+| Pipeline                 | * Transport: Dedicated artifact distribution channel.       |
+|                          | * Identity: ModelID, ModelVersion (SemVer), ChecksumSHA256.  |
+|                          | * Semantics: Version-gated idempotent deployment.            |
++--------------------------+--------------------------------------------------------------+
+```
+
+* **Artifacts Are Not Telemetry Batches**: Model artifacts must never be encapsulated as telemetry batches, nor should they reuse telemetry `BatchID`, `SequenceNumber`, or SQLite sync state columns.
+* **Dedicated Transport**: Future model distribution will utilize a dedicated, isolated transport (such as a separate NATS JetStream Object Store bucket, specialized NATS distribution subjects, or an out-of-band HTTPS endpoint).
+* **Delivery Decoupling**: Repeated delivery of the same valid model artifact must not cause an unsafe or inconsistent activation. If a model version equal to or lower than the active model is received without an explicit operator rollback directive, the agent safely ignores it.
+
+---
+
+### 31.10 Versioning and Rollback Safety
+
+Model artifacts are identified and versioned using explicit domain attributes:
+* **Model ID (`model_id`)**: Functional identifier of the model family (e.g. `iforest-gateway-v1`).
+* **Model Version (`model_version`)**: Semantic version string (e.g. `1.2.0`). Major version changes indicate structural changes; minor version changes indicate retraining on new baseline data.
+* **Feature Schema Version (`feature_schema_version`)**: Explicit schema compatibility contract (e.g. `features.v1.0.0`). Prevents evaluating a model against mismatched telemetry dimensions.
+* **Training Dataset ID (`training_dataset_id`)**: Audit reference linking the artifact to the source training snapshot.
+* **Inference Algorithm (`algorithm`)**: Algorithm family identifier (strictly `"isolation_forest"`).
+
+#### Proposed Future Version & Downgrade Protection Policies
+Monotonic model-version enforcement is not currently implemented in Phase 5.5D. In future model-distribution phases, version monotonicity, replay defense, and downgrade protection will be evaluated as a deployment policy requiring cryptographically authenticated metadata (such as signed manifests with timestamps and nonces) and explicit operator rollback authorization:
+1. **Monotonic Progression (Future Policy)**: In future model-distribution pipelines, candidate models will be compared against active versions ($V_{\text{candidate}} > V_{\text{active}}$). Monotonic progression is a design goal for future implementation, not a currently active runtime check.
+2. **Replay & Downgrade Defense (Future Requirement)**: Replay and downgrade protection fundamentally requires asymmetric cryptographic signatures over versioned metadata. SHA-256 integrity alone does not prevent an attacker or misconfigured system from replaying an older, validly hashed model artifact.
+3. **Authorized Rollback Override (Future Policy)**: Reverting to an older model version in production will require an explicit, cryptographically authenticated rollback directive signed by an authorized operator.
+4. **Stale Model Handling (Future Policy)**: If an agent receives a candidate matching the active version ($V_{\text{candidate}} == V_{\text{active}}$) with an identical checksum, the distribution layer will treat the event as an idempotent no-op.
+
+---
+
+### 31.11 Security Model
+
+Deploying executable machine learning artifacts to edge nodes introduces specific threat vectors that must be mitigated by defense-in-depth:
+
+```
+[Threat Vector]                              [Mitigation Layer]
+1. Corrupted / Truncated Artifact ─────────> Canonical JSON SHA-256 Checksum (Implemented)
+2. Malformed Node / Cyclic Graph ──────────> Graph Traversal & Acyclicity Checks (Implemented)
+3. Denial of Service (Deep Trees) ─────────> Bounded Safety Limits (Trees, Nodes, Depth) (Implemented)
+4. Telemetry Schema Poisoning ─────────────> Strict Feature Dimension & Name Checks (Implemented)
+5. Non-Finite Floats (NaN / Inf) ──────────> Float Sanitization & Value Validation (Implemented)
+6. Untrusted Publisher / Spoofing ─────────> Asymmetric Digital Signatures (Ed25519) (Future Phase)
+7. Replay / Stale Model Downgrade ─────────> Signed Version Monotonicity & Nonces (Future Phase)
+8. Compromised Signing Key ────────────────> Key Revocation Lists & Expirations (Future Phase)
+```
+
+#### Detailed Security Boundaries
+* **Artifact Integrity**: The agent verifies canonical JSON SHA-256 before parsing tree nodes.
+* **Artifact Authenticity (Future)**: Asymmetric signatures (Ed25519) will verify publisher identity.
+* **Replay & Downgrade Prevention**: Requires cryptographic signatures over metadata (including version and timestamps). SHA-256 alone does not provide replay or downgrade protection.
+* **Resource Bounds**: Hard safety ceilings prevent memory exhaustion or traversal stalls:
+  `MaxTrees = 1000`, `MaxNodesPerTree = 2048`, `MaxTotalNodes = 100000`, `MaxTreeDepth = 50`, `MaxInputDimensions = 64`, `MaxSubSampleSize = 10000`.
+* **Execution Safety Boundary**: Model artifacts are structured inference data (numerical split thresholds and node indices) and are not treated as executable shell or script content. The inference engine evaluates decisions mathematically and does not invoke host execution commands.
+
+---
+
+### 31.12 Failure / Recovery Matrix (Conditions A through W)
+
+The following matrix documents the designed behavior across twenty-three edge model distribution and deployment conditions:
+
+| ID | Operating Condition | Edge Agent Response | Authoritative State | Active Inference Impact | Safe Retry? | Rollback Involved? |
+| :--- | :--- | :--- | :--- | :--- | :---: | :---: |
+| **A** | Control plane unavailable | Retains current active model; suspends update checks | Edge Active Model | No impact; detection continues | Yes | No |
+| **B** | Model registry unavailable | Logs warning; continues running active model | Edge Active Model | No impact; detection continues | Yes | No |
+| **C** | Download interrupted | Discards partial file in staging; logs transport error | Edge Active Model | No impact; detection continues | Yes | No |
+| **D** | Network partition | Operates fully offline; buffers telemetry locally | Edge Active Model | No impact; detection continues | Yes | No |
+| **E** | Corrupted artifact | Deserialization fails in staging; artifact quarantined | Edge Active Model | No impact; detection continues | Yes | No |
+| **F** | Checksum mismatch | SHA-256 check fails in staging; candidate rejected | Edge Active Model | No impact; detection continues | Yes | No |
+| **G** | Invalid signature | Cryptographic check fails; candidate dropped | Edge Active Model | No impact; detection continues | Yes | No |
+| **H** | Unknown signing key | Key not in trusted keystore; candidate rejected | Edge Active Model | No impact; detection continues | Yes | No |
+| **I** | Malformed model | Validation catches structural defect; rejected | Edge Active Model | No impact; detection continues | Yes | No |
+| **J** | Unsupported algorithm | Rejects non-`isolation_forest` algorithm | Edge Active Model | No impact; detection continues | No | No |
+| **K** | Feature schema mismatch | Rejects non-`features.v1.0.0` schema | Edge Active Model | No impact; detection continues | No | No |
+| **L** | Input dimension mismatch | Rejects dimensions $\ne 4$ or unordered metrics | Edge Active Model | No impact; detection continues | No | No |
+| **M** | Resource-limit violation | Rejects excessive trees, nodes, or depth | Edge Active Model | No impact; detection continues | No | No |
+| **N** | Staging failure | Disk full/permission error in staging; aborted | Edge Active Model | No impact; detection continues | Yes | No |
+| **O** | Activation failure | Promotion fails; candidate rejected; active remains unchanged | Edge Active Model | Active model continues running | Yes | If activation failed |
+| **P** | Edge crash during staging | Startup sweeps orphan `.tmp` files in staging | Edge Active Model | Resumes active model on boot | Yes | No |
+| **Q** | Edge crash during activation | Recovery must identify and load a valid model; exact crash-consistency depends on the filesystem and storage platform and must be validated during implementation | Active or Previous | Detection continues if a valid model is identified | Yes | If activation aborted |
+| **R** | Rollback requested after activation | Restores `previous` model via pointer swap | Edge Previous Model | Reverts to prior known-good | No | Yes |
+| **S** | Duplicate distribution request | Recognizes identical version/hash; no-op | Edge Active Model | No impact; acknowledged | Yes | No |
+| **T** | Stale model received | Rejects candidate with timestamp older than active | Edge Active Model | No impact; candidate dropped | No | No |
+| **U** | Downgrade attempt | Rejects version lower than active without override | Edge Active Model | No impact; candidate dropped | No | No |
+| **V** | Edge disconnected during update | Aborts in-flight download; active continues | Edge Active Model | No impact; detection continues | Yes | No |
+| **W** | Control-plane restart during distribution | Connection reset handled gracefully; retry backoff | Edge Active Model | No impact; detection continues | Yes | No |
+
+---
+
+### 31.13 Observability Design
+
+To provide operational visibility into model lifecycle events without coupling to runtime frameworks, the architecture defines future structured events and metrics:
+
+#### 1. Future Metrics (Designed for Implementation in Phase 5.6)
+* `aegisedge_model_download_duration_seconds`: Histogram measuring artifact download time across network tiers.
+* `aegisedge_model_verification_duration_seconds`: Histogram measuring SHA-256 and signature check latency.
+* `aegisedge_model_validation_duration_seconds`: Histogram measuring structural and boundary validation time.
+* `aegisedge_model_deployment_events_total{status="success|rejected|failed", reason="..."}`: Counter tracking candidate lifecycle outcomes.
+* `aegisedge_model_rollbacks_total{trigger="operator|startup_recovery|activation_failure"}`: Counter tracking model rollback events.
+* `aegisedge_model_active_info{model_id="...", model_version="...", algorithm="...", checksum="..."}`: Gauge exposing active model metadata.
+
+#### 2. Future Structured Log Events
+* `ModelDownloadStarted`: `model_id`, `model_version`, `expected_bytes`, `source_url`.
+* `ModelVerificationCompleted`: `model_id`, `model_version`, `checksum_sha256`, `duration_ms`.
+* `ModelValidationFailed`: `model_id`, `model_version`, `failure_reason`, `violating_field`.
+* `ModelActivationCommitted`: `model_id`, `activated_version`, `previous_version`, `activation_type`.
+* `ModelRollbackExecuted`: `model_id`, `reverted_from_version`, `restored_to_version`, `trigger_cause`.
+
+---
+
+### 31.14 Model Distribution Security Boundary
+
+$$\textbf{The machine learning model is executable inference data.}$$
+
+Because model artifacts directly configure the decision logic of edge anomaly detection, they represent a sensitive attack surface. Malicious or malformed artifacts must be treated as untrusted external input until five mandatory gates pass:
+1. **Integrity Check**: Canonical SHA-256 digest verified.
+2. **Authenticity Check**: Cryptographic signature verified against trusted public keys (future phase).
+3. **Structural Validation**: Tree acyclicity, node reachability, and graph geometry validated.
+4. **Compatibility Validation**: Telemetry schema and canonical metric ordering verified.
+5. **Resource Bounds Check**: Tree counts, node counts, and path depths confirmed within safety limits.
+
+#### Non-Destructive Boundary
+The model must never have access to host system execution, shell commands, process spawning, or arbitrary filesystem modification. The existing AegisEdge safety invariant remains inviolable:
+$$\textbf{ML inference produces mathematical AnomalySignals. It never directly executes operational mutations.}$$
+
+---
+
+### 31.15 Current vs. Future Capabilities
+
+The boundary between operational code currently verified in the repository and future architectural designs is explicitly categorized:
+
+| Capability / Subsystem | Status | Repository Reference |
+| :--- | :---: | :--- |
+| **Pure-Go Isolation Forest Traversal & Scoring** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml.go` |
+| **Model Manifest Domain Contract (`MLModelManifest`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
+| **Mathematical Normalization & Expected Path Length ($c(\psi)$)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
+| **Model Structural Validation & Graph Acyclicity Checks** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
+| **Canonical JSON SHA-256 Checksum Calculation & Verification** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go`, `services/control-plane/training/` |
+| **Resource Safety Ceilings (`MaxTrees`, `MaxNodes`, `MaxDepth`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
+| **Deterministic Offline Model Training CLI (`aegisedge-train`)** | **CURRENTLY IMPLEMENTED** | `services/control-plane/cmd/aegisedge-train/` |
+| **CSV Telemetry Dataset Loading & Canonical Feature Ordering** | **CURRENTLY IMPLEMENTED** | `services/control-plane/training/dataset.go` |
+| **Deterministic Model Serialization & Verification** | **CURRENTLY IMPLEMENTED** | `services/control-plane/training/serializer.go` |
+| **Threshold & Statistical Detectors (`ThresholdDetector`, `StatisticalDetector`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/threshold.go`, `statistical.go` |
+| **Local SQLite WAL Durability & Telemetry Sync Pipeline** | **CURRENTLY IMPLEMENTED** | `edge/agent/storage/`, `edge/agent/sync/` |
+| **Model Distribution Network Transport (HTTP/NATS)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
+| **Central Model Registry & Version Catalog** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
+| **Edge Staging Sandbox & Candidate Quarantine Manager** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
+| **Atomic Model Activation (Pointer Swap & Platform Rename)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
+| **Local Autonomous Rollback Engine (Active/Previous States)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
+| **Ed25519 Cryptographic Signing & Public Key Management** | *FUTURE IMPLEMENTATION* | Future Cryptographic Milestone |
+| **Key Rotation & Revocation List Distribution** | *FUTURE IMPLEMENTATION* | Future Security Milestone |
+| **Automatic Accuracy-Based Retraining & Rollback** | *FUTURE IMPLEMENTATION* | Future Fleet Intelligence Milestone |
