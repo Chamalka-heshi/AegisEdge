@@ -1550,21 +1550,23 @@ The boundary between operational code currently verified in the repository and f
 | Capability / Subsystem | Status | Repository Reference |
 | :--- | :---: | :--- |
 | **Pure-Go Isolation Forest Traversal & Scoring** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml.go` |
-| **Model Manifest Domain Contract (`MLModelManifest`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
-| **Mathematical Normalization & Expected Path Length ($c(\psi)$)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
-| **Model Structural Validation & Graph Acyclicity Checks** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
-| **Canonical JSON SHA-256 Checksum Calculation & Verification** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go`, `services/control-plane/training/` |
-| **Resource Safety Ceilings (`MaxTrees`, `MaxNodes`, `MaxDepth`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/ml_model.go` |
+| **Shared Model Manifest Contracts (`ModelManifest`)** | **CURRENTLY IMPLEMENTED** | `shared/ml/model.go` (Phase 5.6A) |
+| **Shared Runtime Compatibility Contracts** | **CURRENTLY IMPLEMENTED** | `shared/ml/compatibility.go` (Phase 5.6A) |
+| **Shared Deployment Lifecycle Contracts** | **CURRENTLY IMPLEMENTED** | `shared/ml/deployment.go` (Phase 5.6A) |
+| **Edge Local Model Store & Candidate Staging** | **CURRENTLY IMPLEMENTED** | `edge/agent/modelstore/store.go` (Phase 5.6B) |
+| **Mathematical Normalization & Expected Path Length ($c(\psi)$)** | **CURRENTLY IMPLEMENTED** | `shared/ml/model.go` |
+| **Model Structural Validation & Graph Acyclicity Checks** | **CURRENTLY IMPLEMENTED** | `shared/ml/model.go` |
+| **Canonical JSON SHA-256 Checksum Calculation & Verification** | **CURRENTLY IMPLEMENTED** | `shared/ml/model.go`, `services/control-plane/training/` |
+| **Resource Safety Ceilings (`MaxTrees`, `MaxNodes`, `MaxDepth`)** | **CURRENTLY IMPLEMENTED** | `shared/ml/model.go` |
 | **Deterministic Offline Model Training CLI (`aegisedge-train`)** | **CURRENTLY IMPLEMENTED** | `services/control-plane/cmd/aegisedge-train/` |
 | **CSV Telemetry Dataset Loading & Canonical Feature Ordering** | **CURRENTLY IMPLEMENTED** | `services/control-plane/training/dataset.go` |
-| **Deterministic Model Serialization & Verification** | **CURRENTLY IMPLEMENTED** | `services/control-plane/training/serializer.go` |
+| **Deterministic Model Serialization & Verification** | **CURRENTLY IMPLEMENTED** | `shared/ml/model.go`, `services/control-plane/training/serializer.go` |
 | **Threshold & Statistical Detectors (`ThresholdDetector`, `StatisticalDetector`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/detector/threshold.go`, `statistical.go` |
 | **Local SQLite WAL Durability & Telemetry Sync Pipeline** | **CURRENTLY IMPLEMENTED** | `edge/agent/storage/`, `edge/agent/sync/` |
-| **Model Distribution Network Transport (HTTP/NATS)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
-| **Central Model Registry & Version Catalog** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
-| **Edge Staging Sandbox & Candidate Quarantine Manager** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
-| **Atomic Model Activation (Pointer Swap & Platform Rename)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
-| **Local Autonomous Rollback Engine (Active/Previous States)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Target: Phase 5.6) |
+| **Model Distribution Network Transport (HTTP/NATS)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
+| **Central Model Registry & Version Catalog** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
+| **Model Activation (Proposed Pointer Swap & Platform Replacement)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Crash-Consistent Activation Not Implemented) |
+| **Local Autonomous Rollback Engine (Active/Previous States)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
 | **Ed25519 Cryptographic Signing & Public Key Management** | *FUTURE IMPLEMENTATION* | Future Cryptographic Milestone |
 | **Key Rotation & Revocation List Distribution** | *FUTURE IMPLEMENTATION* | Future Security Milestone |
 | **Automatic Accuracy-Based Retraining & Rollback** | *FUTURE IMPLEMENTATION* | Future Fleet Intelligence Milestone |

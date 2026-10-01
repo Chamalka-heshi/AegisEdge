@@ -85,15 +85,20 @@ go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:80
 
 A local NATS/JetStream development environment is available (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). In Phase 4.3, full application-level NATS integration was completed (`NATS_ENABLED=true`), enabling `SQLite -> PENDING -> NATS JetStream -> PubAck -> PUBLISHED -> Consumer -> Idempotent Ingestion -> ACK`. Phase 4.4 formalizes the comprehensive resilience, redelivery, and failure recovery design in [`ADR-0008`](docs/decisions/ADR-0008-nats-resilience-and-recovery.md).
 
-#### 5. Edge Anomaly Detection Architecture (Phases 5.1 – 5.5A)
+#### 5. Edge Anomaly Detection Architecture (Phases 5.1 – 5.6B)
 
 * **IMPLEMENTED**:
   * `ThresholdDetector`: Deterministic static threshold boundaries ($W=1$) with hysteresis bands and recovery thresholds (Phases 5.1–5.2).
   * `StatisticalDetector`: Deterministic rolling statistical baseline ($\mu, \sigma$, z-score) with bounded window eviction and zero-variance safety (Phase 5.4).
   * `IncidentEngine`: Local $M$-of-$N$ temporal correlation, deduplication, and canonical Incident FSM lifecycle (Phases 5.3–5.5).
-* **DESIGNED / FUTURE**:
-  * `MLDetector`: Multivariate Isolation Forest ensemble evaluated in pure Go over 4-dimensional telemetry vectors (`cpu`, `memory`, `disk`, `temperature`) (Phase 5.5A Design Only, see [`ADR-0009`](docs/decisions/ADR-0009-edge-anomaly-detection.md)).
-  * Model training, artifact packaging, distribution, and validation pipelines.
+  * `MLDetector`: Pure-Go Isolation Forest multivariate anomaly detection engine evaluating canonical 4-dimensional telemetry vectors (`cpu`, `memory`, `disk`, `temperature`) (Phase 5.5B, see [`ADR-0009 §30`](docs/decisions/ADR-0009-edge-anomaly-detection.md)).
+  * `aegisedge-train`: Offline Isolation Forest training CLI with canonical 4D feature alignment, deterministic PRNG seed, and model serialization (Phase 5.5C).
+  * `shared/ml`: Clean decoupled contracts for model manifests, canonical JSON SHA-256 integrity, runtime compatibility evaluation, and deployment lifecycle state machine (Phase 5.6A).
+  * `edge/agent/modelstore`: Filesystem-backed edge model store and candidate staging boundary with multi-stage validation gates, safe bounded reads, Windows-compatible file operations, idempotency, and conflict rejection (Phase 5.6B).
+* **DESIGNED**:
+  * ML Model Distribution, Activation & Rollback Architecture: Staged deployment, proposed activation mechanisms, and autonomous offline rollback (Phase 5.5D Design Only; crash-consistent activation is not implemented, see [`ADR-0009 §31`](docs/decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
+* **FUTURE IMPLEMENTATION**:
+  * Ed25519 cryptographic signing, central model registry service, model distribution network transport, runtime edge model activation/rollback manager.
 
 ### Running Tests
 
@@ -104,5 +109,5 @@ To verify all modules across the Go workspace:
 .\scripts\check.ps1
 
 # Or directly via Go across all workspace modules
-go test -v ./shared/types/... ./edge/agent/... ./services/control-plane/...
+go test -v ./shared/types/... ./shared/ml/... ./edge/agent/... ./services/control-plane/...
 ```
