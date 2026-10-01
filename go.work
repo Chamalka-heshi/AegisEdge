@@ -3,5 +3,6 @@ go 1.25.0
 use (
 	./edge/agent
 	./services/control-plane
+	./shared/ml
 	./shared/types
 )

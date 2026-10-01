@@ -3,7 +3,7 @@ module github.com/Chamalka-heshi/AegisEdge/services/control-plane
 go 1.22
 
 require (
-	github.com/Chamalka-heshi/AegisEdge/edge/agent v0.0.0
+	github.com/Chamalka-heshi/AegisEdge/shared/ml v0.0.0
 	github.com/Chamalka-heshi/AegisEdge/shared/types v0.0.0
 	github.com/nats-io/nats.go v1.37.0
 )
@@ -17,5 +17,5 @@ require (
 	golang.org/x/text v0.14.0 // indirect
 )
 
-replace github.com/Chamalka-heshi/AegisEdge/edge/agent => ../../edge/agent
+replace github.com/Chamalka-heshi/AegisEdge/shared/ml => ../../shared/ml
 replace github.com/Chamalka-heshi/AegisEdge/shared/types => ../../shared/types
