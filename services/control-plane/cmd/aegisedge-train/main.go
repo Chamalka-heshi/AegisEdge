@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
 	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/training"
+	"github.com/Chamalka-heshi/AegisEdge/shared/ml"
 )
 
 const (
@@ -119,7 +119,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  Input Dataset:       %s\n", *inputPath)
 	fmt.Fprintf(stdout, "  Dataset ID:          %s\n", manifest.TrainingDatasetID)
 	fmt.Fprintf(stdout, "  Sample Count:        %d\n", len(dataset.Rows))
-	fmt.Fprintf(stdout, "  Feature Dimensions:  %d (%s)\n", manifest.InputDimensions, detector.FeatureSchemaV1)
+	fmt.Fprintf(stdout, "  Feature Dimensions:  %d (%s)\n", manifest.InputDimensions, ml.FeatureSchemaV1)
 	fmt.Fprintf(stdout, "  Features:            %s\n", strings.Join(manifest.SupportedMetrics, ", "))
 	fmt.Fprintf(stdout, "  Tree Count:          %d\n", len(manifest.Trees))
 	fmt.Fprintf(stdout, "  Subsample Size (psi): %d\n", manifest.SubSampleSize)

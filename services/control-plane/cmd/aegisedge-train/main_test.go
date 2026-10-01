@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
 	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/training"
+	"github.com/Chamalka-heshi/AegisEdge/shared/ml"
 )
 
 func TestCLI_HelpAndVersion(t *testing.T) {
@@ -119,12 +119,19 @@ func TestCLI_EndToEndExecution(t *testing.T) {
 		t.Fatalf("expected threshold 0.65, got: %f", manifest.DecisionThreshold)
 	}
 
-	// Verify detector can consume it directly
-	det, err := detector.NewMLDetector(detector.MLDetectorConfig{Manifest: manifest})
-	if err != nil {
-		t.Fatalf("MLDetector failed to load CLI-generated model: %v", err)
+	if manifest.Status != ml.ModelStatusActive {
+		t.Fatalf("expected status %s, got: %s", ml.ModelStatusActive, manifest.Status)
 	}
-	if det.Name() != "ml_isolation_forest" {
-		t.Fatalf("detector name mismatch: %s", det.Name())
+	if manifest.FeatureSchemaVersion != ml.FeatureSchemaV1 {
+		t.Fatalf("expected feature schema %s, got: %s", ml.FeatureSchemaV1, manifest.FeatureSchemaVersion)
+	}
+
+	// Verify the model manifest is fully validated and conforms to shared ML contracts
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("model manifest failed validation: %v", err)
+	}
+	computedChecksum, err := manifest.ComputeChecksum()
+	if err != nil || computedChecksum != manifest.ChecksumSHA256 {
+		t.Fatalf("checksum mismatch: computed=%s, manifest=%s", computedChecksum, manifest.ChecksumSHA256)
 	}
 }
