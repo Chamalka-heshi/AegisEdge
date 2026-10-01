@@ -3,6 +3,7 @@ module github.com/Chamalka-heshi/AegisEdge/edge/agent
 go 1.25.0
 
 require (
+	github.com/Chamalka-heshi/AegisEdge/shared/ml v0.0.0
 	github.com/Chamalka-heshi/AegisEdge/shared/types v0.0.0
 	github.com/nats-io/nats.go v1.37.0
 	modernc.org/sqlite v1.58.0
@@ -25,4 +26,5 @@ require (
 	modernc.org/memory v1.12.1 // indirect
 )
 
+replace github.com/Chamalka-heshi/AegisEdge/shared/ml => ../../shared/ml
 replace github.com/Chamalka-heshi/AegisEdge/shared/types => ../../shared/types
