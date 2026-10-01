@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
+	"github.com/Chamalka-heshi/AegisEdge/shared/ml"
 )
 
 // Training configuration and execution errors.
@@ -54,22 +54,22 @@ func (cfg *TrainConfig) Validate() error {
 	if strings.TrimSpace(cfg.ModelVersion) == "" {
 		return fmt.Errorf("%w: model_version cannot be empty", ErrInvalidTrainingConfig)
 	}
-	if cfg.Trees < 1 || cfg.Trees > detector.MaxTrees {
+	if cfg.Trees < 1 || cfg.Trees > ml.MaxTrees {
 		return fmt.Errorf("%w: trees must be in [1, %d], got %d",
-			ErrInvalidTrainingConfig, detector.MaxTrees, cfg.Trees)
+			ErrInvalidTrainingConfig, ml.MaxTrees, cfg.Trees)
 	}
-	if cfg.SubSampleSize < 2 || cfg.SubSampleSize > detector.MaxSubSampleSize {
+	if cfg.SubSampleSize < 2 || cfg.SubSampleSize > ml.MaxSubSampleSize {
 		return fmt.Errorf("%w: sub_sample_size must be in [2, %d], got %d",
-			ErrInvalidTrainingConfig, detector.MaxSubSampleSize, cfg.SubSampleSize)
+			ErrInvalidTrainingConfig, ml.MaxSubSampleSize, cfg.SubSampleSize)
 	}
 	if math.IsNaN(cfg.DecisionThreshold) || math.IsInf(cfg.DecisionThreshold, 0) ||
 		cfg.DecisionThreshold <= 0.0 || cfg.DecisionThreshold >= 1.0 {
 		return fmt.Errorf("%w: decision_threshold must be in (0.0, 1.0), got %f",
 			ErrInvalidTrainingConfig, cfg.DecisionThreshold)
 	}
-	if cfg.MaxTreeDepth > detector.MaxTreeDepth {
+	if cfg.MaxTreeDepth > ml.MaxTreeDepth {
 		return fmt.Errorf("%w: max_tree_depth cannot exceed %d, got %d",
-			ErrInvalidTrainingConfig, detector.MaxTreeDepth, cfg.MaxTreeDepth)
+			ErrInvalidTrainingConfig, ml.MaxTreeDepth, cfg.MaxTreeDepth)
 	}
 	return nil
 }
@@ -77,17 +77,17 @@ func (cfg *TrainConfig) Validate() error {
 // ComputeNormalizationParams computes the mean, standard deviation, min, and max for each feature
 // strictly over the provided training dataset.
 // Rejects datasets where any feature has zero or near-zero variance (stddev <= 1e-9).
-func ComputeNormalizationParams(dataset *TrainingDataset) ([]detector.FeatureNormalizationParams, error) {
+func ComputeNormalizationParams(dataset *TrainingDataset) ([]ml.FeatureNormalizationParams, error) {
 	if dataset == nil || len(dataset.Rows) == 0 {
 		return nil, ErrEmptyDataset
 	}
 
 	numRows := len(dataset.Rows)
-	numCols := len(detector.CanonicalSupportedMetrics)
-	params := make([]detector.FeatureNormalizationParams, numCols)
+	numCols := len(ml.CanonicalSupportedMetrics)
+	params := make([]ml.FeatureNormalizationParams, numCols)
 
 	for col := 0; col < numCols; col++ {
-		metricName := detector.CanonicalSupportedMetrics[col]
+		metricName := ml.CanonicalSupportedMetrics[col]
 
 		var sum float64
 		minVal := dataset.Rows[0][col]
@@ -119,7 +119,7 @@ func ComputeNormalizationParams(dataset *TrainingDataset) ([]detector.FeatureNor
 				ErrZeroVarianceFeature, metricName, stdDev, minVal, maxVal)
 		}
 
-		params[col] = detector.FeatureNormalizationParams{
+		params[col] = ml.FeatureNormalizationParams{
 			MetricName: metricName,
 			Mean:       mean,
 			StdDev:     stdDev,
@@ -132,7 +132,7 @@ func ComputeNormalizationParams(dataset *TrainingDataset) ([]detector.FeatureNor
 }
 
 // NormalizeDataset applies frozen normalization parameters to the training dataset rows.
-func NormalizeDataset(dataset *TrainingDataset, params []detector.FeatureNormalizationParams) [][]float64 {
+func NormalizeDataset(dataset *TrainingDataset, params []ml.FeatureNormalizationParams) [][]float64 {
 	numRows := len(dataset.Rows)
 	numCols := len(params)
 	normalized := make([][]float64, numRows)
@@ -150,7 +150,7 @@ func NormalizeDataset(dataset *TrainingDataset, params []detector.FeatureNormali
 
 // Train executes the offline Isolation Forest training algorithm over a validated TrainingDataset.
 // Produces an immutable, fully validated MLModelManifest ready for deployment to edge nodes.
-func Train(dataset *TrainingDataset, cfg TrainConfig) (*detector.MLModelManifest, error) {
+func Train(dataset *TrainingDataset, cfg TrainConfig) (*ml.ModelManifest, error) {
 	if dataset == nil || len(dataset.Rows) == 0 {
 		return nil, ErrEmptyDataset
 	}
@@ -177,21 +177,21 @@ func Train(dataset *TrainingDataset, cfg TrainConfig) (*detector.MLModelManifest
 	if maxDepth <= 0 {
 		maxDepth = int(math.Ceil(math.Log2(float64(cfg.SubSampleSize))))
 	}
-	if maxDepth > detector.MaxTreeDepth {
-		maxDepth = detector.MaxTreeDepth
+	if maxDepth > ml.MaxTreeDepth {
+		maxDepth = ml.MaxTreeDepth
 	}
 
 	// 5. Construct isolation trees
-	trees := make([]detector.IsolationTree, cfg.Trees)
+	trees := make([]ml.IsolationTree, cfg.Trees)
 
 	for t := 0; t < cfg.Trees; t++ {
 		// Subsample selection without replacement
 		subsample := selectSubsample(normRows, cfg.SubSampleSize, totalRows, prng)
 
-		var nodes []detector.IsolationTreeNode
+		var nodes []ml.IsolationTreeNode
 		buildIsolationTree(subsample, 0, maxDepth, prng, &nodes)
 
-		trees[t] = detector.IsolationTree{
+		trees[t] = ml.IsolationTree{
 			RootIndex: 0,
 			Nodes:     nodes,
 		}
@@ -207,20 +207,20 @@ func Train(dataset *TrainingDataset, cfg TrainConfig) (*detector.MLModelManifest
 		datasetID = dataset.DatasetID
 	}
 
-	manifest := &detector.MLModelManifest{
+	manifest := &ml.ModelManifest{
 		ModelID:              cfg.ModelID,
 		ModelVersion:         cfg.ModelVersion,
-		Algorithm:            detector.AlgorithmIsolationForest,
-		FeatureSchemaVersion: detector.FeatureSchemaV1,
+		Algorithm:            ml.AlgorithmIsolationForest,
+		FeatureSchemaVersion: ml.FeatureSchemaV1,
 		TrainingDatasetID:    datasetID,
 		CreatedAt:            createdAt,
-		InputDimensions:      len(detector.CanonicalSupportedMetrics),
-		SupportedMetrics:     detector.CanonicalSupportedMetrics,
+		InputDimensions:      len(ml.CanonicalSupportedMetrics),
+		SupportedMetrics:     ml.CanonicalSupportedMetrics,
 		NormalizationParams:  normParams,
 		Trees:                trees,
 		SubSampleSize:        cfg.SubSampleSize,
 		DecisionThreshold:    cfg.DecisionThreshold,
-		Status:               detector.ModelStatusActive,
+		Status:               ml.ModelStatusActive,
 	}
 
 	// 6. Compute integrity checksum
@@ -263,14 +263,14 @@ func selectSubsample(rows [][]float64, psi, totalRows int, prng *rand.Rand) [][]
 }
 
 // buildIsolationTree recursively partitions data until a leaf termination condition is met.
-func buildIsolationTree(data [][]float64, depth, maxDepth int, prng *rand.Rand, nodes *[]detector.IsolationTreeNode) int {
+func buildIsolationTree(data [][]float64, depth, maxDepth int, prng *rand.Rand, nodes *[]ml.IsolationTreeNode) int {
 	myIdx := len(*nodes)
 	// Reserve slot in nodes slice
-	*nodes = append(*nodes, detector.IsolationTreeNode{})
+	*nodes = append(*nodes, ml.IsolationTreeNode{})
 
 	n := len(data)
 	if depth >= maxDepth || n <= 1 {
-		(*nodes)[myIdx] = detector.IsolationTreeNode{
+		(*nodes)[myIdx] = ml.IsolationTreeNode{
 			FeatureIndex: -1,
 			SplitValue:   0.0,
 			LeftChild:    -1,
@@ -307,7 +307,7 @@ func buildIsolationTree(data [][]float64, depth, maxDepth int, prng *rand.Rand, 
 
 	if len(eligibleFeatures) == 0 {
 		// All data points identical: cannot split further
-		(*nodes)[myIdx] = detector.IsolationTreeNode{
+		(*nodes)[myIdx] = ml.IsolationTreeNode{
 			FeatureIndex: -1,
 			SplitValue:   0.0,
 			LeftChild:    -1,
@@ -339,7 +339,7 @@ func buildIsolationTree(data [][]float64, depth, maxDepth int, prng *rand.Rand, 
 
 	// Guard against floating point rounding edge cases creating empty branches
 	if len(left) == 0 || len(right) == 0 {
-		(*nodes)[myIdx] = detector.IsolationTreeNode{
+		(*nodes)[myIdx] = ml.IsolationTreeNode{
 			FeatureIndex: -1,
 			SplitValue:   0.0,
 			LeftChild:    -1,
@@ -353,7 +353,7 @@ func buildIsolationTree(data [][]float64, depth, maxDepth int, prng *rand.Rand, 
 	leftIdx := buildIsolationTree(left, depth+1, maxDepth, prng, nodes)
 	rightIdx := buildIsolationTree(right, depth+1, maxDepth, prng, nodes)
 
-	(*nodes)[myIdx] = detector.IsolationTreeNode{
+	(*nodes)[myIdx] = ml.IsolationTreeNode{
 		FeatureIndex: q,
 		SplitValue:   p,
 		LeftChild:    leftIdx,

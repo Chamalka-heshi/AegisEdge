@@ -1,12 +1,11 @@
 package training
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 
-	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
+	"github.com/Chamalka-heshi/AegisEdge/shared/ml"
 )
 
 // Serialization errors.
@@ -17,45 +16,21 @@ var (
 
 // SerializeModel serializes an MLModelManifest into deterministic, formatted JSON bytes.
 // Validates the manifest before serializing.
-func SerializeModel(manifest *detector.MLModelManifest) ([]byte, error) {
+func SerializeModel(manifest *ml.ModelManifest) ([]byte, error) {
 	if manifest == nil {
 		return nil, ErrNilManifestToSerialize
 	}
-
-	if err := manifest.Validate(); err != nil {
-		return nil, fmt.Errorf("refusing to serialize invalid model manifest: %w", err)
-	}
-
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal model manifest: %w", err)
-	}
-
-	// Append trailing newline for POSIX/editor compatibility
-	return append(data, '\n'), nil
+	return ml.Serialize(manifest)
 }
 
 // DeserializeModel unmarshals JSON bytes into an MLModelManifest and strictly validates it.
-func DeserializeModel(data []byte) (*detector.MLModelManifest, error) {
-	if len(data) == 0 {
-		return nil, fmt.Errorf("%w: empty data", ErrCorruptModelArtifact)
-	}
-
-	var manifest detector.MLModelManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, fmt.Errorf("%w: JSON unmarshal error: %w", ErrCorruptModelArtifact, err)
-	}
-
-	if err := manifest.Validate(); err != nil {
-		return nil, fmt.Errorf("%w: edge validation failed: %w", ErrCorruptModelArtifact, err)
-	}
-
-	return &manifest, nil
+func DeserializeModel(data []byte) (*ml.ModelManifest, error) {
+	return ml.Deserialize(data)
 }
 
 // SaveModelToFile writes an MLModelManifest to a local file.
 // Validates before writing, and performs an immediate read-back verification to guarantee round-trip integrity.
-func SaveModelToFile(manifest *detector.MLModelManifest, filePath string) error {
+func SaveModelToFile(manifest *ml.ModelManifest, filePath string) error {
 	data, err := SerializeModel(manifest)
 	if err != nil {
 		return err
@@ -80,7 +55,7 @@ func SaveModelToFile(manifest *detector.MLModelManifest, filePath string) error 
 }
 
 // LoadModelFromFile reads, unmarshals, and validates an MLModelManifest from a file.
-func LoadModelFromFile(filePath string) (*detector.MLModelManifest, error) {
+func LoadModelFromFile(filePath string) (*ml.ModelManifest, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read model file %q: %w", filePath, err)
