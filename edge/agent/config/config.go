@@ -14,6 +14,7 @@ const (
 	DefaultSyncInterval       = 5 * time.Second
 	DefaultNATSURL            = "nats://127.0.0.1:4222"
 	DefaultNATSPublishTimeout = 5 * time.Second
+	DefaultModelStoreDir      = "data/models"
 )
 
 // Config represents runtime configuration parameters for the edge agent.
@@ -28,6 +29,7 @@ type Config struct {
 	NATSEnabled        bool
 	NATSURL            string
 	NATSPublishTimeout time.Duration
+	ModelStoreDir      string
 }
 
 // LoadFromEnv loads configuration from environment variables, falling back to sensible defaults.
@@ -87,6 +89,11 @@ func LoadFromEnv() Config {
 		}
 	}
 
+	modelStoreDir := strings.TrimSpace(os.Getenv("AEGISEDGE_MODEL_STORE_DIR"))
+	if modelStoreDir == "" {
+		modelStoreDir = DefaultModelStoreDir
+	}
+
 	return Config{
 		NodeID:             nodeID,
 		DatabasePath:       dbPath,
@@ -98,5 +105,6 @@ func LoadFromEnv() Config {
 		NATSEnabled:        natsEnabled,
 		NATSURL:            natsURL,
 		NATSPublishTimeout: natsPublishTimeout,
+		ModelStoreDir:      modelStoreDir,
 	}
 }

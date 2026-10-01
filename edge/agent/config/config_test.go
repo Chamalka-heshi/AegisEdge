@@ -35,6 +35,9 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	if !cfg.SyncEnabled {
 		t.Errorf("expected default SyncEnabled to be true")
 	}
+	if cfg.ModelStoreDir != DefaultModelStoreDir {
+		t.Errorf("expected default ModelStoreDir %s, got %s", DefaultModelStoreDir, cfg.ModelStoreDir)
+	}
 }
 
 func TestLoadFromEnv_Overrides(t *testing.T) {
@@ -44,6 +47,7 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	os.Setenv("AEGISEDGE_CONTROL_PLANE_URL", "http://cp.internal:9000")
 	os.Setenv("AEGISEDGE_SYNC_INTERVAL", "1s")
 	os.Setenv("AEGISEDGE_SYNC_ENABLED", "false")
+	os.Setenv("AEGISEDGE_MODEL_STORE_DIR", "/var/lib/aegisedge/models")
 	defer func() {
 		os.Unsetenv("AEGISEDGE_NODE_ID")
 		os.Unsetenv("AEGISEDGE_DATABASE_PATH")
@@ -51,6 +55,7 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 		os.Unsetenv("AEGISEDGE_CONTROL_PLANE_URL")
 		os.Unsetenv("AEGISEDGE_SYNC_INTERVAL")
 		os.Unsetenv("AEGISEDGE_SYNC_ENABLED")
+		os.Unsetenv("AEGISEDGE_MODEL_STORE_DIR")
 	}()
 
 	cfg := LoadFromEnv()
@@ -72,5 +77,8 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	}
 	if cfg.SyncEnabled {
 		t.Errorf("expected SyncEnabled to be false")
+	}
+	if cfg.ModelStoreDir != "/var/lib/aegisedge/models" {
+		t.Errorf("expected custom ModelStoreDir, got %s", cfg.ModelStoreDir)
 	}
 }
