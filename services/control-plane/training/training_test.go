@@ -2,16 +2,12 @@ package training
 
 import (
 	"bytes"
-	"context"
-	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
-	"github.com/Chamalka-heshi/AegisEdge/shared/types"
+	"github.com/Chamalka-heshi/AegisEdge/shared/ml"
 )
 
 // helperGenerateDeterministicCSV returns a clean, straightforward CSV dataset.
@@ -203,13 +199,13 @@ func TestTraining_SeedSensitivity(t *testing.T) {
 func TestTraining_ConfigValidationLimits(t *testing.T) {
 	ds := &TrainingDataset{
 		DatasetID:    "ds",
-		FeatureNames: detector.CanonicalSupportedMetrics,
+		FeatureNames: ml.CanonicalSupportedMetrics,
 		Rows:         [][]float64{{40, 50, 30, 45}, {45, 55, 35, 50}},
 	}
 
 	// Trees exceed MaxTrees
 	cfg1 := DefaultTrainConfig()
-	cfg1.Trees = detector.MaxTrees + 1
+	cfg1.Trees = ml.MaxTrees + 1
 	if _, err := Train(ds, cfg1); err == nil || !strings.Contains(err.Error(), "trees must be in") {
 		t.Fatalf("expected excessive trees error, got: %v", err)
 	}
@@ -278,14 +274,24 @@ func TestSerialization_CorruptArtifactRejection(t *testing.T) {
 	m, _ := Train(ds, DefaultTrainConfig())
 	data, _ := SerializeModel(m)
 
-	tampered := strings.Replace(string(data), m.ChecksumSHA256, "0000000000000000000000000000000000000000000000000000000000000000", 1)
-	_, err = DeserializeModel([]byte(tampered))
+	tamperedChecksum := strings.Replace(string(data), m.ChecksumSHA256, "0000000000000000000000000000000000000000000000000000000000000000", 1)
+	_, err = DeserializeModel([]byte(tamperedChecksum))
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
-		t.Fatalf("expected checksum mismatch error on tampered artifact, got: %v", err)
+		t.Fatalf("expected checksum mismatch error on tampered checksum, got: %v", err)
+	}
+
+	// Tampered payload while keeping original checksum
+	tamperedPayload := strings.Replace(string(data), `"model_version": "1.0.0"`, `"model_version": "2.0.0"`, 1)
+	if tamperedPayload == string(data) {
+		t.Fatalf("test setup error: failed to replace model_version in serialized payload")
+	}
+	_, err = DeserializeModel([]byte(tamperedPayload))
+	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("expected checksum mismatch error on tampered payload with original checksum, got: %v", err)
 	}
 }
 
-func TestEndToEnd_TrainSerializeLoadInferenceEquivalence(t *testing.T) {
+func TestEndToEnd_TrainSerializeLoadEquivalence(t *testing.T) {
 	tmpDir := t.TempDir()
 	modelPath := filepath.Join(tmpDir, "trained_model.json")
 
@@ -318,60 +324,43 @@ func TestEndToEnd_TrainSerializeLoadInferenceEquivalence(t *testing.T) {
 		t.Fatalf("load from file failed: %v", err)
 	}
 
-	// 4. Construct MLDetector for in-memory model and loaded model
-	detInMemory, err := detector.NewMLDetector(detector.MLDetectorConfig{Manifest: inMemoryManifest})
+	// 4. Assert model properties match exactly
+	if loadedManifest.ChecksumSHA256 != inMemoryManifest.ChecksumSHA256 {
+		t.Fatalf("checksum mismatch: %s != %s", loadedManifest.ChecksumSHA256, inMemoryManifest.ChecksumSHA256)
+	}
+	if err := loadedManifest.Validate(); err != nil {
+		t.Fatalf("loaded manifest validation failed: %v", err)
+	}
+	if loadedManifest.ModelID != inMemoryManifest.ModelID {
+		t.Fatalf("model ID mismatch: %s != %s", loadedManifest.ModelID, inMemoryManifest.ModelID)
+	}
+	if loadedManifest.ModelVersion != inMemoryManifest.ModelVersion {
+		t.Fatalf("model version mismatch: %s != %s", loadedManifest.ModelVersion, inMemoryManifest.ModelVersion)
+	}
+	if len(loadedManifest.Trees) != len(inMemoryManifest.Trees) {
+		t.Fatalf("tree count mismatch: %d != %d", len(loadedManifest.Trees), len(inMemoryManifest.Trees))
+	}
+	if loadedManifest.DecisionThreshold != inMemoryManifest.DecisionThreshold {
+		t.Fatalf("threshold mismatch: %f != %f", loadedManifest.DecisionThreshold, inMemoryManifest.DecisionThreshold)
+	}
+	if loadedManifest.SubSampleSize != inMemoryManifest.SubSampleSize {
+		t.Fatalf("subsample size mismatch: %d != %d", loadedManifest.SubSampleSize, inMemoryManifest.SubSampleSize)
+	}
+	if len(loadedManifest.NormalizationParams) != len(inMemoryManifest.NormalizationParams) {
+		t.Fatalf("normalization params count mismatch")
+	}
+
+	// 5. Assert canonical serialized byte-for-byte equivalence
+	rawInMemory, err := SerializeModel(inMemoryManifest)
 	if err != nil {
-		t.Fatalf("in-memory detector creation failed: %v", err)
+		t.Fatalf("serializing inMemoryManifest failed: %v", err)
 	}
-
-	detLoaded, err := detector.NewMLDetector(detector.MLDetectorConfig{Manifest: loadedManifest})
+	rawLoaded, err := SerializeModel(loadedManifest)
 	if err != nil {
-		t.Fatalf("loaded detector creation failed: %v", err)
+		t.Fatalf("serializing loadedManifest failed: %v", err)
 	}
-
-	// 5. Run inference across fixed test vectors and assert strict equivalence
-	testVectors := [][]float64{
-		{45.0, 55.0, 35.0, 48.0}, // nominal baseline vector
-		{95.0, 55.0, 35.0, 48.0}, // high CPU vector
-		{45.0, 95.0, 35.0, 48.0}, // high memory vector
-		{95.0, 95.0, 95.0, 95.0}, // extreme multivariate anomaly
-		{20.0, 20.0, 20.0, 20.0}, // low boundary vector
-	}
-
-	ctx := context.Background()
-	fixedTime := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
-
-	for idx, vec := range testVectors {
-		sig1, err1 := detInMemory.DetectVector(ctx, "test-node", fixedTime, "sample-01", vec)
-		if err1 != nil {
-			t.Fatalf("vector %d in-memory inference error: %v", idx, err1)
-		}
-
-		sig2, err2 := detLoaded.DetectVector(ctx, "test-node", fixedTime, "sample-01", vec)
-		if err2 != nil {
-			t.Fatalf("vector %d loaded inference error: %v", idx, err2)
-		}
-
-		// Both must agree on anomaly decision (nil vs non-nil)
-		if (sig1 == nil && sig2 != nil) || (sig1 != nil && sig2 == nil) {
-			t.Fatalf("vector %d anomaly decision mismatch: sig1=%v, sig2=%v", idx, sig1, sig2)
-		}
-
-		if sig1 != nil && sig2 != nil {
-			// Mathematical equivalence: scores must match within floating-point precision
-			if math.Abs(sig1.AnomalyScore-sig2.AnomalyScore) > 1e-9 {
-				t.Fatalf("vector %d anomaly score mismatch: %f != %f", idx, sig1.AnomalyScore, sig2.AnomalyScore)
-			}
-			if math.Abs(sig1.ObservedValue-sig2.ObservedValue) > 1e-9 {
-				t.Fatalf("vector %d raw score mismatch: %f != %f", idx, sig1.ObservedValue, sig2.ObservedValue)
-			}
-			if sig1.AnomalyID != sig2.AnomalyID {
-				t.Fatalf("vector %d anomaly ID mismatch: %s != %s", idx, sig1.AnomalyID, sig2.AnomalyID)
-			}
-			if sig1.DetectionMethod != types.DetectionMethodMLIsolationForest {
-				t.Fatalf("vector %d unexpected detection method: %s", idx, sig1.DetectionMethod)
-			}
-		}
+	if !bytes.Equal(rawInMemory, rawLoaded) {
+		t.Fatalf("serialized representations do not match byte-for-byte")
 	}
 }
 
