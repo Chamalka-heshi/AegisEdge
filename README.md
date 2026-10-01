@@ -85,7 +85,7 @@ go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:80
 
 A local NATS/JetStream development environment is available (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). In Phase 4.3, full application-level NATS integration was completed (`NATS_ENABLED=true`), enabling `SQLite -> PENDING -> NATS JetStream -> PubAck -> PUBLISHED -> Consumer -> Idempotent Ingestion -> ACK`. Phase 4.4 formalizes the comprehensive resilience, redelivery, and failure recovery design in [`ADR-0008`](docs/decisions/ADR-0008-nats-resilience-and-recovery.md).
 
-#### 5. Edge Anomaly Detection Architecture (Phases 5.1 – 5.6B)
+#### 5. Edge Anomaly Detection Architecture (Phases 5.1 – 5.6C)
 
 * **IMPLEMENTED**:
   * `ThresholdDetector`: Deterministic static threshold boundaries ($W=1$) with hysteresis bands and recovery thresholds (Phases 5.1–5.2).
@@ -95,10 +95,11 @@ A local NATS/JetStream development environment is available (see [`docs/developm
   * `aegisedge-train`: Offline Isolation Forest training CLI with canonical 4D feature alignment, deterministic PRNG seed, and model serialization (Phase 5.5C).
   * `shared/ml`: Clean decoupled contracts for model manifests, canonical JSON SHA-256 integrity, runtime compatibility evaluation, and deployment lifecycle state machine (Phase 5.6A).
   * `edge/agent/modelstore`: Filesystem-backed edge model store and candidate staging boundary with multi-stage validation gates, safe bounded reads, Windows-compatible file operations, idempotency, and conflict rejection (Phase 5.6B).
+  * `edge/agent/modelactivation`: Thread-safe runtime model activation manager with pre-promotion validation pipeline, dynamic `RuntimeDetector` dispatching under `sync.RWMutex`, idempotency, conflict rejection, and previous active model tracking (Phase 5.6C).
 * **DESIGNED**:
-  * ML Model Distribution, Activation & Rollback Architecture: Staged deployment, proposed activation mechanisms, and autonomous offline rollback (Phase 5.5D Design Only; crash-consistent activation is not implemented, see [`ADR-0009 §31`](docs/decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
+  * ML Model Distribution & Rollback Architecture: Staged deployment, network transport, and autonomous offline rollback (Phase 5.5D Design Only; crash-consistent filesystem activation is not implemented, see [`ADR-0009 §31`](docs/decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
 * **FUTURE IMPLEMENTATION**:
-  * Ed25519 cryptographic signing, central model registry service, model distribution network transport, runtime edge model activation/rollback manager.
+  * Ed25519 cryptographic signing, central model registry service, model distribution network transport, autonomous crash-consistent filesystem rollback engine.
 
 ### Running Tests
 

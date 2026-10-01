@@ -1565,8 +1565,8 @@ The boundary between operational code currently verified in the repository and f
 | **Local SQLite WAL Durability & Telemetry Sync Pipeline** | **CURRENTLY IMPLEMENTED** | `edge/agent/storage/`, `edge/agent/sync/` |
 | **Model Distribution Network Transport (HTTP/NATS)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
 | **Central Model Registry & Version Catalog** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
-| **Model Activation (Proposed Pointer Swap & Platform Replacement)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Crash-Consistent Activation Not Implemented) |
-| **Local Autonomous Rollback Engine (Active/Previous States)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
+| **Edge ML Model Activation & Runtime Switching (`modelactivation.Manager`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/modelactivation/manager.go` (Phase 5.6C; in-memory concurrency-safe switching via sync.RWMutex; crash-consistent filesystem activation is not implemented) |
+| **Local Autonomous Rollback Engine (Active/Previous States)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Previous model metadata tracked in Phase 5.6C) |
 | **Ed25519 Cryptographic Signing & Public Key Management** | *FUTURE IMPLEMENTATION* | Future Cryptographic Milestone |
 | **Key Rotation & Revocation List Distribution** | *FUTURE IMPLEMENTATION* | Future Security Milestone |
 | **Automatic Accuracy-Based Retraining & Rollback** | *FUTURE IMPLEMENTATION* | Future Fleet Intelligence Milestone |

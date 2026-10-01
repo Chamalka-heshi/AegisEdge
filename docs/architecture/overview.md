@@ -468,7 +468,10 @@ flowchart TD
 | **Durable Incident Persistence & Restart Recovery** | **CURRENTLY IMPLEMENTED** | Phase 5.5 |
 | **Pure-Go Isolation Forest Inference Engine** | **CURRENTLY IMPLEMENTED** | Phase 5.5B |
 | **Offline Model Training Tooling CLI** | **CURRENTLY IMPLEMENTED** | Phase 5.5C |
-| **ML Model Distribution, Staging & Rollback** | *DESIGNED (Future Implementation)* | Phase 5.5D |
+| **ML Model Shared Contracts & Validation** | **CURRENTLY IMPLEMENTED** | Phase 5.6A |
+| **Edge Local Model Store & Candidate Staging** | **CURRENTLY IMPLEMENTED** | Phase 5.6B |
+| **Edge ML Model Activation & Runtime Switching** | **CURRENTLY IMPLEMENTED** | Phase 5.6C |
+| **ML Model Distribution Transport & Registry** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
 | **Deterministic Response Policy Engine** | *DESIGNED (Future Implementation)* | Phase 6.2 |
 | **Fail-Closed Safety Validator** | *DESIGNED (Future Implementation)* | Phase 6.2 |
 | **Simulated Action Executor & Dry-Run Mode** | *DESIGNED (Future Implementation)* | Phase 6.3 |
@@ -490,9 +493,9 @@ $$\textbf{INCIDENT} \longrightarrow \textbf{RESPONSE POLICY} \longrightarrow \te
 
 ---
 
-## 14. ML Model Distribution, Activation & Rollback Architecture (Phase 5.5D — Design Only)
+## 14. ML Model Lifecycle: Staging, Activation & Rollback Architecture
 
-Phase 5.5D establishes the architecture, trust boundaries, multi-stage validation gates, and crash-resilient rollback mechanisms for deploying machine learning models to autonomous edge nodes ([ADR-0009 §31](../decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
+Phase 5.5D established the architecture and invariants, Phase 5.6A extracted shared contracts (`shared/ml`), Phase 5.6B implemented edge candidate staging (`edge/agent/modelstore`), and Phase 5.6C implements runtime activation and switching (`edge/agent/modelactivation`) ([ADR-0009 §31](../decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
 
 ```mermaid
 flowchart TD
@@ -503,12 +506,12 @@ flowchart TD
     end
 
     subgraph EdgeNode ["Edge Node (Autonomous Agent)"]
-        DIST -. "Downstream Distribution" .-> VER["Edge Verification\n(Integrity, Schema & Structural Checks) [DESIGNED]"]
-        VER --> STAGE["Staging Sandbox\n(Isolated Candidate) [DESIGNED]"]
-        STAGE --> ACT["Atomic Activation\n(Pointer Swap & Platform Replacement) [DESIGNED]"]
+        DIST -. "Downstream Distribution" .-> VER["Edge Verification\n(Integrity, Schema & Structural Checks) [IMPLEMENTED]"]
+        VER --> STAGE["Staging Sandbox\n(edge/agent/modelstore) [IMPLEMENTED]"]
+        STAGE --> ACT["Activation Manager\n(edge/agent/modelactivation) [IMPLEMENTED]"]
         ACT --> INF["Local Inference Runtime\n(MLDetector Engine) [IMPLEMENTED]"]
-        ACT --> PREV["Previous Model Retention\n(model_previous.json) [DESIGNED]"]
-        PREV -. "Local Rollback" .-> ACT
+        ACT --> PREV["Previous Model Retention\n(ModelInfo metadata) [IMPLEMENTED]"]
+        PREV -. "Autonomous Rollback Engine" .-> ACT
     end
 ```
 
@@ -517,18 +520,19 @@ flowchart TD
 1. **Central Safety Invariant**:
    $$\textbf{"An edge node must never replace its active model with an unverified, incompatible, malformed, or unsupported model."}$$
 2. **MODEL AVAILABLE $\neq$ MODEL ACTIVE**:
-   The presence or announcement of an available candidate model in the control plane or local staging grants zero authority for edge execution. Only successful verification, validation, and atomic promotion permit real-time inference.
+   The presence or announcement of an available candidate model in the control plane or local staging grants zero authority for edge execution. Only successful multi-stage verification, structural validation, and explicit promotion permit real-time inference.
 3. **Strict Decoupling from Telemetry Synchronization**:
    Model deployment operates across a separate downstream channel. It does not depend on, block, or reuse telemetry `BatchID`, monotonic sequence numbers, or telemetry ACK semantics. The existing telemetry path (`SQLite -> PENDING -> NATS/HTTP -> Control Plane`) remains completely independent. Repeated delivery of the same valid model artifact must not cause an unsafe or inconsistent activation.
 4. **Offline Autonomy Invariant**:
    $$\textbf{CONTROL PLANE OFFLINE } \longrightarrow \textbf{ ACTIVE MODEL REMAINS ACTIVE } \longrightarrow \textbf{ LOCAL DETECTION CONTINUES}$$
    If the control plane, registry, or network is unavailable, the edge agent continues anomaly detection using its currently validated active model, subject to local hardware, storage, and runtime availability.
-5. **Crash-Resilient Activation Architecture (Proposed Design)**:
-   * **In-Memory**: Activation is proposed to use an atomic pointer swap (e.g. `sync/atomic.Pointer`) in a future implementation phase. Lock-free in-memory activation is a proposed design and is not currently implemented; zero-downtime activation is not claimed.
-   * **Filesystem**: Future implementation designs should evaluate platform-appropriate atomic replacement semantics where available. Recovery must identify and load a valid model, while exact crash-consistency depends on the filesystem and storage platform and must be validated during implementation. The architecture aims to prevent partially written candidate artifacts from becoming active, subject to OS, filesystem, and storage hardware behavior. Transactional filesystem semantics are not claimed.
-6. **Autonomous Disconnected Rollback (Proposed Design)**:
-   The edge node retains a validated historical baseline (`previous`). Rollback triggers in Phase 5.5D are designed for pre-activation validation failure, activation state transition failure, startup corruption, or explicit operator rollback. Automatic runtime accuracy or panic-based rollback are future policy candidates.
+5. **Runtime Activation Architecture (Phase 5.6C Implemented)**:
+   * **In-Memory**: Concurrency-safe runtime model switching is implemented via `sync.RWMutex` protecting active model pointer swaps and dynamic `RuntimeDetector` dispatching. Read-path inference executes concurrently without blocking other readers. Multiple activation attempts are serialized via `sync.Mutex`.
+   * **Failure Safety**: If activation validation or runtime model construction fails, the existing active model remains unchanged and continues to serve subsequent inference requests.
+   * **Filesystem Durability & Rollback (Future Work)**: Crash-consistent filesystem activation transactions and autonomous rollback engines are designed for future implementation phases.
+6. **Previous Model Tracking (Phase 5.6C Implemented)**:
+   The activation manager preserves immutable metadata (`ModelInfo`) of the superseded active model, enabling point-in-time status reporting and future rollback targeting.
 7. **Integrity vs. Authenticity**:
    The current SHA-256 checksum strictly guarantees file integrity against corruption, bit-rot, and truncation. SHA-256 alone does NOT provide origin authentication, non-repudiation, publisher identity, or replay/downgrade protection. Cryptographic authenticity via asymmetric signatures (e.g. Ed25519) is strictly future design.
 8. **Potential Future Degradation Hierarchy**:
-   Active ML model $\rightarrow$ Previous validated ML model $\rightarrow$ Statistical detector $\rightarrow$ Threshold detector. Automatic runtime detector failover is future work and is not implemented in Phase 5.5D. The existing `ThresholdDetector`, `StatisticalDetector`, and `MLDetector` are separate existing components; their automatic runtime orchestration is not yet implemented.
+   Active ML model $\rightarrow$ Previous validated ML model $\rightarrow$ Statistical detector $\rightarrow$ Threshold detector. Automatic runtime detector failover is future work and is not implemented in Phase 5.6C. The existing `ThresholdDetector`, `StatisticalDetector`, and `MLDetector` are separate existing components; their automatic runtime orchestration is not yet implemented.
