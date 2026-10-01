@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
+	"github.com/Chamalka-heshi/AegisEdge/shared/ml"
 )
 
 // Dataset parsing errors.
@@ -35,7 +35,7 @@ type TrainingDataset struct {
 // LoadCSVDataset reads and validates a CSV dataset from an io.Reader.
 //
 // Rules:
-//  1. The header must contain all four canonical metrics defined by detector.CanonicalSupportedMetrics:
+//  1. The header must contain all four canonical metrics defined by ml.CanonicalSupportedMetrics:
 //     "cpu_usage_percent", "memory_usage_percent", "disk_usage_percent", "temperature_celsius".
 //  2. No unsupported columns or duplicate columns are permitted.
 //  3. Every data row must have exactly 4 columns.
@@ -54,9 +54,9 @@ func LoadCSVDataset(r io.Reader, datasetID string) (*TrainingDataset, error) {
 		return nil, fmt.Errorf("%w: %w", ErrMissingHeader, err)
 	}
 
-	if len(header) != len(detector.CanonicalSupportedMetrics) {
+	if len(header) != len(ml.CanonicalSupportedMetrics) {
 		return nil, fmt.Errorf("%w: expected %d columns, got %d",
-			ErrInvalidRowDimension, len(detector.CanonicalSupportedMetrics), len(header))
+			ErrInvalidRowDimension, len(ml.CanonicalSupportedMetrics), len(header))
 	}
 
 	// Map header columns to canonical feature indices
@@ -74,7 +74,7 @@ func LoadCSVDataset(r io.Reader, datasetID string) (*TrainingDataset, error) {
 		seenColumns[name] = struct{}{}
 
 		canonicalIdx := -1
-		for i, canon := range detector.CanonicalSupportedMetrics {
+		for i, canon := range ml.CanonicalSupportedMetrics {
 			if name == canon {
 				canonicalIdx = i
 				break
@@ -87,7 +87,7 @@ func LoadCSVDataset(r io.Reader, datasetID string) (*TrainingDataset, error) {
 	}
 
 	// Ensure all canonical metrics were present
-	for _, canon := range detector.CanonicalSupportedMetrics {
+	for _, canon := range ml.CanonicalSupportedMetrics {
 		if _, ok := seenColumns[canon]; !ok {
 			return nil, fmt.Errorf("%w: %q", ErrMissingRequiredColumn, canon)
 		}
@@ -111,7 +111,7 @@ func LoadCSVDataset(r io.Reader, datasetID string) (*TrainingDataset, error) {
 				ErrInvalidRowDimension, lineNum, len(header), len(record))
 		}
 
-		canonicalRow := make([]float64, len(detector.CanonicalSupportedMetrics))
+		canonicalRow := make([]float64, len(ml.CanonicalSupportedMetrics))
 		for colIdx, valStr := range record {
 			trimmed := strings.TrimSpace(valStr)
 			val, pErr := strconv.ParseFloat(trimmed, 64)
@@ -141,7 +141,7 @@ func LoadCSVDataset(r io.Reader, datasetID string) (*TrainingDataset, error) {
 
 	return &TrainingDataset{
 		DatasetID:    id,
-		FeatureNames: detector.CanonicalSupportedMetrics,
+		FeatureNames: ml.CanonicalSupportedMetrics,
 		Rows:         rows,
 	}, nil
 }
