@@ -1183,7 +1183,7 @@ The lifecycle of an Isolation Forest model artifact spans offline construction, 
            ↓
         STAGED (Isolated Ready Candidate)
            ↓
-       ACTIVATED (Atomic Pointer Swap & Platform Replacement)
+       ACTIVATED (Safe Pointer Swap & Platform Replacement)
 ```
 
 #### Rejection & Failure States
@@ -1336,7 +1336,7 @@ Before any candidate model can be activated, it must be evaluated against the st
 An edge node must never enter a state where an invalid, corrupted, or partially written model becomes active. In Phase 5.5D, atomic activation is a design concept for future implementation (Phase 5.6+); the current codebase loads a single static model at startup.
 
 ```
-Incoming Download ──> Staging Sandbox ──> Multi-Stage Validation ──> Atomic Swap ──> Active Runtime
+Incoming Download ──> Staging Sandbox ──> Multi-Stage Validation ──> Safe Local Swap ──> Active Runtime
                             │                      │
                      (Failure/Abort)        (Validation Error)
                             │                      │
@@ -1566,7 +1566,8 @@ The boundary between operational code currently verified in the repository and f
 | **Model Distribution Network Transport (HTTP/NATS)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
 | **Central Model Registry & Version Catalog** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
 | **Edge ML Model Activation & Runtime Switching (`modelactivation.Manager`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/modelactivation/manager.go` (Phase 5.6C; in-memory concurrency-safe switching via sync.RWMutex; crash-consistent filesystem activation is not implemented) |
-| **Local Autonomous Rollback Engine (Active/Previous States)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only (Previous model metadata tracked in Phase 5.6C) |
+| **Edge ML Model Rollback & Recovery (`modelactivation.Manager.Rollback`)** | **CURRENTLY IMPLEMENTED** | `edge/agent/modelactivation/manager.go`, `edge/agent/modelstore/store.go` (Phase 5.6D; explicit rollback, previous model artifact retention in previous/, validation pipeline, runtime detector switching, temporary-directory-based safe local swap; automated rollback and crash-consistent filesystem transactions are not implemented) |
+| **Automated Policy-Based Rollback Engine (Accuracy/Drift Triggers)** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
 | **Ed25519 Cryptographic Signing & Public Key Management** | *FUTURE IMPLEMENTATION* | Future Cryptographic Milestone |
 | **Key Rotation & Revocation List Distribution** | *FUTURE IMPLEMENTATION* | Future Security Milestone |
 | **Automatic Accuracy-Based Retraining & Rollback** | *FUTURE IMPLEMENTATION* | Future Fleet Intelligence Milestone |
