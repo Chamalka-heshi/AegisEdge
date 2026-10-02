@@ -85,7 +85,7 @@ go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:80
 
 A local NATS/JetStream development environment is available (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). In Phase 4.3, full application-level NATS integration was completed (`NATS_ENABLED=true`), enabling `SQLite -> PENDING -> NATS JetStream -> PubAck -> PUBLISHED -> Consumer -> Idempotent Ingestion -> ACK`. Phase 4.4 formalizes the comprehensive resilience, redelivery, and failure recovery design in [`ADR-0008`](docs/decisions/ADR-0008-nats-resilience-and-recovery.md).
 
-#### 5. Edge Anomaly Detection Architecture (Phases 5.1 – 5.6C)
+#### 5. Edge Anomaly Detection & Autonomous Response Architecture (Phases 5.1 – 6.2)
 
 * **IMPLEMENTED**:
   * `ThresholdDetector`: Deterministic static threshold boundaries ($W=1$) with hysteresis bands and recovery thresholds (Phases 5.1–5.2).
@@ -95,11 +95,16 @@ A local NATS/JetStream development environment is available (see [`docs/developm
   * `aegisedge-train`: Offline Isolation Forest training CLI with canonical 4D feature alignment, deterministic PRNG seed, and model serialization (Phase 5.5C).
   * `shared/ml`: Clean decoupled contracts for model manifests, canonical JSON SHA-256 integrity, runtime compatibility evaluation, and deployment lifecycle state machine (Phase 5.6A).
   * `edge/agent/modelstore`: Filesystem-backed edge model store and candidate staging boundary with multi-stage validation gates, safe bounded reads, Windows-compatible file operations, idempotency, and conflict rejection (Phase 5.6B).
-  * `edge/agent/modelactivation`: Thread-safe runtime model activation manager with pre-promotion validation pipeline, dynamic `RuntimeDetector` dispatching under `sync.RWMutex`, idempotency, conflict rejection, and previous active model tracking (Phase 5.6C).
+  * `edge/agent/modelactivation`: Thread-safe runtime model activation and explicit rollback manager with pre-promotion validation pipeline, dynamic `RuntimeDetector` dispatching under `sync.RWMutex`, idempotency, conflict rejection, previous model disk retention in `previous/`, and repeated rollback swapping (Phases 5.6C & 5.6D).
+  * `edge/agent/response`: Deterministic Response Policy Engine (`RuleBasedPolicy`) with explicit rule precedence and stable SHA-256 `DecisionID`, combined with Fail-Closed Safety Validator (`StandardSafetyValidator`) enforcing typed action allowlists, target validation, risk classification, parameter limits, and process-local non-durable cooldown tracking (Phase 6.2).
 * **DESIGNED**:
-  * ML Model Distribution & Rollback Architecture: Staged deployment, network transport, and autonomous offline rollback (Phase 5.5D Design Only; crash-consistent filesystem activation is not implemented, see [`ADR-0009 §31`](docs/decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
+  * Autonomous Incident Response Architecture: Layered response pipeline, simulated execution, operator approval, and automated telemetry verification (Phase 6.1 Design Only, see [ADR-0012](docs/decisions/ADR-0012-autonomous-incident-response.md)).
+  * ML Model Distribution & Autonomous Rollback Architecture: Staged deployment, network transport, and autonomous policy-based rollback (Phase 5.5D Design Only; crash-consistent filesystem activation is not implemented, see [ADR-0009 §31](docs/decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
 * **FUTURE IMPLEMENTATION**:
-  * Ed25519 cryptographic signing, central model registry service, model distribution network transport, autonomous crash-consistent filesystem rollback engine.
+  * Simulated action executor and dry-run pipeline integration (Phase 6.3).
+  * Durable mitigation persistence in SQLite WAL storage via Migration v4 (Phase 6.4).
+  * Controlled host actuators, operator approval tickets, and automated telemetry verification (Phase 6.5).
+  * Ed25519 cryptographic signing, central model registry service, model distribution network transport, automated policy-driven rollback engine.
 
 ### Running Tests
 
