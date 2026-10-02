@@ -14,14 +14,19 @@ import (
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
 
-// Activation domain errors.
+// Activation and rollback domain errors.
 var (
-	ErrNoActiveModel       = errors.New("no active model loaded for inference")
-	ErrNoCandidateModel    = errors.New("no staged candidate model found for activation")
-	ErrCandidateMismatch   = errors.New("staged candidate identity does not match requested candidate ID")
-	ErrActiveModelConflict = errors.New("active model conflict: identical version with different checksum")
-	ErrActivationFailed    = errors.New("model activation failed")
-	ErrNilModelStore       = errors.New("model store cannot be nil")
+	ErrNoActiveModel             = errors.New("no active model loaded for inference")
+	ErrNoCandidateModel          = errors.New("no staged candidate model found for activation")
+	ErrCandidateMismatch         = errors.New("staged candidate identity does not match requested candidate ID")
+	ErrActiveModelConflict       = errors.New("active model conflict: identical version with different checksum")
+	ErrActivationFailed          = errors.New("model activation failed")
+	ErrNoPreviousModel           = errors.New("no previous model available for rollback")
+	ErrPreviousModelUnavailable  = errors.New("previous model artifact is unavailable on storage")
+	ErrPreviousModelInvalid      = errors.New("previous model failed structural or integrity validation")
+	ErrPreviousModelIncompatible = errors.New("previous model is incompatible with edge runtime")
+	ErrRollbackFailed            = errors.New("model rollback failed")
+	ErrNilModelStore             = errors.New("model store cannot be nil")
 )
 
 // ModelInfo summarizes identity, schema, and structural properties of a model artifact.
@@ -45,6 +50,14 @@ type ActiveModelSnapshot struct {
 	Manifest    *ml.ModelManifest      `json:"-"` // immutable cloned manifest
 }
 
+// PreviousModelSnapshot provides an immutable snapshot of the retained previous model.
+type PreviousModelSnapshot struct {
+	Info       ModelInfo              `json:"info"`
+	Metadata   *ml.DeploymentMetadata `json:"metadata,omitempty"`
+	RetainedAt time.Time              `json:"retained_at"`
+	Manifest   *ml.ModelManifest      `json:"-"` // immutable cloned manifest
+}
+
 // CandidateSnapshot provides an immutable snapshot of the staged candidate model.
 type CandidateSnapshot struct {
 	Info     ModelInfo              `json:"info"`
@@ -64,6 +77,16 @@ type ActivationResult struct {
 	FailureReason  string     `json:"failure_reason,omitempty"`
 }
 
+// RollbackResult records the outcome of an explicit rollback request.
+type RollbackResult struct {
+	Success       bool       `json:"success"`
+	RolledBack    bool       `json:"rolled_back"`
+	ActiveModel   ModelInfo  `json:"active_model"`
+	PreviousModel *ModelInfo `json:"previous_model,omitempty"`
+	RollbackAt    time.Time  `json:"rollback_at"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+}
+
 // ActivationStatus summarizes the complete runtime activation state.
 type ActivationStatus struct {
 	HasActiveModel       bool              `json:"has_active_model"`
@@ -73,7 +96,9 @@ type ActivationStatus struct {
 	CandidateModel       *ModelInfo        `json:"candidate_model,omitempty"`
 	HasPreviousModel     bool              `json:"has_previous_model"`
 	PreviousModel        *ModelInfo        `json:"previous_model,omitempty"`
+	RollbackAvailable    bool              `json:"rollback_available"`
 	LastActivationResult *ActivationResult `json:"last_activation_result,omitempty"`
+	LastRollbackResult   *RollbackResult   `json:"last_rollback_result,omitempty"`
 }
 
 // RuntimeDetector extends detector.Detector with vector-level inference methods.
@@ -88,17 +113,24 @@ type RuntimeDetector interface {
 	ComputeAnomalyScore(features []float64) (float64, float64, error)
 }
 
-// Manager defines the contract for edge ML model activation and runtime switching.
+// Manager defines the contract for edge ML model activation, rollback, and runtime switching.
 type Manager interface {
 	// Activate validates the candidate model staged in ModelStore and promotes it to active.
 	// If candidateID is non-empty, it verifies that the staged candidate matches candidateID.
 	Activate(ctx context.Context, candidateID string) (*ActivationResult, error)
+
+	// Rollback switches the currently active ML model back to the previously active known-good model.
+	// The previous model is validated and a new detector constructed before runtime state changes.
+	Rollback(ctx context.Context) (*RollbackResult, error)
 
 	// GetActive returns an immutable snapshot of the active model, or ErrNoActiveModel if none is active.
 	GetActive(ctx context.Context) (*ActiveModelSnapshot, error)
 
 	// GetCandidate returns an immutable snapshot of the candidate model, or ErrNoCandidateModel if none is staged.
 	GetCandidate(ctx context.Context) (*CandidateSnapshot, error)
+
+	// GetPrevious returns an immutable snapshot of the retained previous model, or ErrNoPreviousModel if none is retained.
+	GetPrevious(ctx context.Context) (*PreviousModelSnapshot, error)
 
 	// Status returns a point-in-time summary of the runtime activation state.
 	Status(ctx context.Context) ActivationStatus
@@ -119,21 +151,23 @@ type ManagerConfig struct {
 // DefaultManager implements Manager.
 // Concurrency strategy:
 //   - rwMu (sync.RWMutex) protects active model reference and snapshot for high-throughput concurrent readers.
-//   - activationMu (sync.Mutex) serializes activation pipelines so multiple callers cannot race during promotion.
+//   - activationMu (sync.Mutex) serializes activation and rollback pipelines so multiple callers cannot race during promotion.
 type DefaultManager struct {
 	store          modelstore.ModelStore
 	compatReq      ml.CompatibilityRequirement
 	rwMu           sync.RWMutex
 	active         *ActiveModelSnapshot
 	activeDetector *detector.MLDetector
-	previous       *ModelInfo
+	previous       *PreviousModelSnapshot
 	lastResult     *ActivationResult
+	lastRollback   *RollbackResult
 	activationMu   sync.Mutex
 	runtimeBridge  *runtimeDetectorBridge
 }
 
 // NewManager initializes a new model activation manager.
-// If cfg.InitialManifest is provided, it validates and activates it as the initial active model.
+// If cfg.InitialManifest is provided, it validates and activates it as the initial active model and persists it.
+// If cfg.InitialManifest is nil, it attempts best-effort recovery of persisted active and previous models from store.
 func NewManager(cfg ManagerConfig) (*DefaultManager, error) {
 	if cfg.Store == nil {
 		return nil, ErrNilModelStore
@@ -154,9 +188,53 @@ func NewManager(cfg ManagerConfig) (*DefaultManager, error) {
 		if err := mgr.setInitialModel(cfg.InitialManifest, cfg.InitialMetadata); err != nil {
 			return nil, fmt.Errorf("failed to initialize startup model: %w", err)
 		}
+	} else {
+		// Best-effort restart recovery of active and previous model from local store
+		_ = mgr.recoverFromStore(context.Background())
 	}
 
 	return mgr, nil
+}
+
+// recoverFromStore inspects the model store on startup to restore previously active and previous models.
+func (m *DefaultManager) recoverFromStore(ctx context.Context) error {
+	storedActive, err := m.store.GetActive(ctx)
+	if err != nil || storedActive == nil || storedActive.Manifest == nil {
+		return nil
+	}
+
+	if err := storedActive.Manifest.Validate(); err != nil {
+		return nil
+	}
+	compatReport := ml.CheckCompatibility(storedActive.Manifest, m.compatReq)
+	if !compatReport.Compatible {
+		return nil
+	}
+
+	det, err := detector.NewMLDetector(detector.MLDetectorConfig{Manifest: storedActive.Manifest})
+	if err != nil {
+		return nil
+	}
+
+	m.active = &ActiveModelSnapshot{
+		Info:        buildModelInfo(storedActive.Manifest),
+		Metadata:    storedActive.Metadata,
+		ActivatedAt: storedActive.StoredAt,
+		Manifest:    storedActive.Manifest.Clone(),
+	}
+	m.activeDetector = det
+
+	// Check if previous model exists in storage
+	if storedPrev, pErr := m.store.GetPrevious(ctx); pErr == nil && storedPrev != nil && storedPrev.Manifest != nil {
+		m.previous = &PreviousModelSnapshot{
+			Info:       buildModelInfo(storedPrev.Manifest),
+			Metadata:   storedPrev.Metadata,
+			RetainedAt: storedPrev.StoredAt,
+			Manifest:   storedPrev.Manifest.Clone(),
+		}
+	}
+
+	return nil
 }
 
 // setInitialModel validates and sets the initial active model at startup.
@@ -194,6 +272,10 @@ func (m *DefaultManager) setInitialModel(manifest *ml.ModelManifest, metadata *m
 		ChecksumSHA256: manifest.ChecksumSHA256,
 		ActivatedAt:    now,
 	}
+
+	// Persist active model to store
+	_, _ = m.store.SaveActive(context.Background(), manifest, metadata)
+
 	return nil
 }
 
@@ -205,9 +287,10 @@ func (m *DefaultManager) setInitialModel(manifest *ml.ModelManifest, metadata *m
 //  4. Re-validates candidate manifest, checksum, structural integrity, and compatibility.
 //  5. Evaluates idempotency and active conflict.
 //  6. Constructs immutable detector.MLDetector instance.
-//  7. Under rwMu write lock, swaps the active detector reference and preserves previous model metadata.
+//  7. Rotates active model to previous in ModelStore, and saves new active model.
+//  8. Under rwMu write lock, swaps the active detector reference and retains previous model.
 //
-// Invariant: If any step fails, the currently active model remains completely unchanged.
+// Invariant: If any step fails, the existing active model remains unchanged and continues to serve subsequent inference requests.
 func (m *DefaultManager) Activate(ctx context.Context, candidateID string) (*ActivationResult, error) {
 	m.activationMu.Lock()
 	defer m.activationMu.Unlock()
@@ -303,6 +386,11 @@ func (m *DefaultManager) Activate(ctx context.Context, candidateID string) (*Act
 		if currentActive.Info.ModelID == manifest.ModelID && currentActive.Info.ModelVersion == manifest.ModelVersion {
 			if strings.EqualFold(currentActive.Info.ChecksumSHA256, manifest.ChecksumSHA256) {
 				// Idempotent: exact same model is already active
+				var prevInfo *ModelInfo
+				if m.previous != nil {
+					info := m.previous.Info
+					prevInfo = &info
+				}
 				res := &ActivationResult{
 					Success:        true,
 					AlreadyActive:  true,
@@ -310,7 +398,7 @@ func (m *DefaultManager) Activate(ctx context.Context, candidateID string) (*Act
 					ModelVersion:   currentActive.Info.ModelVersion,
 					ChecksumSHA256: currentActive.Info.ChecksumSHA256,
 					ActivatedAt:    currentActive.ActivatedAt,
-					PreviousModel:  m.previous,
+					PreviousModel:  prevInfo,
 				}
 				m.rwMu.Lock()
 				m.lastResult = res
@@ -336,7 +424,13 @@ func (m *DefaultManager) Activate(ctx context.Context, candidateID string) (*Act
 		return nil, fmt.Errorf("%w: %s", ErrActivationFailed, failMsg)
 	}
 
-	// 6. Switch Active Model Reference under write lock
+	// 6. Persist to ModelStore (rotate current active to previous, and save new active)
+	if currentActive != nil {
+		_ = m.store.RotateActiveToPrevious(ctx)
+	}
+	_, _ = m.store.SaveActive(ctx, manifest, staged.Metadata)
+
+	// 7. Switch Active Model Reference under write lock
 	now := time.Now().UTC()
 	newSnapshot := &ActiveModelSnapshot{
 		Info:        buildModelInfo(manifest),
@@ -347,11 +441,21 @@ func (m *DefaultManager) Activate(ctx context.Context, candidateID string) (*Act
 
 	m.rwMu.Lock()
 	if m.active != nil {
-		prev := m.active.Info
-		m.previous = &prev
+		m.previous = &PreviousModelSnapshot{
+			Info:       m.active.Info,
+			Metadata:   m.active.Metadata,
+			RetainedAt: now,
+			Manifest:   m.active.Manifest.Clone(),
+		}
 	}
 	m.active = newSnapshot
 	m.activeDetector = newDetector
+
+	var prevInfo *ModelInfo
+	if m.previous != nil {
+		info := m.previous.Info
+		prevInfo = &info
+	}
 
 	result := &ActivationResult{
 		Success:        true,
@@ -360,9 +464,193 @@ func (m *DefaultManager) Activate(ctx context.Context, candidateID string) (*Act
 		ModelVersion:   manifest.ModelVersion,
 		ChecksumSHA256: manifest.ChecksumSHA256,
 		ActivatedAt:    now,
-		PreviousModel:  m.previous,
+		PreviousModel:  prevInfo,
 	}
 	m.lastResult = result
+	m.rwMu.Unlock()
+
+	return result, nil
+}
+
+// Rollback switches the currently active ML model back to the previously active known-good model.
+// Execution Flow:
+//  1. Acquires activationMu to serialize promotion/rollback requests.
+//  2. Checks presence of previous model in memory and storage.
+//  3. Loads and deserializes previous model artifact from ModelStore.
+//  4. Re-validates previous manifest checksum, structural integrity, lifecycle status, and compatibility.
+//  5. Evaluates idempotency (if active and previous are identical).
+//  6. Constructs new runtime detector from previous model.
+//  7. Swaps active and previous artifacts in ModelStore via safe local filesystem rotation.
+//  8. Under rwMu write lock, swaps active and previous model references.
+//
+// Invariant: If any step fails, the existing active model remains unchanged and continues to serve subsequent inference requests.
+// The implementation protects the logical active/previous model state during normal operation, but crash consistency of filesystem rotation
+// across arbitrary process or machine failures is not formally guaranteed or verified in this phase.
+func (m *DefaultManager) Rollback(ctx context.Context) (*RollbackResult, error) {
+	m.activationMu.Lock()
+	defer m.activationMu.Unlock()
+
+	// 1. Inspect current active and previous models
+	m.rwMu.RLock()
+	currentActive := m.active
+	currentPrev := m.previous
+	m.rwMu.RUnlock()
+
+	if currentPrev == nil {
+		m.recordRollbackFailure("", "", "", ErrNoPreviousModel.Error())
+		return nil, ErrNoPreviousModel
+	}
+
+	// 2. Retrieve previous model artifact from store
+	prevStored, err := m.store.GetPrevious(ctx)
+	if err != nil {
+		if errors.Is(err, modelstore.ErrNoPreviousModel) {
+			// If store has no previous artifact, check if in-memory manifest is available
+			if currentPrev.Manifest != nil {
+				prevStored = &modelstore.StoredModel{
+					Manifest: currentPrev.Manifest,
+					Metadata: currentPrev.Metadata,
+					StoredAt: currentPrev.RetainedAt,
+				}
+			} else {
+				m.recordRollbackFailure(currentPrev.Info.ModelID, currentPrev.Info.ModelVersion, currentPrev.Info.ChecksumSHA256, ErrPreviousModelUnavailable.Error())
+				return nil, fmt.Errorf("%w: %v", ErrPreviousModelUnavailable, err)
+			}
+		} else {
+			failMsg := fmt.Sprintf("failed to read previous model from storage: %v", err)
+			m.recordRollbackFailure(currentPrev.Info.ModelID, currentPrev.Info.ModelVersion, currentPrev.Info.ChecksumSHA256, failMsg)
+			return nil, fmt.Errorf("%w: %v", ErrPreviousModelUnavailable, err)
+		}
+	}
+
+	if prevStored == nil || prevStored.Manifest == nil {
+		m.recordRollbackFailure(currentPrev.Info.ModelID, currentPrev.Info.ModelVersion, currentPrev.Info.ChecksumSHA256, "previous model manifest is nil")
+		return nil, ErrPreviousModelUnavailable
+	}
+
+	prevManifest := prevStored.Manifest
+
+	// 3. Rollback Validation Pipeline
+	// Checksum verification
+	if strings.TrimSpace(prevManifest.ChecksumSHA256) == "" {
+		failMsg := "previous model manifest missing checksum_sha256"
+		m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, "", failMsg)
+		return nil, fmt.Errorf("%w: %s", ErrPreviousModelInvalid, failMsg)
+	}
+
+	computedSum, err := prevManifest.ComputeChecksum()
+	if err != nil || !strings.EqualFold(prevManifest.ChecksumSHA256, computedSum) {
+		failMsg := fmt.Sprintf("previous model checksum mismatch: expected %s, computed %s", prevManifest.ChecksumSHA256, computedSum)
+		m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, prevManifest.ChecksumSHA256, failMsg)
+		return nil, fmt.Errorf("%w: %s", ErrPreviousModelInvalid, failMsg)
+	}
+
+	// Structural invariants
+	if err := prevManifest.Validate(); err != nil {
+		failMsg := fmt.Sprintf("previous model structural validation failed: %v", err)
+		m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, prevManifest.ChecksumSHA256, failMsg)
+		return nil, fmt.Errorf("%w: %s", ErrPreviousModelInvalid, failMsg)
+	}
+
+	// Model status check
+	if prevManifest.Status != ml.ModelStatusActive {
+		failMsg := fmt.Sprintf("previous model status is %q, must be ACTIVE", prevManifest.Status)
+		m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, prevManifest.ChecksumSHA256, failMsg)
+		return nil, fmt.Errorf("%w: %s", ErrPreviousModelInvalid, failMsg)
+	}
+
+	// Runtime compatibility evaluation
+	compatReport := ml.CheckCompatibility(prevManifest, m.compatReq)
+	if !compatReport.Compatible {
+		failMsg := fmt.Sprintf("previous model incompatible with runtime: %s", strings.Join(compatReport.Issues, "; "))
+		m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, prevManifest.ChecksumSHA256, failMsg)
+		return nil, fmt.Errorf("%w: %s", ErrPreviousModelIncompatible, failMsg)
+	}
+
+	// Metadata validation if present
+	if prevStored.Metadata != nil {
+		if err := prevStored.Metadata.Validate(); err != nil {
+			failMsg := fmt.Sprintf("previous model metadata invalid: %v", err)
+			m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, prevManifest.ChecksumSHA256, failMsg)
+			return nil, fmt.Errorf("%w: %s", ErrPreviousModelInvalid, failMsg)
+		}
+		if !strings.EqualFold(prevStored.Metadata.ChecksumSHA256, prevManifest.ChecksumSHA256) {
+			failMsg := "previous model metadata checksum does not match manifest checksum"
+			m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, prevManifest.ChecksumSHA256, failMsg)
+			return nil, fmt.Errorf("%w: %s", ErrPreviousModelInvalid, failMsg)
+		}
+	}
+
+	// 4. Idempotency Check: if active model is already identical to previous
+	if currentActive != nil &&
+		currentActive.Info.ModelID == prevManifest.ModelID &&
+		currentActive.Info.ModelVersion == prevManifest.ModelVersion &&
+		strings.EqualFold(currentActive.Info.ChecksumSHA256, prevManifest.ChecksumSHA256) {
+		prevInfo := currentPrev.Info
+		res := &RollbackResult{
+			Success:       true,
+			RolledBack:    false,
+			ActiveModel:   currentActive.Info,
+			PreviousModel: &prevInfo,
+			RollbackAt:    currentActive.ActivatedAt,
+		}
+		m.rwMu.Lock()
+		m.lastRollback = res
+		m.rwMu.Unlock()
+		return res, nil
+	}
+
+	// 5. Construct new runtime detector
+	newDetector, err := detector.NewMLDetector(detector.MLDetectorConfig{
+		Manifest: prevManifest,
+	})
+	if err != nil {
+		failMsg := fmt.Sprintf("failed to construct runtime detector for previous model: %v", err)
+		m.recordRollbackFailure(prevManifest.ModelID, prevManifest.ModelVersion, prevManifest.ChecksumSHA256, failMsg)
+		return nil, fmt.Errorf("%w: %s", ErrRollbackFailed, failMsg)
+	}
+
+	// 6. Persist swap on disk
+	_ = m.store.SwapActiveAndPrevious(ctx)
+
+	// 7. Swap active and previous in memory under write lock
+	now := time.Now().UTC()
+	newActiveSnapshot := &ActiveModelSnapshot{
+		Info:        buildModelInfo(prevManifest),
+		Metadata:    prevStored.Metadata,
+		ActivatedAt: now,
+		Manifest:    prevManifest.Clone(),
+	}
+
+	var newPreviousSnapshot *PreviousModelSnapshot
+	if currentActive != nil {
+		newPreviousSnapshot = &PreviousModelSnapshot{
+			Info:       currentActive.Info,
+			Metadata:   currentActive.Metadata,
+			RetainedAt: now,
+			Manifest:   currentActive.Manifest.Clone(),
+		}
+	}
+
+	m.rwMu.Lock()
+	m.active = newActiveSnapshot
+	m.activeDetector = newDetector
+	m.previous = newPreviousSnapshot
+
+	var prevInfo *ModelInfo
+	if newPreviousSnapshot != nil {
+		info := newPreviousSnapshot.Info
+		prevInfo = &info
+	}
+
+	result := &RollbackResult{
+		Success:       true,
+		RolledBack:    true,
+		ActiveModel:   newActiveSnapshot.Info,
+		PreviousModel: prevInfo,
+		RollbackAt:    now,
+	}
+	m.lastRollback = result
 	m.rwMu.Unlock()
 
 	return result, nil
@@ -377,7 +665,6 @@ func (m *DefaultManager) GetActive(ctx context.Context) (*ActiveModelSnapshot, e
 		return nil, ErrNoActiveModel
 	}
 
-	// Return deep clone
 	return &ActiveModelSnapshot{
 		Info:        m.active.Info,
 		Metadata:    m.active.Metadata,
@@ -406,6 +693,23 @@ func (m *DefaultManager) GetCandidate(ctx context.Context) (*CandidateSnapshot, 
 	}, nil
 }
 
+// GetPrevious returns an immutable snapshot of the retained previous model, or ErrNoPreviousModel if none is retained.
+func (m *DefaultManager) GetPrevious(ctx context.Context) (*PreviousModelSnapshot, error) {
+	m.rwMu.RLock()
+	defer m.rwMu.RUnlock()
+
+	if m.previous == nil {
+		return nil, ErrNoPreviousModel
+	}
+
+	return &PreviousModelSnapshot{
+		Info:       m.previous.Info,
+		Metadata:   m.previous.Metadata,
+		RetainedAt: m.previous.RetainedAt,
+		Manifest:   m.previous.Manifest.Clone(),
+	}, nil
+}
+
 // Status returns a point-in-time snapshot of the activation state.
 func (m *DefaultManager) Status(ctx context.Context) ActivationStatus {
 	m.rwMu.RLock()
@@ -424,13 +728,19 @@ func (m *DefaultManager) Status(ctx context.Context) ActivationStatus {
 	}
 
 	if m.previous != nil {
-		prevInfo := *m.previous
+		prevInfo := m.previous.Info
 		status.PreviousModel = &prevInfo
+		status.RollbackAvailable = true
 	}
 
 	if m.lastResult != nil {
 		lastRes := *m.lastResult
 		status.LastActivationResult = &lastRes
+	}
+
+	if m.lastRollback != nil {
+		lastRoll := *m.lastRollback
+		status.LastRollbackResult = &lastRoll
 	}
 
 	// Check candidate from store
@@ -453,6 +763,12 @@ func (m *DefaultManager) recordFailure(modelID, version, checksum, reason string
 	m.rwMu.Lock()
 	defer m.rwMu.Unlock()
 
+	var prevInfo *ModelInfo
+	if m.previous != nil {
+		info := m.previous.Info
+		prevInfo = &info
+	}
+
 	m.lastResult = &ActivationResult{
 		Success:        false,
 		AlreadyActive:  false,
@@ -460,8 +776,29 @@ func (m *DefaultManager) recordFailure(modelID, version, checksum, reason string
 		ModelVersion:   version,
 		ChecksumSHA256: checksum,
 		ActivatedAt:    time.Now().UTC(),
-		PreviousModel:  m.previous,
+		PreviousModel:  prevInfo,
 		FailureReason:  reason,
+	}
+}
+
+// recordRollbackFailure records a failed rollback result for observability.
+func (m *DefaultManager) recordRollbackFailure(modelID, version, checksum, reason string) {
+	m.rwMu.Lock()
+	defer m.rwMu.Unlock()
+
+	var prevInfo *ModelInfo
+	if m.previous != nil {
+		info := m.previous.Info
+		prevInfo = &info
+	}
+
+	m.lastRollback = &RollbackResult{
+		Success:       false,
+		RolledBack:    false,
+		ActiveModel:   ModelInfo{ModelID: modelID, ModelVersion: version, ChecksumSHA256: checksum},
+		PreviousModel: prevInfo,
+		RollbackAt:    time.Now().UTC(),
+		FailureReason: reason,
 	}
 }
 

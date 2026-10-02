@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
@@ -27,12 +29,18 @@ type ResponsePolicy interface {
 
 // PolicyRule defines an explicit deterministic mapping from metric and severity to an allowlisted action.
 type PolicyRule struct {
-	MetricName  string
-	MinSeverity types.IncidentSeverity
-	ActionType  types.MitigationActionType
-	Target      string
-	Parameters  map[string]string
-	Reason      string
+	RuleID             string                     `json:"rule_id"`
+	Priority           int                        `json:"priority"` // Higher numerical value = higher precedence
+	Enabled            bool                       `json:"enabled"`
+	MetricName         string                     `json:"metric_name,omitempty"` // Empty or "*" matches any metric
+	MinimumSeverity    types.IncidentSeverity     `json:"minimum_severity"`
+	ActionType         types.MitigationActionType `json:"action_type"`
+	Target             string                     `json:"target"`
+	Parameters         map[string]string          `json:"parameters,omitempty"`
+	AuthorizationClass AuthorizationClass         `json:"authorization_class"`
+	Cooldown           time.Duration              `json:"cooldown"`
+	PolicyVersion      string                     `json:"policy_version"`
+	Reason             string                     `json:"reason"`
 }
 
 // RuleBasedPolicy implements ResponsePolicy using explicit, deterministic rule lookup tables.
@@ -41,7 +49,7 @@ type RuleBasedPolicy struct {
 	version       string
 	executionMode ExecutionMode
 	rules         []PolicyRule
-	fallbackRule  PolicyRule
+	fallbackRule  *PolicyRule
 }
 
 // NewDefaultPolicy constructs the standard deterministic response policy (v1.0.0).
@@ -50,50 +58,77 @@ type RuleBasedPolicy struct {
 // are strictly SIMULATION / DEMONSTRATION targets used to model remediation decisions.
 // They do NOT represent or interact with real host processes or deployed infrastructure.
 func NewDefaultPolicy() *RuleBasedPolicy {
+	ver := "1.0.0"
+	pName := "default_edge_response_policy"
 	return &RuleBasedPolicy{
-		name:          "default_edge_response_policy",
-		version:       "1.0.0",
+		name:          pName,
+		version:       ver,
 		executionMode: ExecutionModeDryRun,
 		rules: []PolicyRule{
 			{
-				MetricName:  "cpu_usage_percent",
-				MinSeverity: types.SeverityHigh,
-				ActionType:  types.ActionSimulatedThrottle,
-				Target:      "telemetry_generator",
+				RuleID:          "rule-cpu-throttle-01",
+				Priority:        100,
+				Enabled:         true,
+				MetricName:      "cpu_usage_percent",
+				MinimumSeverity: types.SeverityHigh,
+				ActionType:      types.ActionSimulatedThrottle,
+				Target:          "telemetry_generator",
 				Parameters: map[string]string{
 					"throttle_percent": "50",
 					"duration_sec":     "300",
 				},
-				Reason: "CPU threshold exceeded with HIGH/CRITICAL severity; proposing throttle",
+				AuthorizationClass: AuthClassAutoExecute,
+				Cooldown:           300 * time.Second,
+				PolicyVersion:      ver,
+				Reason:             "CPU threshold exceeded with HIGH/CRITICAL severity; proposing throttle",
 			},
 			{
-				MetricName:  "memory_usage_percent",
-				MinSeverity: types.SeverityCritical,
-				ActionType:  types.ActionSimulatedRestart,
-				Target:      "collector",
+				RuleID:          "rule-mem-restart-01",
+				Priority:        100,
+				Enabled:         true,
+				MetricName:      "memory_usage_percent",
+				MinimumSeverity: types.SeverityCritical,
+				ActionType:      types.ActionSimulatedRestart,
+				Target:          "collector",
 				Parameters: map[string]string{
 					"grace_period_sec": "10",
 				},
-				Reason: "Memory threshold exceeded with CRITICAL severity; proposing worker restart",
+				AuthorizationClass: AuthClassAutoExecute,
+				Cooldown:           300 * time.Second,
+				PolicyVersion:      ver,
+				Reason:             "Memory threshold exceeded with CRITICAL severity; proposing worker restart",
 			},
 			{
-				MetricName:  "disk_usage_percent",
-				MinSeverity: types.SeverityHigh,
-				ActionType:  types.ActionSimulatedAlert,
-				Target:      "local_syslog",
+				RuleID:          "rule-disk-alert-01",
+				Priority:        50,
+				Enabled:         true,
+				MetricName:      "disk_usage_percent",
+				MinimumSeverity: types.SeverityHigh,
+				ActionType:      types.ActionSimulatedAlert,
+				Target:          "local_syslog",
 				Parameters: map[string]string{
 					"priority": "HIGH",
 				},
-				Reason: "Disk threshold exceeded; proposing local high-priority alert",
+				AuthorizationClass: AuthClassAutoExecute,
+				Cooldown:           60 * time.Second,
+				PolicyVersion:      ver,
+				Reason:             "Disk threshold exceeded; proposing local high-priority alert",
 			},
 		},
-		fallbackRule: PolicyRule{
-			ActionType: types.ActionSimulatedAlert,
-			Target:     "local_syslog",
+		fallbackRule: &PolicyRule{
+			RuleID:          "rule-fallback-alert",
+			Priority:        0,
+			Enabled:         true,
+			MinimumSeverity: types.SeverityLow,
+			ActionType:      types.ActionSimulatedAlert,
+			Target:          "local_syslog",
 			Parameters: map[string]string{
 				"priority": "LOW",
 			},
-			Reason: "Standard operational anomaly breach; proposing low-priority alert",
+			AuthorizationClass: AuthClassAutoExecute,
+			Cooldown:           60 * time.Second,
+			PolicyVersion:      ver,
+			Reason:             "Standard operational anomaly breach; proposing low-priority alert",
 		},
 	}
 }
@@ -115,6 +150,34 @@ func (p *RuleBasedPolicy) SetExecutionMode(mode ExecutionMode) error {
 	}
 	p.executionMode = mode
 	return nil
+}
+
+// AddRule appends an additional deterministic rule.
+func (p *RuleBasedPolicy) AddRule(rule PolicyRule) {
+	p.rules = append(p.rules, rule)
+}
+
+// SetRules replaces all policy rules.
+func (p *RuleBasedPolicy) SetRules(rules []PolicyRule) {
+	p.rules = make([]PolicyRule, len(rules))
+	copy(p.rules, rules)
+}
+
+// Rules returns a copy of current rules.
+func (p *RuleBasedPolicy) Rules() []PolicyRule {
+	cp := make([]PolicyRule, len(p.rules))
+	copy(cp, p.rules)
+	return cp
+}
+
+// SetFallbackRule sets or overrides the fallback rule.
+func (p *RuleBasedPolicy) SetFallbackRule(rule PolicyRule) {
+	p.fallbackRule = &rule
+}
+
+// ClearFallbackRule removes the fallback rule.
+func (p *RuleBasedPolicy) ClearFallbackRule() {
+	p.fallbackRule = nil
 }
 
 // Evaluate applies deterministic policy rules to the Incident.
@@ -145,13 +208,57 @@ func (p *RuleBasedPolicy) Evaluate(ctx context.Context, inc *types.Incident) (*R
 		return nil, fmt.Errorf("%w: unrecognized status %s", ErrIncidentNotActionable, inc.Status)
 	}
 
-	// 2. Deterministic Rule Matching
-	selectedRule := p.fallbackRule
+	// 2. Deterministic Rule Matching with Explicit Precedence
+	// A candidate rule must:
+	// a) Be enabled
+	// b) Match the metric (exact match or wildcard/empty)
+	// c) Have minimum severity satisfied
+	var candidates []PolicyRule
 	for _, r := range p.rules {
-		if r.MetricName == inc.TriggerMetric && severityMeetsOrExceeds(inc.Severity, r.MinSeverity) {
-			selectedRule = r
-			break
+		if !r.Enabled {
+			continue
 		}
+		if !severityMeetsOrExceeds(inc.Severity, r.MinimumSeverity) {
+			continue
+		}
+		metricMatch := r.MetricName == inc.TriggerMetric || r.MetricName == "" || r.MetricName == "*"
+		if metricMatch {
+			candidates = append(candidates, r)
+		}
+	}
+
+	var selectedRule *PolicyRule
+
+	if len(candidates) > 0 {
+		// Sort candidates strictly deterministically:
+		// 1. Specific metric match (exact TriggerMetric) > General/Wildcard
+		// 2. Priority descending (higher priority first)
+		// 3. MinimumSeverity descending (more specific severity first)
+		// 4. RuleID ascending (lexicographical tie-breaker)
+		sort.SliceStable(candidates, func(i, j int) bool {
+			a, b := candidates[i], candidates[j]
+			aSpecific := a.MetricName == inc.TriggerMetric && a.MetricName != "" && a.MetricName != "*"
+			bSpecific := b.MetricName == inc.TriggerMetric && b.MetricName != "" && b.MetricName != "*"
+			if aSpecific != bSpecific {
+				return aSpecific // true if a is specific and b is generic
+			}
+			if a.Priority != b.Priority {
+				return a.Priority > b.Priority
+			}
+			aSev := severityRank(a.MinimumSeverity)
+			bSev := severityRank(b.MinimumSeverity)
+			if aSev != bSev {
+				return aSev > bSev
+			}
+			return a.RuleID < b.RuleID
+		})
+		selectedRule = &candidates[0]
+	} else if p.fallbackRule != nil && p.fallbackRule.Enabled && severityMeetsOrExceeds(inc.Severity, p.fallbackRule.MinimumSeverity) {
+		selectedRule = p.fallbackRule
+	}
+
+	if selectedRule == nil {
+		return nil, ErrNoRuleMatched
 	}
 
 	// 3. Compute Deterministic DecisionID (Independent of Timestamps)
@@ -170,18 +277,20 @@ func (p *RuleBasedPolicy) Evaluate(ctx context.Context, inc *types.Incident) (*R
 	}
 
 	decision := &ResponseDecision{
-		DecisionID:        decisionID,
-		IncidentID:        inc.IncidentID,
-		NodeID:            inc.NodeID,
-		ActionType:        selectedRule.ActionType,
-		Target:            selectedRule.Target,
-		Parameters:        params,
-		Reason:            selectedRule.Reason,
-		PolicyName:        p.name,
-		PolicyVersion:     p.version,
-		ExecutionMode:     p.executionMode,
-		DecisionTimestamp: inc.UpdatedAt, // Stable logical reference time
-		EvidenceSummary:   evidenceSummary,
+		DecisionID:         decisionID,
+		IncidentID:         inc.IncidentID,
+		NodeID:             inc.NodeID,
+		RuleID:             selectedRule.RuleID,
+		ActionType:         selectedRule.ActionType,
+		Target:             selectedRule.Target,
+		Parameters:         params,
+		AuthorizationClass: selectedRule.AuthorizationClass,
+		Reason:             selectedRule.Reason,
+		PolicyName:         p.name,
+		PolicyVersion:      p.version,
+		ExecutionMode:      p.executionMode,
+		DecisionTimestamp:  inc.UpdatedAt, // Stable logical reference time
+		EvidenceSummary:    evidenceSummary,
 	}
 
 	return decision, nil

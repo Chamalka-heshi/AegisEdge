@@ -27,7 +27,7 @@ var allowlistedActions = map[types.MitigationActionType]struct{}{
 var dangerousKeywords = []string{
 	"rm ", "rmdir", "kill", "pkill", "killall", "shutdown", "reboot", "halt", "poweroff",
 	"/bin/sh", "/bin/bash", "cmd.exe", "powershell", "powershell.exe",
-	"eval", "exec", "system", "mkfs", "dd ", "chmod", "chown",
+	"eval(", "eval ", "exec(", "exec ", "system(", "system ", "systemctl", "mkfs", "dd ", "chmod", "chown",
 	"curl", "wget", "nc ", "netcat", "iptables", "nftables", "ufw",
 }
 
@@ -50,13 +50,14 @@ func IsAllowlistedString(action string) bool {
 	return IsAllowlisted(types.MitigationActionType(action))
 }
 
-// AllowlistedActions returns a copy of all recognized allowlisted action types.
+// AllowlistedActions returns a copy of all recognized allowlisted action types in deterministic order.
 func AllowlistedActions() []types.MitigationActionType {
-	actions := make([]types.MitigationActionType, 0, len(allowlistedActions))
-	for a := range allowlistedActions {
-		actions = append(actions, a)
+	return []types.MitigationActionType{
+		types.ActionSimulatedAlert,
+		types.ActionSimulatedThrottle,
+		types.ActionSimulatedRestart,
+		types.ActionSimulatedIsolate,
 	}
-	return actions
 }
 
 // ContainsDangerousPayload scans an input string for shell metacharacters and prohibited command keywords.
@@ -77,4 +78,41 @@ func ContainsDangerousPayload(s string) bool {
 	}
 
 	return false
+}
+
+// IsValidTarget verifies that the target identifier adheres to safe naming conventions.
+// It allows alphanumeric names, underscores, hyphens, and colons (e.g., "telemetry_generator", "service:collector", "node-local").
+// It strictly rejects whitespace, shell metacharacters, slashes, backslashes, and command executables.
+func IsValidTarget(target string) bool {
+	t := strings.TrimSpace(target)
+	if t == "" || len(t) > 64 {
+		return false
+	}
+	// Target cannot contain whitespace
+	if strings.ContainsAny(t, " \t\n\r") {
+		return false
+	}
+	// Check against dangerous keywords and shell characters
+	if ContainsDangerousPayload(t) {
+		return false
+	}
+	// Prohibited command names even if without symbols
+	lower := strings.ToLower(t)
+	prohibitedCommands := []string{
+		"bash", "sh", "zsh", "cmd", "powershell", "powershell.exe",
+		"kill", "pkill", "killall", "rm", "rmdir", "shutdown", "reboot",
+		"halt", "poweroff", "init", "systemctl", "service", "eval", "exec",
+	}
+	for _, cmd := range prohibitedCommands {
+		if lower == cmd {
+			return false
+		}
+	}
+	// Must only contain safe identifier runes: [a-zA-Z0-9_\-:]
+	for _, r := range t {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == ':') {
+			return false
+		}
+	}
+	return true
 }

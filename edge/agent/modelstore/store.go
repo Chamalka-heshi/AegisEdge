@@ -47,6 +47,8 @@ var (
 	ErrCompatibilityFailure = errors.New("model artifact is incompatible with edge runtime")
 	ErrCandidateConflict    = errors.New("candidate model conflict: different checksum for existing model identity")
 	ErrNoCandidateModel     = errors.New("no staged candidate model found")
+	ErrNoActiveModel        = errors.New("no stored active model found")
+	ErrNoPreviousModel      = errors.New("no retained previous model found")
 	ErrInvalidStoreDir      = errors.New("invalid model store directory")
 )
 
@@ -55,6 +57,15 @@ type StoreConfig struct {
 	BaseDir              string
 	MaxArtifactSizeBytes int64
 	CompatibilityReq     ml.CompatibilityRequirement
+}
+
+// StoredModel represents a validated model artifact and metadata stored on disk.
+type StoredModel struct {
+	Manifest     *ml.ModelManifest      `json:"manifest"`
+	Metadata     *ml.DeploymentMetadata `json:"metadata"`
+	ArtifactPath string                 `json:"artifact_path"`
+	MetadataPath string                 `json:"metadata_path"`
+	StoredAt     time.Time              `json:"stored_at"`
 }
 
 // StageRequest encapsulates the inputs for staging a candidate model artifact.
@@ -92,6 +103,28 @@ type ModelStore interface {
 
 	// StoreDir returns the absolute base directory of the model store.
 	StoreDir() string
+
+	// GetActive retrieves the currently stored active model and metadata from active/.
+	// Returns (nil, ErrNoActiveModel) if no active model is stored.
+	GetActive(ctx context.Context) (*StoredModel, error)
+
+	// GetPrevious retrieves the currently retained previous model and metadata from previous/.
+	// Returns (nil, ErrNoPreviousModel) if no previous model is stored.
+	GetPrevious(ctx context.Context) (*StoredModel, error)
+
+	// SaveActive stores the active model artifact and metadata into active/ via safe replacement.
+	SaveActive(ctx context.Context, manifest *ml.ModelManifest, metadata *ml.DeploymentMetadata) (*StoredModel, error)
+
+	// RotateActiveToPrevious copies the current active model from active/ to previous/ via safe replacement.
+	// If active/ does not exist, it is a no-op returning nil.
+	RotateActiveToPrevious(ctx context.Context) error
+
+	// SwapActiveAndPrevious swaps the model artifacts between active/ and previous/ via safe replacement.
+	// Returns an error if either active or previous is missing.
+	SwapActiveAndPrevious(ctx context.Context) error
+
+	// ClearPrevious removes any stored previous model artifact and metadata from previous/.
+	ClearPrevious(ctx context.Context) error
 }
 
 // FileSystemModelStore implements ModelStore on the local filesystem.
@@ -101,6 +134,8 @@ type FileSystemModelStore struct {
 	baseDir          string
 	stagingDir       string
 	candidateDir     string
+	activeDir        string
+	previousDir      string
 	maxSizeBytes     int64
 	defaultCompatReq ml.CompatibilityRequirement
 	mu               sync.Mutex
@@ -121,6 +156,8 @@ func NewFileSystemModelStore(cfg StoreConfig) (*FileSystemModelStore, error) {
 
 	stagingDir := filepath.Join(absBase, DirStaging)
 	candidateDir := filepath.Join(absBase, DirCandidate)
+	activeDir := filepath.Join(absBase, DirActive)
+	previousDir := filepath.Join(absBase, DirPrevious)
 
 	// Ensure directories exist
 	if err := os.MkdirAll(stagingDir, 0700); err != nil {
@@ -128,6 +165,12 @@ func NewFileSystemModelStore(cfg StoreConfig) (*FileSystemModelStore, error) {
 	}
 	if err := os.MkdirAll(candidateDir, 0700); err != nil {
 		return nil, fmt.Errorf("%w: failed to create candidate dir: %v", ErrWriteFailure, err)
+	}
+	if err := os.MkdirAll(activeDir, 0700); err != nil {
+		return nil, fmt.Errorf("%w: failed to create active dir: %v", ErrWriteFailure, err)
+	}
+	if err := os.MkdirAll(previousDir, 0700); err != nil {
+		return nil, fmt.Errorf("%w: failed to create previous dir: %v", ErrWriteFailure, err)
 	}
 
 	maxSize := cfg.MaxArtifactSizeBytes
@@ -144,6 +187,8 @@ func NewFileSystemModelStore(cfg StoreConfig) (*FileSystemModelStore, error) {
 		baseDir:          absBase,
 		stagingDir:       stagingDir,
 		candidateDir:     candidateDir,
+		activeDir:        activeDir,
+		previousDir:      previousDir,
 		maxSizeBytes:     maxSize,
 		defaultCompatReq: compatReq,
 	}
@@ -382,6 +427,209 @@ func (s *FileSystemModelStore) ClearCandidate(ctx context.Context) error {
 	return nil
 }
 
+// GetActive retrieves the stored active model artifact and metadata from active/.
+func (s *FileSystemModelStore) GetActive(ctx context.Context) (*StoredModel, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readStoredModel(s.activeDir, ErrNoActiveModel)
+}
+
+// GetPrevious retrieves the stored previous model artifact and metadata from previous/.
+func (s *FileSystemModelStore) GetPrevious(ctx context.Context) (*StoredModel, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readStoredModel(s.previousDir, ErrNoPreviousModel)
+}
+
+// SaveActive stores the active model artifact and metadata into active/ via safe replacement.
+func (s *FileSystemModelStore) SaveActive(ctx context.Context, manifest *ml.ModelManifest, metadata *ml.DeploymentMetadata) (*StoredModel, error) {
+	if manifest == nil {
+		return nil, ml.ErrNilModelManifest
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := ml.Serialize(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to serialize manifest: %v", ErrWriteFailure, err)
+	}
+
+	modelPath := filepath.Join(s.activeDir, ModelFileName)
+	metaPath := filepath.Join(s.activeDir, MetadataFileName)
+	tmpModel := filepath.Join(s.activeDir, "model.json.tmp")
+	tmpMeta := filepath.Join(s.activeDir, "metadata.json.tmp")
+
+	if err := safeWriteReplace(tmpModel, modelPath, data); err != nil {
+		return nil, fmt.Errorf("%w: failed to write active model: %v", ErrWriteFailure, err)
+	}
+
+	meta := metadata
+	if meta == nil {
+		meta = s.buildMetadataFromManifest(manifest, int64(len(data)), nil)
+	}
+	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to serialize active metadata: %v", ErrWriteFailure, err)
+	}
+	if err := safeWriteReplace(tmpMeta, metaPath, append(metaBytes, '\n')); err != nil {
+		return nil, fmt.Errorf("%w: failed to write active metadata: %v", ErrWriteFailure, err)
+	}
+
+	return &StoredModel{
+		Manifest:     manifest.Clone(),
+		Metadata:     meta,
+		ArtifactPath: modelPath,
+		MetadataPath: metaPath,
+		StoredAt:     meta.DeployedAt,
+	}, nil
+}
+
+// RotateActiveToPrevious copies the current active model from active/ to previous/ via safe replacement.
+func (s *FileSystemModelStore) RotateActiveToPrevious(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	activeModelPath := filepath.Join(s.activeDir, ModelFileName)
+	activeMetaPath := filepath.Join(s.activeDir, MetadataFileName)
+
+	if _, err := os.Stat(activeModelPath); os.IsNotExist(err) {
+		return nil // No active model to rotate
+	}
+
+	modelData, err := readBoundedFile(activeModelPath, s.maxSizeBytes)
+	if err != nil {
+		return fmt.Errorf("%w: failed to read active model for rotation: %v", ErrReadFailure, err)
+	}
+
+	prevModelPath := filepath.Join(s.previousDir, ModelFileName)
+	tmpPrevModel := filepath.Join(s.previousDir, "model.json.tmp")
+	if err := safeWriteReplace(tmpPrevModel, prevModelPath, modelData); err != nil {
+		return fmt.Errorf("%w: failed to rotate active model to previous: %v", ErrWriteFailure, err)
+	}
+
+	if _, err := os.Stat(activeMetaPath); err == nil {
+		metaData, mErr := readBoundedFile(activeMetaPath, 1024*1024)
+		if mErr == nil {
+			prevMetaPath := filepath.Join(s.previousDir, MetadataFileName)
+			tmpPrevMeta := filepath.Join(s.previousDir, "metadata.json.tmp")
+			_ = safeWriteReplace(tmpPrevMeta, prevMetaPath, metaData)
+		}
+	}
+
+	return nil
+}
+
+// SwapActiveAndPrevious performs a temporary-directory-based safe local swap of model artifacts between active/ and previous/.
+// The implementation protects the logical active/previous model state during normal operation, but crash consistency of filesystem rotation
+// across arbitrary process or machine failures is not formally guaranteed or verified in this phase.
+func (s *FileSystemModelStore) SwapActiveAndPrevious(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	activeModelPath := filepath.Join(s.activeDir, ModelFileName)
+	activeMetaPath := filepath.Join(s.activeDir, MetadataFileName)
+	prevModelPath := filepath.Join(s.previousDir, ModelFileName)
+	prevMetaPath := filepath.Join(s.previousDir, MetadataFileName)
+
+	if _, err := os.Stat(activeModelPath); os.IsNotExist(err) {
+		return ErrNoActiveModel
+	}
+	if _, err := os.Stat(prevModelPath); os.IsNotExist(err) {
+		return ErrNoPreviousModel
+	}
+
+	activeModelData, err := readBoundedFile(activeModelPath, s.maxSizeBytes)
+	if err != nil {
+		return fmt.Errorf("%w: failed to read active model for swap: %v", ErrReadFailure, err)
+	}
+	prevModelData, err := readBoundedFile(prevModelPath, s.maxSizeBytes)
+	if err != nil {
+		return fmt.Errorf("%w: failed to read previous model for swap: %v", ErrReadFailure, err)
+	}
+
+	var activeMetaData, prevMetaData []byte
+	if _, err := os.Stat(activeMetaPath); err == nil {
+		activeMetaData, _ = readBoundedFile(activeMetaPath, 1024*1024)
+	}
+	if _, err := os.Stat(prevMetaPath); err == nil {
+		prevMetaData, _ = readBoundedFile(prevMetaPath, 1024*1024)
+	}
+
+	// Write previous data into active/
+	tmpActiveModel := filepath.Join(s.activeDir, "model.json.tmp")
+	if err := safeWriteReplace(tmpActiveModel, activeModelPath, prevModelData); err != nil {
+		return fmt.Errorf("%w: failed to write previous model into active: %v", ErrWriteFailure, err)
+	}
+	if len(prevMetaData) > 0 {
+		tmpActiveMeta := filepath.Join(s.activeDir, "metadata.json.tmp")
+		_ = safeWriteReplace(tmpActiveMeta, activeMetaPath, prevMetaData)
+	}
+
+	// Write active data into previous/
+	tmpPrevModel := filepath.Join(s.previousDir, "model.json.tmp")
+	if err := safeWriteReplace(tmpPrevModel, prevModelPath, activeModelData); err != nil {
+		return fmt.Errorf("%w: failed to write active model into previous: %v", ErrWriteFailure, err)
+	}
+	if len(activeMetaData) > 0 {
+		tmpPrevMeta := filepath.Join(s.previousDir, "metadata.json.tmp")
+		_ = safeWriteReplace(tmpPrevMeta, prevMetaPath, activeMetaData)
+	}
+
+	return nil
+}
+
+// ClearPrevious removes any stored previous model artifact and metadata from previous/.
+func (s *FileSystemModelStore) ClearPrevious(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prevModelPath := filepath.Join(s.previousDir, ModelFileName)
+	prevMetaPath := filepath.Join(s.previousDir, MetadataFileName)
+
+	_ = os.Remove(prevModelPath)
+	_ = os.Remove(prevMetaPath)
+	return nil
+}
+
+// readStoredModel reads and deserializes a stored model from a target directory.
+func (s *FileSystemModelStore) readStoredModel(dir string, notFoundErr error) (*StoredModel, error) {
+	modelPath := filepath.Join(dir, ModelFileName)
+	metaPath := filepath.Join(dir, MetadataFileName)
+
+	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+		return nil, notFoundErr
+	}
+
+	data, err := readBoundedFile(modelPath, s.maxSizeBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to read stored model: %v", ErrReadFailure, err)
+	}
+
+	manifest, err := ml.Deserialize(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: corrupted stored model file: %v", ErrValidationFailure, err)
+	}
+
+	var meta *ml.DeploymentMetadata
+	if metaBytes, mErr := readBoundedFile(metaPath, 1024*1024); mErr == nil {
+		var m ml.DeploymentMetadata
+		if jErr := json.Unmarshal(metaBytes, &m); jErr == nil {
+			meta = &m
+		}
+	}
+	if meta == nil {
+		meta = s.buildMetadataFromManifest(manifest, int64(len(data)), nil)
+	}
+
+	return &StoredModel{
+		Manifest:     manifest.Clone(),
+		Metadata:     meta,
+		ArtifactPath: modelPath,
+		MetadataPath: metaPath,
+		StoredAt:     meta.DeployedAt,
+	}, nil
+}
+
 // generateTempStagingPath creates a unique temporary filename within the staging directory.
 func (s *FileSystemModelStore) generateTempStagingPath() string {
 	ctr := atomic.AddUint64(&s.tempCounter, 1)
@@ -500,9 +748,10 @@ func readBoundedFile(path string, maxBytes int64) ([]byte, error) {
 
 // safeWriteReplace writes data to a temporary file, flushes/closes it, removes any existing target
 // file (for Windows filesystem compatibility), and renames the temporary file into the final destination path.
-// This provides temporary-file-based safe replacement against partially written files; crash-atomic
-// transactional replacement across power loss or system crash is not claimed. Crash-consistent
-// activation is not implemented.
+// This provides temporary-file-based safe replacement against partially written files.
+// The implementation protects the logical active/previous model state during normal operation, but crash consistency of filesystem rotation
+// across arbitrary process or machine failures is not formally guaranteed or verified in this phase.
+// Crash-consistent activation is not implemented.
 func safeWriteReplace(tmpPath, finalPath string, data []byte) error {
 	defer func() {
 		_ = os.Remove(tmpPath)

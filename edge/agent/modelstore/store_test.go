@@ -674,3 +674,107 @@ func TestModelStore_WindowsCompatibleFilesystemBehavior(t *testing.T) {
 		t.Fatalf("expected ErrNoCandidateModel after clear, got: %v", err)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// 17. Active and Previous Model Retention and Swap
+// -----------------------------------------------------------------------------
+
+func TestModelStore_ActiveAndPreviousRetentionAndSwap(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := NewFileSystemModelStore(StoreConfig{BaseDir: tmpDir})
+	ctx := context.Background()
+
+	// 17A: Empty store returns appropriate not-found errors
+	_, err := store.GetActive(ctx)
+	if !errors.Is(err, ErrNoActiveModel) {
+		t.Fatalf("expected ErrNoActiveModel on empty store, got: %v", err)
+	}
+	_, err = store.GetPrevious(ctx)
+	if !errors.Is(err, ErrNoPreviousModel) {
+		t.Fatalf("expected ErrNoPreviousModel on empty store, got: %v", err)
+	}
+
+	// 17B: SaveActive writes model to active/
+	m1 := helperBuildValidManifest("model-active-1", "1.0.0", 0.50)
+	stored1, err := store.SaveActive(ctx, m1, nil)
+	if err != nil {
+		t.Fatalf("SaveActive failed: %v", err)
+	}
+	if stored1.Manifest.ModelID != "model-active-1" {
+		t.Fatalf("expected ModelID 'model-active-1', got: %s", stored1.Manifest.ModelID)
+	}
+
+	active1, err := store.GetActive(ctx)
+	if err != nil {
+		t.Fatalf("GetActive failed: %v", err)
+	}
+	if active1.Manifest.ModelID != "model-active-1" {
+		t.Fatalf("GetActive ModelID mismatch: %s", active1.Manifest.ModelID)
+	}
+
+	// 17C: RotateActiveToPrevious moves active to previous
+	if err := store.RotateActiveToPrevious(ctx); err != nil {
+		t.Fatalf("RotateActiveToPrevious failed: %v", err)
+	}
+	prev1, err := store.GetPrevious(ctx)
+	if err != nil {
+		t.Fatalf("GetPrevious failed: %v", err)
+	}
+	if prev1.Manifest.ModelID != "model-active-1" {
+		t.Fatalf("GetPrevious ModelID mismatch: %s", prev1.Manifest.ModelID)
+	}
+
+	// 17D: Save a new model to active/
+	m2 := helperBuildValidManifest("model-active-2", "2.0.0", 0.60)
+	_, err = store.SaveActive(ctx, m2, nil)
+	if err != nil {
+		t.Fatalf("SaveActive m2 failed: %v", err)
+	}
+
+	// Verify active is m2, previous is m1
+	active2, _ := store.GetActive(ctx)
+	if active2.Manifest.ModelID != "model-active-2" {
+		t.Fatalf("active expected model-active-2, got: %s", active2.Manifest.ModelID)
+	}
+	prevAfter, _ := store.GetPrevious(ctx)
+	if prevAfter.Manifest.ModelID != "model-active-1" {
+		t.Fatalf("previous expected model-active-1, got: %s", prevAfter.Manifest.ModelID)
+	}
+
+	// 17E: SwapActiveAndPrevious swaps active and previous on disk
+	if err := store.SwapActiveAndPrevious(ctx); err != nil {
+		t.Fatalf("SwapActiveAndPrevious failed: %v", err)
+	}
+	swappedActive, err := store.GetActive(ctx)
+	if err != nil || swappedActive.Manifest.ModelID != "model-active-1" {
+		t.Fatalf("after swap, active expected model-active-1, got: %v", swappedActive)
+	}
+	swappedPrev, err := store.GetPrevious(ctx)
+	if err != nil || swappedPrev.Manifest.ModelID != "model-active-2" {
+		t.Fatalf("after swap, previous expected model-active-2, got: %v", swappedPrev)
+	}
+
+	// 17F: Repeated Swap returns to original
+	if err := store.SwapActiveAndPrevious(ctx); err != nil {
+		t.Fatalf("second SwapActiveAndPrevious failed: %v", err)
+	}
+	reSwappedActive, _ := store.GetActive(ctx)
+	if reSwappedActive.Manifest.ModelID != "model-active-2" {
+		t.Fatalf("after 2nd swap, active expected model-active-2, got: %s", reSwappedActive.Manifest.ModelID)
+	}
+
+	// 17G: ClearPrevious removes previous model
+	if err := store.ClearPrevious(ctx); err != nil {
+		t.Fatalf("ClearPrevious failed: %v", err)
+	}
+	_, err = store.GetPrevious(ctx)
+	if !errors.Is(err, ErrNoPreviousModel) {
+		t.Fatalf("expected ErrNoPreviousModel after ClearPrevious, got: %v", err)
+	}
+
+	// Swap with missing previous fails with ErrNoPreviousModel
+	err = store.SwapActiveAndPrevious(ctx)
+	if !errors.Is(err, ErrNoPreviousModel) {
+		t.Fatalf("expected ErrNoPreviousModel on swap with missing previous, got: %v", err)
+	}
+}

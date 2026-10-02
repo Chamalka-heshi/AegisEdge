@@ -428,6 +428,8 @@ func TestModelActivation_FailureSafety(t *testing.T) {
 // mockStore allows injecting custom StagedCandidate objects to test activation manager edge cases
 type mockStore struct {
 	candidate *modelstore.StagedCandidate
+	active    *modelstore.StoredModel
+	previous  *modelstore.StoredModel
 	err       error
 }
 
@@ -452,6 +454,65 @@ func (m *mockStore) ClearCandidate(ctx context.Context) error {
 
 func (m *mockStore) StoreDir() string {
 	return "/tmp/mock"
+}
+
+func (m *mockStore) GetActive(ctx context.Context) (*modelstore.StoredModel, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.active == nil {
+		return nil, modelstore.ErrNoActiveModel
+	}
+	return m.active, nil
+}
+
+func (m *mockStore) GetPrevious(ctx context.Context) (*modelstore.StoredModel, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.previous == nil {
+		return nil, modelstore.ErrNoPreviousModel
+	}
+	return m.previous, nil
+}
+
+func (m *mockStore) SaveActive(ctx context.Context, manifest *ml.ModelManifest, metadata *ml.DeploymentMetadata) (*modelstore.StoredModel, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	m.active = &modelstore.StoredModel{
+		Manifest: manifest,
+		Metadata: metadata,
+		StoredAt: time.Now().UTC(),
+	}
+	return m.active, nil
+}
+
+func (m *mockStore) RotateActiveToPrevious(ctx context.Context) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.previous = m.active
+	return nil
+}
+
+func (m *mockStore) SwapActiveAndPrevious(ctx context.Context) error {
+	if m.err != nil {
+		return m.err
+	}
+	if m.active == nil {
+		return modelstore.ErrNoActiveModel
+	}
+	if m.previous == nil {
+		return modelstore.ErrNoPreviousModel
+	}
+	m.active, m.previous = m.previous, m.active
+	return nil
+}
+
+func (m *mockStore) ClearPrevious(ctx context.Context) error {
+	m.previous = nil
+	return nil
 }
 
 func verifyActiveModelUntouched(t *testing.T, mgr Manager, expected *ml.ModelManifest) {
@@ -933,5 +994,527 @@ func TestModelActivation_FailedActivationDuringContinuousInference(t *testing.T)
 	active, _ := mgr.GetActive(ctx)
 	if active.Info.ModelID != "resilient-model" {
 		t.Fatalf("unexpected active model ID: %s", active.Info.ModelID)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 13. Rollback: No Previous Model Returns ErrNoPreviousModel
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_NoPreviousModel(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+
+	initial := helperBuildValidManifest("solo-model", "1.0.0", 0.50)
+	mgr, err := NewManager(ManagerConfig{
+		Store:           store,
+		InitialManifest: initial,
+	})
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Initial status has no previous model
+	status := mgr.Status(ctx)
+	if status.HasPreviousModel {
+		t.Fatal("expected HasPreviousModel=false")
+	}
+
+	// Rollback must fail with ErrNoPreviousModel
+	res, err := mgr.Rollback(ctx)
+	if !errors.Is(err, ErrNoPreviousModel) {
+		t.Fatalf("expected ErrNoPreviousModel, got: %v", err)
+	}
+	if res != nil {
+		t.Fatalf("expected nil result on failure, got: %+v", res)
+	}
+
+	// Active model remains solo-model
+	verifyActiveModelUntouched(t, mgr, initial)
+}
+
+// -----------------------------------------------------------------------------
+// 14. Rollback: Successful State Transition and Active/Previous Swap
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_SuccessAndSwap(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+
+	m1 := helperBuildValidManifest("swap-model", "1.0.0", 0.40)
+	mgr, _ := NewManager(ManagerConfig{Store: store, InitialManifest: m1})
+	ctx := context.Background()
+
+	// Activate Model 2
+	m2 := helperBuildValidManifest("swap-model", "2.0.0", 0.70)
+	_, err := store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, m2)})
+	if err != nil {
+		t.Fatalf("stage m2 failed: %v", err)
+	}
+
+	actRes, err := mgr.Activate(ctx, "")
+	if err != nil || !actRes.Success {
+		t.Fatalf("activate m2 failed: %v", err)
+	}
+
+	// Status before rollback: Active=2.0.0, Previous=1.0.0
+	stBefore := mgr.Status(ctx)
+	if !stBefore.HasPreviousModel || !stBefore.RollbackAvailable {
+		t.Fatalf("expected rollback available, got: %+v", stBefore)
+	}
+	if stBefore.ActiveModel.ModelVersion != "2.0.0" {
+		t.Fatalf("active model version expected 2.0.0, got: %s", stBefore.ActiveModel.ModelVersion)
+	}
+	if stBefore.PreviousModel.ModelVersion != "1.0.0" {
+		t.Fatalf("previous model version expected 1.0.0, got: %s", stBefore.PreviousModel.ModelVersion)
+	}
+
+	// Execute Rollback
+	rbRes, err := mgr.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("rollback failed: %v", err)
+	}
+	if !rbRes.Success || !rbRes.RolledBack {
+		t.Fatalf("expected successful rollback, got: %+v", rbRes)
+	}
+	if rbRes.ActiveModel.ModelVersion != "1.0.0" {
+		t.Fatalf("new active model expected 1.0.0, got: %s", rbRes.ActiveModel.ModelVersion)
+	}
+	if rbRes.PreviousModel == nil || rbRes.PreviousModel.ModelVersion != "2.0.0" {
+		t.Fatalf("previous model expected 2.0.0 after rollback, got: %+v", rbRes.PreviousModel)
+	}
+
+	// Verify runtime detector dynamically points to 1.0.0
+	det := mgr.RuntimeDetector()
+	if det.Version() != "1.0.0" {
+		t.Fatalf("runtime detector expected version 1.0.0, got: %s", det.Version())
+	}
+
+	// Verify GetPrevious returns 2.0.0 snapshot
+	prevSnap, err := mgr.GetPrevious(ctx)
+	if err != nil {
+		t.Fatalf("GetPrevious failed: %v", err)
+	}
+	if prevSnap.Info.ModelVersion != "2.0.0" {
+		t.Fatalf("GetPrevious snapshot expected 2.0.0, got: %s", prevSnap.Info.ModelVersion)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 15. Rollback: Repeated Valid Swaps (A -> B -> A -> B)
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_RepeatedSwaps(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+
+	mA := helperBuildValidManifest("multi-swap", "1.0.0", 0.50)
+	mgr, _ := NewManager(ManagerConfig{Store: store, InitialManifest: mA})
+	ctx := context.Background()
+
+	mB := helperBuildValidManifest("multi-swap", "2.0.0", 0.60)
+	_, _ = store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, mB)})
+	_, _ = mgr.Activate(ctx, "")
+
+	// 1st Rollback: B -> A
+	r1, err := mgr.Rollback(ctx)
+	if err != nil || !r1.Success || r1.ActiveModel.ModelVersion != "1.0.0" {
+		t.Fatalf("rollback 1 failed: %v, %+v", err, r1)
+	}
+
+	// 2nd Rollback: A -> B
+	r2, err := mgr.Rollback(ctx)
+	if err != nil || !r2.Success || r2.ActiveModel.ModelVersion != "2.0.0" {
+		t.Fatalf("rollback 2 failed: %v, %+v", err, r2)
+	}
+
+	// 3rd Rollback: B -> A
+	r3, err := mgr.Rollback(ctx)
+	if err != nil || !r3.Success || r3.ActiveModel.ModelVersion != "1.0.0" {
+		t.Fatalf("rollback 3 failed: %v, %+v", err, r3)
+	}
+
+	if mgr.RuntimeDetector().Version() != "1.0.0" {
+		t.Fatalf("detector version expected 1.0.0, got: %s", mgr.RuntimeDetector().Version())
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 16. Rollback: Previous Artifact Missing on Storage
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_ArtifactMissingOnStorage(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+
+	m1 := helperBuildValidManifest("missing-art", "1.0.0", 0.50)
+	mgr, _ := NewManager(ManagerConfig{Store: store, InitialManifest: m1})
+	ctx := context.Background()
+
+	m2 := helperBuildValidManifest("missing-art", "2.0.0", 0.60)
+	_, _ = store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, m2)})
+	_, _ = mgr.Activate(ctx, "")
+
+	// Now delete previous model from disk and clear in-memory manifest to simulate missing storage
+	_ = store.ClearPrevious(ctx)
+	mgr.previous.Manifest = nil // force disk read failure
+
+	// Rollback must fail with ErrPreviousModelUnavailable
+	_, err := mgr.Rollback(ctx)
+	if !errors.Is(err, ErrPreviousModelUnavailable) {
+		t.Fatalf("expected ErrPreviousModelUnavailable, got: %v", err)
+	}
+
+	// Active model MUST remain 2.0.0
+	active, _ := mgr.GetActive(ctx)
+	if active.Info.ModelVersion != "2.0.0" {
+		t.Fatalf("active model was modified! expected 2.0.0, got: %s", active.Info.ModelVersion)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 17. Rollback: Failure Pipeline Comprehensive (Active Untouched)
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_FailurePipeline(t *testing.T) {
+	activeManifest := helperBuildValidManifest("active-guardian", "2.0.0", 0.60)
+
+	testCases := []struct {
+		name          string
+		setupPrev     func() *ml.ModelManifest
+		setupMeta     func() *ml.DeploymentMetadata
+		expectedError error
+	}{
+		{
+			name: "previous missing checksum",
+			setupPrev: func() *ml.ModelManifest {
+				m := helperBuildValidManifest("active-guardian", "1.0.0", 0.50)
+				m.ChecksumSHA256 = ""
+				return m
+			},
+			expectedError: ErrPreviousModelInvalid,
+		},
+		{
+			name: "previous checksum mismatch",
+			setupPrev: func() *ml.ModelManifest {
+				m := helperBuildValidManifest("active-guardian", "1.0.0", 0.50)
+				m.ChecksumSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+				return m
+			},
+			expectedError: ErrPreviousModelInvalid,
+		},
+		{
+			name: "previous negative threshold",
+			setupPrev: func() *ml.ModelManifest {
+				m := helperBuildValidManifest("active-guardian", "1.0.0", -0.50)
+				sum, _ := m.ComputeChecksum()
+				m.ChecksumSHA256 = sum
+				return m
+			},
+			expectedError: ErrPreviousModelInvalid,
+		},
+		{
+			name: "previous status DISABLED",
+			setupPrev: func() *ml.ModelManifest {
+				m := helperBuildValidManifest("active-guardian", "1.0.0", 0.50)
+				m.Status = ml.ModelStatusDisabled
+				sum, _ := m.ComputeChecksum()
+				m.ChecksumSHA256 = sum
+				return m
+			},
+			expectedError: ErrPreviousModelInvalid,
+		},
+		{
+			name: "previous incompatible artifact format",
+			setupPrev: func() *ml.ModelManifest {
+				m := helperBuildValidManifest("active-guardian", "1.0.0", 0.50)
+				m.ArtifactFormatVersion = "aegisedge.model.v99"
+				sum, _ := m.ComputeChecksum()
+				m.ChecksumSHA256 = sum
+				return m
+			},
+			expectedError: ErrPreviousModelIncompatible,
+		},
+		{
+			name: "previous metadata digest mismatch",
+			setupPrev: func() *ml.ModelManifest {
+				return helperBuildValidManifest("active-guardian", "1.0.0", 0.50)
+			},
+			setupMeta: func() *ml.DeploymentMetadata {
+				return &ml.DeploymentMetadata{
+					DeploymentID:   "dep-bad-meta",
+					ModelID:        "active-guardian",
+					ModelVersion:   "1.0.0",
+					ChecksumSHA256: "bad_checksum",
+					DeployedAt:     time.Now().UTC(),
+				}
+			},
+			expectedError: ErrPreviousModelInvalid,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			prevManifest := tc.setupPrev()
+			var prevMeta *ml.DeploymentMetadata
+			if tc.setupMeta != nil {
+				prevMeta = tc.setupMeta()
+			}
+
+			mock := &mockStore{
+				active: &modelstore.StoredModel{
+					Manifest: activeManifest,
+					StoredAt: time.Now().UTC(),
+				},
+				previous: &modelstore.StoredModel{
+					Manifest: prevManifest,
+					Metadata: prevMeta,
+					StoredAt: time.Now().UTC(),
+				},
+			}
+
+			mgr, err := NewManager(ManagerConfig{
+				Store:           mock,
+				InitialManifest: activeManifest,
+			})
+			if err != nil {
+				t.Fatalf("NewManager failed: %v", err)
+			}
+
+			// In-memory previous snapshot matches test previous
+			mgr.previous = &PreviousModelSnapshot{
+				Info:       buildModelInfo(prevManifest),
+				Metadata:   prevMeta,
+				RetainedAt: time.Now().UTC(),
+				Manifest:   prevManifest,
+			}
+
+			// Attempt rollback
+			_, rbErr := mgr.Rollback(context.Background())
+			if rbErr == nil {
+				t.Fatal("expected rollback failure, got nil")
+			}
+			if !errors.Is(rbErr, tc.expectedError) {
+				t.Fatalf("expected error %v, got %v", tc.expectedError, rbErr)
+			}
+
+			// Active model MUST remain completely untouched!
+			verifyActiveModelUntouched(t, mgr, activeManifest)
+
+			// Runtime detector continues serving inference with active model
+			det := mgr.RuntimeDetector()
+			if det.Version() != "2.0.0" {
+				t.Fatalf("detector version changed: %s", det.Version())
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 18. Rollback: Restart Recovery from Local Storage
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_RestartRecovery(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+	ctx := context.Background()
+
+	// Agent 1: starts with v1, activates v2
+	m1 := helperBuildValidManifest("restart-model", "1.0.0", 0.50)
+	mgr1, _ := NewManager(ManagerConfig{Store: store, InitialManifest: m1})
+
+	m2 := helperBuildValidManifest("restart-model", "2.0.0", 0.60)
+	_, _ = store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, m2)})
+	_, _ = mgr1.Activate(ctx, "")
+
+	// "Simulate agent restart" by initializing a new manager against the same store with InitialManifest: nil
+	mgr2, err := NewManager(ManagerConfig{Store: store, InitialManifest: nil})
+	if err != nil {
+		t.Fatalf("mgr2 NewManager restart recovery failed: %v", err)
+	}
+
+	st := mgr2.Status(ctx)
+	if !st.HasActiveModel || st.ActiveModel.ModelVersion != "2.0.0" {
+		t.Fatalf("mgr2 active model expected 2.0.0, got: %+v", st.ActiveModel)
+	}
+	if !st.HasPreviousModel || !st.RollbackAvailable || st.PreviousModel.ModelVersion != "1.0.0" {
+		t.Fatalf("mgr2 previous model expected 1.0.0, got: %+v", st.PreviousModel)
+	}
+
+	// Executing rollback on recovered agent returns to 1.0.0
+	rbRes, err := mgr2.Rollback(ctx)
+	if err != nil || !rbRes.Success || rbRes.ActiveModel.ModelVersion != "1.0.0" {
+		t.Fatalf("mgr2 rollback failed: %v, %+v", err, rbRes)
+	}
+
+	if mgr2.RuntimeDetector().Version() != "1.0.0" {
+		t.Fatalf("runtime detector expected 1.0.0, got: %s", mgr2.RuntimeDetector().Version())
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 19. Rollback: Activation After Rollback & Rollback After Activation
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_ActivationLifecycleInterleaving(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+	ctx := context.Background()
+
+	// Initial: v1 active
+	m1 := helperBuildValidManifest("interleave", "1.0.0", 0.50)
+	mgr, _ := NewManager(ManagerConfig{Store: store, InitialManifest: m1})
+
+	// Activate v2 -> Active: v2, Previous: v1
+	m2 := helperBuildValidManifest("interleave", "2.0.0", 0.60)
+	_, _ = store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, m2)})
+	_, _ = mgr.Activate(ctx, "")
+
+	// Rollback -> Active: v1, Previous: v2
+	rb, err := mgr.Rollback(ctx)
+	if err != nil || rb.ActiveModel.ModelVersion != "1.0.0" {
+		t.Fatalf("rollback to v1 failed: %v", err)
+	}
+
+	// Stage and Activate v3 -> Active: v3, Previous: v1
+	m3 := helperBuildValidManifest("interleave", "3.0.0", 0.70)
+	_, _ = store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, m3)})
+	act, err := mgr.Activate(ctx, "")
+	if err != nil || act.ModelVersion != "3.0.0" {
+		t.Fatalf("activate v3 failed: %v", err)
+	}
+
+	// Rollback -> Active: v1, Previous: v3
+	rb2, err := mgr.Rollback(ctx)
+	if err != nil || rb2.ActiveModel.ModelVersion != "1.0.0" {
+		t.Fatalf("rollback to v1 after v3 failed: %v", err)
+	}
+	if rb2.PreviousModel.ModelVersion != "3.0.0" {
+		t.Fatalf("previous model expected 3.0.0, got: %s", rb2.PreviousModel.ModelVersion)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 20. Concurrency: Continuous Inference During Dynamic Rollback
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_ConcurrentInference(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+	ctx := context.Background()
+
+	m1 := helperBuildValidManifest("conc-rb", "1.0.0", 0.50)
+	mgr, _ := NewManager(ManagerConfig{Store: store, InitialManifest: m1})
+
+	m2 := helperBuildValidManifest("conc-rb", "2.0.0", 0.60)
+	_, _ = store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, m2)})
+	_, _ = mgr.Activate(ctx, "")
+
+	det := mgr.RuntimeDetector()
+	testVector := []float64{50.0, 60.0, 40.0, 50.0}
+
+	const numReaders = 8
+	const readerOps = 400
+	var wg sync.WaitGroup
+	var readErrors atomic.Int64
+	var successfulReads atomic.Int64
+
+	stopCh := make(chan struct{})
+
+	// Continuous readers
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < readerOps; j++ {
+				select {
+				case <-stopCh:
+					return
+				default:
+				}
+				score, normScore, err := det.ComputeAnomalyScore(testVector)
+				if err != nil {
+					readErrors.Add(1)
+				} else if score > 0 && normScore > 0 {
+					successfulReads.Add(1)
+				}
+				time.Sleep(100 * time.Microsecond)
+			}
+		}()
+	}
+
+	// Trigger 4 back-and-forth rollbacks concurrently
+	for r := 0; r < 4; r++ {
+		time.Sleep(5 * time.Millisecond)
+		res, err := mgr.Rollback(ctx)
+		if err != nil || !res.Success {
+			t.Fatalf("concurrent rollback %d failed: %v", r, err)
+		}
+	}
+
+	wg.Wait()
+	close(stopCh)
+
+	if errs := readErrors.Load(); errs > 0 {
+		t.Fatalf("encountered %d inference errors during concurrent rollbacks", errs)
+	}
+	if reads := successfulReads.Load(); reads == 0 {
+		t.Fatal("expected positive number of successful inference evaluations")
+	}
+
+	// Final active model after 4 rollbacks (even number) returns to 2.0.0
+	active, _ := mgr.GetActive(ctx)
+	if active.Info.ModelVersion != "2.0.0" {
+		t.Fatalf("expected final active version 2.0.0, got: %s", active.Info.ModelVersion)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 21. Concurrency: Simultaneous Rollback Requests
+// -----------------------------------------------------------------------------
+
+func TestModelActivation_Rollback_SimultaneousRequests(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := modelstore.NewFileSystemModelStore(modelstore.StoreConfig{BaseDir: tmpDir})
+	ctx := context.Background()
+
+	m1 := helperBuildValidManifest("sim-rb", "1.0.0", 0.50)
+	mgr, _ := NewManager(ManagerConfig{Store: store, InitialManifest: m1})
+
+	m2 := helperBuildValidManifest("sim-rb", "2.0.0", 0.60)
+	_, _ = store.StageModel(ctx, modelstore.StageRequest{Artifact: helperSerializeManifest(t, m2)})
+	_, _ = mgr.Activate(ctx, "")
+
+	const callers = 10
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	results := make([]*RollbackResult, callers)
+
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx], errs[idx] = mgr.Rollback(ctx)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Every caller must execute cleanly without panic or corruption
+	for i := 0; i < callers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("caller %d failed: %v", i, errs[i])
+		}
+		if results[i] == nil || !results[i].Success {
+			t.Fatalf("caller %d result not successful: %+v", i, results[i])
+		}
+	}
+
+	// Final state is coherent
+	status := mgr.Status(ctx)
+	if !status.HasActiveModel || !status.HasPreviousModel {
+		t.Fatalf("incoherent status after simultaneous rollbacks: %+v", status)
 	}
 }

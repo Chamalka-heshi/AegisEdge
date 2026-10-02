@@ -100,3 +100,50 @@ func TestAllowlist_DangerousPayloadDetection(t *testing.T) {
 		}
 	}
 }
+
+// TEST: Target validation
+func TestAllowlist_TargetValidation(t *testing.T) {
+	validTargets := []string{
+		"telemetry_generator",
+		"collector",
+		"local_syslog",
+		"upstream_sync",
+		"node-local",
+		"service:collector",
+		"subsystem:telemetry",
+		"worker-01",
+	}
+
+	for _, target := range validTargets {
+		if !response.IsValidTarget(target) {
+			t.Errorf("expected target %q to be valid, got false", target)
+		}
+	}
+
+	invalidTargets := []string{
+		"",
+		" ",
+		"target with spaces",
+		"worker; rm -rf /",
+		"worker | cat",
+		"bash",
+		"sh",
+		"powershell",
+		"cmd",
+		"kill",
+		"rm",
+		"/bin/sh",
+		"target/slash",
+		"target\\backslash",
+		"target`exec`",
+		"target$(whoami)",
+		"target@host",
+		"very_long_target_name_exceeding_the_conservative_length_limit_of_sixty_four_characters_in_total_length",
+	}
+
+	for _, target := range invalidTargets {
+		if response.IsValidTarget(target) {
+			t.Errorf("expected target %q to be invalid, got true", target)
+		}
+	}
+}
