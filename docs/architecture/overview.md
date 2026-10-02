@@ -322,7 +322,7 @@ flowchart TD
    * Synchronization workers (HTTP client or NATS publisher) pull persisted `PENDING` batches asynchronously from SQLite.
    * Synchronization is completely decoupled from detection results; anomalous batches are synchronized identically to nominal batches.
 5. **Local & Process-Local Lifecycle**:
-   * Anomaly detection is 100% offline with zero cloud, NATS, or HTTP dependencies.
+   * Anomaly detection is offline with zero cloud, NATS, or HTTP dependencies.
    * The detector is instantiated once per agent process lifetime, maintaining in-memory hysteresis state partitioned by `NodeID:MetricName`.
    * Detector state is process-local; upon agent restart, the detector initializes fresh following cold-start semantics without altering SQLite WAL telemetry persistence.
 6. **Anomaly $\neq$ Incident**:
@@ -434,7 +434,7 @@ flowchart TD
 
 ## 13. Safe Autonomous Response & Remediation Architecture (Phase 6.1 — Design Only)
 
-Phase 6.1 establishes the architecture and safety model for autonomous, edge-local incident response ([ADR-0012](../decisions/ADR-0012-safe-autonomous-response.md)).
+Phase 6.1 establishes the architecture and safety model for autonomous, edge-local incident response ([ADR-0012](../decisions/ADR-0012-autonomous-incident-response.md)).
 
 ```mermaid
 flowchart TD
@@ -465,21 +465,23 @@ flowchart TD
 | **Deterministic Threshold Anomaly Detection** | **CURRENTLY IMPLEMENTED** | Phase 5.1–5.3 |
 | **Rolling Statistical Anomaly Detection** | **CURRENTLY IMPLEMENTED** | Phase 5.4 |
 | **Local Incident Correlation ($M$-of-$N$)** | **CURRENTLY IMPLEMENTED** | Phase 5.4 |
-| **Durable Incident Persistence & Restart Recovery** | **CURRENTLY IMPLEMENTED** | Phase 5.5 |
 | **Pure-Go Isolation Forest Inference Engine** | **CURRENTLY IMPLEMENTED** | Phase 5.5B |
 | **Offline Model Training Tooling CLI** | **CURRENTLY IMPLEMENTED** | Phase 5.5C |
 | **ML Model Shared Contracts & Validation** | **CURRENTLY IMPLEMENTED** | Phase 5.6A |
 | **Edge Local Model Store & Candidate Staging** | **CURRENTLY IMPLEMENTED** | Phase 5.6B |
 | **Edge ML Model Activation & Runtime Switching** | **CURRENTLY IMPLEMENTED** | Phase 5.6C |
+| **Edge ML Model Rollback & Recovery** | **CURRENTLY IMPLEMENTED** | Phase 5.6D |
+| **Autonomous Incident Response Architecture** | *DESIGNED* | Phase 6.1 (ADR-0012 Design Only) |
 | **ML Model Distribution Transport & Registry** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
-| **Deterministic Response Policy Engine** | *DESIGNED (Future Implementation)* | Phase 6.2 |
-| **Fail-Closed Safety Validator** | *DESIGNED (Future Implementation)* | Phase 6.2 |
+| **Deterministic Response Policy Engine** | **CURRENTLY IMPLEMENTED** | Phase 6.2 (`edge/agent/response/policy.go`) |
+| **Fail-Closed Safety Validator** | **CURRENTLY IMPLEMENTED** | Phase 6.2 (`edge/agent/response/validator.go`) |
 | **Simulated Action Executor & Dry-Run Mode** | *DESIGNED (Future Implementation)* | Phase 6.3 |
 | **Durable Mitigation Persistence (Migration v4)** | *DESIGNED (Future Implementation)* | Phase 6.4 |
 | **Controlled Host Actuators & Operator Approval** | *DESIGNED (Future Implementation)* | Phase 6.5 |
+| **Automated Telemetry Verification Engine** | *DESIGNED (Future Implementation)* | Phase 6.5 |
 
 ### Core Safety Invariant:
-$$\textbf{INCIDENT} \longrightarrow \textbf{RESPONSE POLICY} \longrightarrow \textbf{SAFETY VALIDATION} \longrightarrow \textbf{ALLOWLISTED ACTION} \longrightarrow \textbf{DRY-RUN / SIMULATION} \longrightarrow \textbf{EXECUTION} \longrightarrow \textbf{RESULT} \longrightarrow \textbf{AUDIT}$$
+$$\textbf{INCIDENT [IMPLEMENTED]} \longrightarrow \textbf{RESPONSE POLICY [DESIGNED]} \longrightarrow \textbf{SAFETY VALIDATION [DESIGNED]} \longrightarrow \textbf{DRY-RUN / SIMULATION [DESIGNED]} \longrightarrow \textbf{OPERATOR APPROVAL [DESIGNED]} \longrightarrow \textbf{CONTROLLED ACTION EXECUTION [DESIGNED]} \longrightarrow \textbf{VERIFY RESULT [DESIGNED]} \longrightarrow \textbf{UPDATE INCIDENT [DESIGNED]} \longrightarrow \textbf{RECORD AUDIT EVENT [DESIGNED]}$$
 
 1. **Zero Arbitrary Execution**: The system must **NEVER** execute arbitrary shell commands (`/bin/sh`, `powershell.exe`) or AI-generated raw command strings.
 2. **Typed Allowlisted Actions Only**: Only compile-time typed actions (`SIMULATED_THROTTLE`, `SIMULATED_RESTART`, `SIMULATED_ISOLATE`, `SIMULATED_ALERT`) can be executed.
@@ -490,12 +492,14 @@ $$\textbf{INCIDENT} \longrightarrow \textbf{RESPONSE POLICY} \longrightarrow \te
 5. **Ambiguous State Safety**: If an action times out or the process crashes during execution, execution cancellation is requested where supported. If execution state cannot be confirmed, the action enters `UNKNOWN_RECONCILIATION_REQUIRED` (an action execution state, not an `IncidentStatus`) and the driving incident transitions to `IncidentStatus = ESCALATED`. The system **never blindly retries** an ambiguous execution. Future actuator-specific reconciliation will determine whether the action executed successfully.
 6. **Strict Pipeline Isolation**: A failure in response policy, safety validation, or actuation can never roll back or corrupt committed telemetry batches or incident records. Upstream synchronization proceeds unaffected.
 7. **Offline Autonomy**: All response evaluation, validation, and simulated actuation execute entirely locally without cloud, internet, control plane, or external dependencies.
+8. **Verification Requirement**: Actuator completion (exit code 0) does not prove that an incident is resolved. Telemetry conditions must be observed post-execution to verify that the anomalous metric returned within nominal bounds.
+9. **Strict AI / ML Segregation**: Machine learning produces mathematical observations (anomaly score, signal, evidence) but has zero direct execution authority over host commands, action types, or filesystem operations.
 
 ---
 
 ## 14. ML Model Lifecycle: Staging, Activation & Rollback Architecture
 
-Phase 5.5D established the architecture and invariants, Phase 5.6A extracted shared contracts (`shared/ml`), Phase 5.6B implemented edge candidate staging (`edge/agent/modelstore`), and Phase 5.6C implements runtime activation and switching (`edge/agent/modelactivation`) ([ADR-0009 §31](../decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
+Phase 5.5D established the architecture and invariants, Phase 5.6A extracted shared contracts (`shared/ml`), Phase 5.6B implemented edge candidate staging (`edge/agent/modelstore`), Phase 5.6C implemented runtime activation and switching (`edge/agent/modelactivation`), and Phase 5.6D implements edge-side model rollback and recovery (`edge/agent/modelactivation.Manager.Rollback`) ([ADR-0009 §31](../decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
 
 ```mermaid
 flowchart TD
@@ -510,8 +514,9 @@ flowchart TD
         VER --> STAGE["Staging Sandbox\n(edge/agent/modelstore) [IMPLEMENTED]"]
         STAGE --> ACT["Activation Manager\n(edge/agent/modelactivation) [IMPLEMENTED]"]
         ACT --> INF["Local Inference Runtime\n(MLDetector Engine) [IMPLEMENTED]"]
-        ACT --> PREV["Previous Model Retention\n(ModelInfo metadata) [IMPLEMENTED]"]
-        PREV -. "Autonomous Rollback Engine" .-> ACT
+        ACT --> PREV["Previous Model Retention\n(modelstore previous/ & snapshot) [IMPLEMENTED]"]
+        ACT -- "Explicit Rollback\n(Manager.Rollback) [IMPLEMENTED]" --> PREV
+        PREV -. "Autonomous Rollback Policy Engine" .-> ACT
     end
 ```
 
@@ -526,12 +531,12 @@ flowchart TD
 4. **Offline Autonomy Invariant**:
    $$\textbf{CONTROL PLANE OFFLINE } \longrightarrow \textbf{ ACTIVE MODEL REMAINS ACTIVE } \longrightarrow \textbf{ LOCAL DETECTION CONTINUES}$$
    If the control plane, registry, or network is unavailable, the edge agent continues anomaly detection using its currently validated active model, subject to local hardware, storage, and runtime availability.
-5. **Runtime Activation Architecture (Phase 5.6C Implemented)**:
-   * **In-Memory**: Concurrency-safe runtime model switching is implemented via `sync.RWMutex` protecting active model pointer swaps and dynamic `RuntimeDetector` dispatching. Read-path inference executes concurrently without blocking other readers. Multiple activation attempts are serialized via `sync.Mutex`.
-   * **Failure Safety**: If activation validation or runtime model construction fails, the existing active model remains unchanged and continues to serve subsequent inference requests.
-   * **Filesystem Durability & Rollback (Future Work)**: Crash-consistent filesystem activation transactions and autonomous rollback engines are designed for future implementation phases.
-6. **Previous Model Tracking (Phase 5.6C Implemented)**:
-   The activation manager preserves immutable metadata (`ModelInfo`) of the superseded active model, enabling point-in-time status reporting and future rollback targeting.
+5. **Runtime Activation & Rollback Architecture (Phase 5.6C & 5.6D Implemented)**:
+   * **In-Memory**: Concurrency-safe runtime model switching is implemented via `sync.RWMutex` protecting active model pointer swaps and dynamic `RuntimeDetector` dispatching. Multiple goroutines can obtain the current detector concurrently through the existing read-lock path; inference calculation occurs after the detector reference has been acquired. Multiple activation and rollback attempts are serialized via sync.Mutex.
+   * **Failure Safety**: If activation validation, rollback validation, or runtime model construction fails, the existing active model remains unchanged and continues to serve subsequent inference requests.
+   * **Filesystem Durability & Rollback (Phase 5.6D Implemented)**: The local model store retains active and previous model artifacts in ctive/ and previous/ directories using temporary-directory-based safe local swap. Explicit rollback validates the previous model artifact, constructs a new runtime detector, performs safe local filesystem rotation between active and previous states, and updates the in-memory detector under sync.RWMutex. The implementation protects the logical active/previous model state during normal operation, but crash consistency of filesystem rotation across arbitrary process or machine failures is not formally guaranteed or verified in this phase. Automated drift/panic-based rollback policies are designed for future implementation phases.
+6. **Previous Model Retention & Rollback (Phase 5.6D Implemented)**:
+   The activation manager and model store retain the complete artifact and metadata of the superseded active model in `previous/`. Explicit invocation of `Rollback(ctx)` performs full pre-promotion validation before performing safe local filesystem rotation between active and previous states, supporting repeated valid back-and-forth rollbacks ($A \leftrightarrow B$).
 7. **Integrity vs. Authenticity**:
    The current SHA-256 checksum strictly guarantees file integrity against corruption, bit-rot, and truncation. SHA-256 alone does NOT provide origin authentication, non-repudiation, publisher identity, or replay/downgrade protection. Cryptographic authenticity via asymmetric signatures (e.g. Ed25519) is strictly future design.
 8. **Potential Future Degradation Hierarchy**:
