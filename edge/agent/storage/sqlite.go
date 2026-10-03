@@ -203,6 +203,81 @@ func (s *SQLiteStore) runMigrations() error {
 		}
 	}
 
+	// 6. Migration v4: mitigation_records table and indexes for durable response persistence
+	if currentVersion < 4 {
+		createMitigationTable := `
+		CREATE TABLE IF NOT EXISTS mitigation_records (
+			action_id TEXT PRIMARY KEY,
+			decision_id TEXT NOT NULL UNIQUE,
+			incident_id TEXT NOT NULL,
+			node_id TEXT NOT NULL,
+			action_type TEXT NOT NULL,
+			target TEXT NOT NULL,
+			status TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			message TEXT NOT NULL,
+			error_code TEXT,
+			parameters TEXT,
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			simulated INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_mitigation_records_incident_id ON mitigation_records(incident_id);
+		CREATE INDEX IF NOT EXISTS idx_mitigation_records_node_id ON mitigation_records(node_id);
+		CREATE INDEX IF NOT EXISTS idx_mitigation_records_status ON mitigation_records(status);
+		`
+		if _, err := tx.ExecContext(ctx, createMitigationTable); err != nil {
+			return fmt.Errorf("migration v4 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v4: %w", err)
+		}
+	}
+
+	// 7. Migration v5: approval_records table and indexes for operator approval boundary (Phase 6.5)
+	if currentVersion < 5 {
+		createApprovalTable := `
+		CREATE TABLE IF NOT EXISTS approval_records (
+			approval_id TEXT PRIMARY KEY,
+			decision_id TEXT NOT NULL UNIQUE,
+			incident_id TEXT NOT NULL,
+			action_id TEXT NOT NULL,
+			node_id TEXT NOT NULL,
+			action_type TEXT NOT NULL,
+			target TEXT NOT NULL,
+			policy_version TEXT NOT NULL,
+			decision_fingerprint TEXT NOT NULL,
+			status TEXT NOT NULL,
+			requested_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			requested_by TEXT NOT NULL,
+			approved_by TEXT NOT NULL DEFAULT '',
+			rejected_by TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			consumed_at TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_approval_records_incident ON approval_records(incident_id);
+		CREATE INDEX IF NOT EXISTS idx_approval_records_node ON approval_records(node_id);
+		CREATE INDEX IF NOT EXISTS idx_approval_records_status ON approval_records(status);
+		CREATE INDEX IF NOT EXISTS idx_approval_records_action ON approval_records(action_id);
+		`
+		if _, err := tx.ExecContext(ctx, createApprovalTable); err != nil {
+			return fmt.Errorf("migration v5 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v5: %w", err)
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -1208,4 +1283,1099 @@ func parseDBTime(str string) (time.Time, error) {
 		return t, nil
 	}
 	return time.Parse(time.RFC3339, str)
+}
+
+func formatDBTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+// Ensure SQLiteStore implements MitigationStore and ApprovalStore.
+var (
+	_ MitigationStore = (*SQLiteStore)(nil)
+	_ ApprovalStore   = (*SQLiteStore)(nil)
+)
+
+// RecordMitigation transactionally validates and persists a mitigation record.
+// Returns ErrDuplicateMitigation if action_id or decision_id already exists.
+func (s *SQLiteStore) RecordMitigation(ctx context.Context, m *StoredMitigation) error {
+	if m == nil {
+		return ErrInvalidMitigation
+	}
+	if err := m.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	// Duplicate check on action_id or decision_id
+	var exists int
+	checkQuery := `SELECT 1 FROM mitigation_records WHERE action_id = ? OR decision_id = ? LIMIT 1;`
+	err = tx.QueryRowContext(ctx, checkQuery, m.ActionID, m.DecisionID).Scan(&exists)
+	if err == nil {
+		return ErrDuplicateMitigation
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check mitigation existence: %w", err)
+	}
+
+	var paramsJSON sql.NullString
+	if len(m.Parameters) > 0 {
+		b, err := json.Marshal(m.Parameters)
+		if err != nil {
+			return fmt.Errorf("failed to marshal parameters: %w", err)
+		}
+		paramsJSON = sql.NullString{String: string(b), Valid: true}
+	}
+
+	var completedStr sql.NullString
+	if m.CompletedAt != nil {
+		completedStr = sql.NullString{
+			String: m.CompletedAt.UTC().Format(time.RFC3339Nano),
+			Valid:  true,
+		}
+	}
+
+	var errCodeStr sql.NullString
+	if m.ErrorCode != "" {
+		errCodeStr = sql.NullString{String: m.ErrorCode, Valid: true}
+	}
+
+	now := time.Now().UTC()
+	createdAt := m.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	updatedAt := m.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+
+	simulatedInt := 0
+	if m.Simulated {
+		simulatedInt = 1
+	}
+
+	insertSQL := `
+	INSERT INTO mitigation_records (
+		action_id, decision_id, incident_id, node_id, action_type,
+		target, status, mode, message, error_code, parameters,
+		started_at, completed_at, duration_ms, simulated, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	`
+	_, err = tx.ExecContext(ctx, insertSQL,
+		m.ActionID,
+		m.DecisionID,
+		m.IncidentID,
+		m.NodeID,
+		string(m.ActionType),
+		m.Target,
+		string(m.Status),
+		m.Mode,
+		m.Message,
+		errCodeStr,
+		paramsJSON,
+		m.StartedAt.UTC().Format(time.RFC3339Nano),
+		completedStr,
+		m.DurationMs,
+		simulatedInt,
+		createdAt.Format(time.RFC3339Nano),
+		updatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "constraint failed") {
+			return ErrDuplicateMitigation
+		}
+		return fmt.Errorf("failed to insert mitigation record: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// GetMitigation retrieves a mitigation record by its unique ActionID.
+func (s *SQLiteStore) GetMitigation(ctx context.Context, actionID string) (*StoredMitigation, error) {
+	if strings.TrimSpace(actionID) == "" {
+		return nil, errors.New("action_id cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+	SELECT action_id, decision_id, incident_id, node_id, action_type,
+	       target, status, mode, message, error_code, parameters,
+	       started_at, completed_at, duration_ms, simulated, created_at, updated_at
+	FROM mitigation_records
+	WHERE action_id = ?
+	LIMIT 1;
+	`
+	row := s.db.QueryRowContext(ctx, query, actionID)
+	m, err := scanMitigation(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrMitigationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// GetMitigationByDecisionID retrieves a mitigation record by its deterministic DecisionID.
+func (s *SQLiteStore) GetMitigationByDecisionID(ctx context.Context, decisionID string) (*StoredMitigation, error) {
+	if strings.TrimSpace(decisionID) == "" {
+		return nil, errors.New("decision_id cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+	SELECT action_id, decision_id, incident_id, node_id, action_type,
+	       target, status, mode, message, error_code, parameters,
+	       started_at, completed_at, duration_ms, simulated, created_at, updated_at
+	FROM mitigation_records
+	WHERE decision_id = ?
+	LIMIT 1;
+	`
+	row := s.db.QueryRowContext(ctx, query, decisionID)
+	m, err := scanMitigation(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrMitigationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ListMitigations retrieves mitigation records matching an optional incidentID (or all if empty),
+// ordered by started_at ASC, bounded by limit.
+func (s *SQLiteStore) ListMitigations(ctx context.Context, incidentID string, limit int) ([]*StoredMitigation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if incidentID != "" {
+		query := `
+		SELECT action_id, decision_id, incident_id, node_id, action_type,
+		       target, status, mode, message, error_code, parameters,
+		       started_at, completed_at, duration_ms, simulated, created_at, updated_at
+		FROM mitigation_records
+		WHERE incident_id = ?
+		ORDER BY started_at ASC
+		LIMIT ?;
+		`
+		rows, err = s.db.QueryContext(ctx, query, incidentID, limit)
+	} else {
+		query := `
+		SELECT action_id, decision_id, incident_id, node_id, action_type,
+		       target, status, mode, message, error_code, parameters,
+		       started_at, completed_at, duration_ms, simulated, created_at, updated_at
+		FROM mitigation_records
+		ORDER BY started_at ASC
+		LIMIT ?;
+		`
+		rows, err = s.db.QueryContext(ctx, query, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []*StoredMitigation
+	for rows.Next() {
+		m, err := scanMitigation(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, m)
+	}
+	return result, rows.Err()
+}
+
+// UpdateMitigationStatus updates the status, completion details, and updated_at of an existing mitigation.
+// Returns ErrInvalidMitigationTransition if the transition violates state machine rules.
+func (s *SQLiteStore) UpdateMitigationStatus(ctx context.Context, actionID string, status types.MitigationStatus, message, errCode string, completedAt *time.Time, durationMs int64) error {
+	if strings.TrimSpace(actionID) == "" {
+		return errors.New("action_id cannot be empty")
+	}
+	if !status.IsValid() {
+		return fmt.Errorf("%w: invalid mitigation status %q", ErrInvalidMitigation, status)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin update tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var currentStatusStr string
+	queryStatus := `SELECT status FROM mitigation_records WHERE action_id = ?;`
+	err = tx.QueryRowContext(ctx, queryStatus, actionID).Scan(&currentStatusStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrMitigationNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("failed to query current status: %w", err)
+	}
+
+	currentStatus := types.MitigationStatus(currentStatusStr)
+	if !CanMitigationTransition(currentStatus, status) {
+		return fmt.Errorf("%w: cannot transition from %s to %s", ErrInvalidMitigationTransition, currentStatus, status)
+	}
+
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	var completedStr sql.NullString
+	if completedAt != nil {
+		completedStr = sql.NullString{
+			String: completedAt.UTC().Format(time.RFC3339Nano),
+			Valid:  true,
+		}
+	}
+	var errCodeStr sql.NullString
+	if errCode != "" {
+		errCodeStr = sql.NullString{String: errCode, Valid: true}
+	}
+
+	updateSQL := `
+	UPDATE mitigation_records SET
+		status = ?,
+		message = ?,
+		error_code = ?,
+		completed_at = COALESCE(?, completed_at),
+		duration_ms = CASE WHEN ? > 0 THEN ? ELSE duration_ms END,
+		updated_at = ?
+	WHERE action_id = ?;
+	`
+	_, err = tx.ExecContext(ctx, updateSQL,
+		string(status),
+		message,
+		errCodeStr,
+		completedStr,
+		durationMs,
+		durationMs,
+		nowStr,
+		actionID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update mitigation record: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// MarkMitigationExecuting updates an existing mitigation to EXECUTING status.
+func (s *SQLiteStore) MarkMitigationExecuting(ctx context.Context, actionID string, startedAt time.Time) error {
+	return s.UpdateMitigationStatus(ctx, actionID, types.MitigationStatusExecuting, "mitigation execution started", "", nil, 0)
+}
+
+// MarkMitigationExecuted updates an existing mitigation to EXECUTED with completion details.
+func (s *SQLiteStore) MarkMitigationExecuted(ctx context.Context, actionID string, message string, completedAt time.Time, durationMs int64) error {
+	return s.UpdateMitigationStatus(ctx, actionID, types.MitigationStatusExecuted, message, "", &completedAt, durationMs)
+}
+
+// MarkMitigationFailed updates an existing mitigation to FAILED with error details.
+func (s *SQLiteStore) MarkMitigationFailed(ctx context.Context, actionID string, message, errCode string, completedAt time.Time, durationMs int64) error {
+	return s.UpdateMitigationStatus(ctx, actionID, types.MitigationStatusFailed, message, errCode, &completedAt, durationMs)
+}
+
+// MarkMitigationUnknown updates an existing mitigation to UNKNOWN_RECONCILIATION_REQUIRED.
+func (s *SQLiteStore) MarkMitigationUnknown(ctx context.Context, actionID string, message, errCode string, updatedAt time.Time) error {
+	return s.UpdateMitigationStatus(ctx, actionID, types.MitigationStatusUnknownReconciliationRequired, message, errCode, nil, 0)
+}
+
+// RecoverInFlightMitigations transitions any mitigation stranded in EXECUTING status to
+// UNKNOWN_RECONCILIATION_REQUIRED upon startup/crash recovery.
+// Returns the number of transitioned records.
+func (s *SQLiteStore) RecoverInFlightMitigations(ctx context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin recovery tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	recoveryMsg := " [RECOVERED ON RESTART: unconfirmed in-flight execution transitioned to UNKNOWN_RECONCILIATION_REQUIRED]"
+	recoverSQL := `
+	UPDATE mitigation_records SET
+		status = 'UNKNOWN_RECONCILIATION_REQUIRED',
+		message = message || ?,
+		error_code = 'RESTART_RECONCILIATION_REQUIRED',
+		updated_at = ?
+	WHERE status = 'EXECUTING';
+	`
+	res, err := tx.ExecContext(ctx, recoverSQL, recoveryMsg, nowStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to execute recovery update: %w", err)
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit recovery tx: %w", err)
+	}
+
+	return affected, nil
+}
+
+// CountMitigations returns the total count of mitigation records stored.
+func (s *SQLiteStore) CountMitigations(ctx context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	var count int64
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM mitigation_records;").Scan(&count)
+	return count, err
+}
+
+func scanMitigation(scanner rowScanner) (*StoredMitigation, error) {
+	var (
+		m            StoredMitigation
+		actionType   string
+		statusStr    string
+		errCode      sql.NullString
+		paramsJSON   sql.NullString
+		startedStr   string
+		completedStr sql.NullString
+		simulatedInt int
+		createdStr   string
+		updatedStr   string
+	)
+
+	err := scanner.Scan(
+		&m.ActionID,
+		&m.DecisionID,
+		&m.IncidentID,
+		&m.NodeID,
+		&actionType,
+		&m.Target,
+		&statusStr,
+		&m.Mode,
+		&m.Message,
+		&errCode,
+		&paramsJSON,
+		&startedStr,
+		&completedStr,
+		&m.DurationMs,
+		&simulatedInt,
+		&createdStr,
+		&updatedStr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	m.ActionType = types.MitigationActionType(actionType)
+	m.Status = types.MitigationStatus(statusStr)
+	if errCode.Valid {
+		m.ErrorCode = errCode.String
+	}
+	if paramsJSON.Valid && paramsJSON.String != "" {
+		_ = json.Unmarshal([]byte(paramsJSON.String), &m.Parameters)
+	}
+	m.StartedAt, _ = parseDBTime(startedStr)
+	if completedStr.Valid && completedStr.String != "" {
+		t, err := parseDBTime(completedStr.String)
+		if err == nil {
+			m.CompletedAt = &t
+		}
+	}
+	m.Simulated = (simulatedInt == 1)
+	m.CreatedAt, _ = parseDBTime(createdStr)
+	m.UpdatedAt, _ = parseDBTime(updatedStr)
+
+	return &m, nil
+}
+
+// ============================================================================
+// ApprovalStore Implementation (Phase 6.5)
+// ============================================================================
+
+// RecordApproval transactionally validates and persists an approval record in PENDING status.
+// Returns ErrDuplicateApproval if an approval with the same approval_id or decision_id already exists.
+func (s *SQLiteStore) RecordApproval(ctx context.Context, app *StoredApproval) error {
+	if app == nil {
+		return ErrInvalidApproval
+	}
+	if err := app.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx for recording approval: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	query := `
+	INSERT INTO approval_records (
+		approval_id, decision_id, incident_id, action_id, node_id,
+		action_type, target, policy_version, decision_fingerprint,
+		status, requested_at, expires_at, requested_by,
+		approved_by, rejected_by, reason, created_at, updated_at, consumed_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	`
+
+	var consumedStr sql.NullString
+	if app.ConsumedAt != nil {
+		consumedStr = sql.NullString{String: formatDBTime(*app.ConsumedAt), Valid: true}
+	}
+
+	_, err = tx.ExecContext(ctx, query,
+		app.ApprovalID,
+		app.DecisionID,
+		app.IncidentID,
+		app.ActionID,
+		app.NodeID,
+		string(app.ActionType),
+		app.Target,
+		app.PolicyVersion,
+		app.DecisionFingerprint,
+		string(app.Status),
+		formatDBTime(app.RequestedAt),
+		formatDBTime(app.ExpiresAt),
+		app.RequestedBy,
+		app.ApprovedBy,
+		app.RejectedBy,
+		app.Reason,
+		formatDBTime(app.CreatedAt),
+		formatDBTime(app.UpdatedAt),
+		consumedStr,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return fmt.Errorf("%w: %v", ErrDuplicateApproval, err)
+		}
+		return fmt.Errorf("failed to insert approval record: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// GetApproval retrieves an approval record by its unique ApprovalID.
+func (s *SQLiteStore) GetApproval(ctx context.Context, approvalID string) (*StoredApproval, error) {
+	if strings.TrimSpace(approvalID) == "" {
+		return nil, errors.New("approval_id cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+	SELECT approval_id, decision_id, incident_id, action_id, node_id,
+	       action_type, target, policy_version, decision_fingerprint,
+	       status, requested_at, expires_at, requested_by,
+	       approved_by, rejected_by, reason, created_at, updated_at, consumed_at
+	FROM approval_records
+	WHERE approval_id = ?
+	LIMIT 1;
+	`
+	row := s.db.QueryRowContext(ctx, query, approvalID)
+	app, err := scanApproval(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrApprovalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// GetApprovalByDecisionID retrieves an approval record by its unique DecisionID.
+func (s *SQLiteStore) GetApprovalByDecisionID(ctx context.Context, decisionID string) (*StoredApproval, error) {
+	if strings.TrimSpace(decisionID) == "" {
+		return nil, errors.New("decision_id cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+	SELECT approval_id, decision_id, incident_id, action_id, node_id,
+	       action_type, target, policy_version, decision_fingerprint,
+	       status, requested_at, expires_at, requested_by,
+	       approved_by, rejected_by, reason, created_at, updated_at, consumed_at
+	FROM approval_records
+	WHERE decision_id = ?
+	LIMIT 1;
+	`
+	row := s.db.QueryRowContext(ctx, query, decisionID)
+	app, err := scanApproval(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrApprovalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// ApproveApproval transitions a PENDING approval to APPROVED.
+// Idempotent: if already APPROVED with matching approvedBy, returns nil.
+func (s *SQLiteStore) ApproveApproval(ctx context.Context, approvalID, approvedBy string, now time.Time) error {
+	if strings.TrimSpace(approvalID) == "" {
+		return errors.New("approval_id cannot be empty")
+	}
+	if strings.TrimSpace(approvedBy) == "" {
+		return errors.New("approved_by cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var (
+		statusStr      string
+		expiresStr     string
+		currApprovedBy string
+	)
+	query := `SELECT status, expires_at, approved_by FROM approval_records WHERE approval_id = ?;`
+	err = tx.QueryRowContext(ctx, query, approvalID).Scan(&statusStr, &expiresStr, &currApprovedBy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrApprovalNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	currStatus := types.ApprovalStatus(statusStr)
+	expTime, err := parseDBTime(expiresStr)
+	if err != nil {
+		return fmt.Errorf("failed to parse expires_at: %w", err)
+	}
+
+	// Idempotent check
+	if currStatus == types.ApprovalStatusApproved {
+		return nil
+	}
+
+	// Check terminal states
+	if currStatus.IsTerminal() {
+		return fmt.Errorf("%w: approval %s is in terminal state %s", ErrInvalidApprovalTransition, approvalID, currStatus)
+	}
+
+	// Check expiration
+	if now.After(expTime) || now.Equal(expTime) {
+		_, _ = tx.ExecContext(ctx, `UPDATE approval_records SET status = 'EXPIRED', updated_at = ? WHERE approval_id = ?;`, formatDBTime(now), approvalID)
+		_ = tx.Commit()
+		return ErrApprovalExpired
+	}
+
+	// Transition PENDING -> APPROVED
+	updateQuery := `
+	UPDATE approval_records
+	SET status = 'APPROVED', approved_by = ?, updated_at = ?
+	WHERE approval_id = ? AND status = 'PENDING';
+	`
+	res, err := tx.ExecContext(ctx, updateQuery, approvedBy, formatDBTime(now), approvalID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: failed to transition to APPROVED", ErrInvalidApprovalTransition)
+	}
+
+	return tx.Commit()
+}
+
+// RejectApproval transitions a PENDING approval to REJECTED.
+func (s *SQLiteStore) RejectApproval(ctx context.Context, approvalID, rejectedBy, reason string, now time.Time) error {
+	if strings.TrimSpace(approvalID) == "" {
+		return errors.New("approval_id cannot be empty")
+	}
+	if strings.TrimSpace(rejectedBy) == "" {
+		return errors.New("rejected_by cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var statusStr string
+	query := `SELECT status FROM approval_records WHERE approval_id = ?;`
+	err = tx.QueryRowContext(ctx, query, approvalID).Scan(&statusStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrApprovalNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	currStatus := types.ApprovalStatus(statusStr)
+	if currStatus == types.ApprovalStatusRejected {
+		return nil // Idempotent
+	}
+	if currStatus == types.ApprovalStatusApproved {
+		return ErrCannotRejectApproved
+	}
+	if currStatus.IsTerminal() {
+		return fmt.Errorf("%w: cannot reject approval in status %s", ErrInvalidApprovalTransition, currStatus)
+	}
+
+	updateQuery := `
+	UPDATE approval_records
+	SET status = 'REJECTED', rejected_by = ?, reason = ?, updated_at = ?
+	WHERE approval_id = ? AND status = 'PENDING';
+	`
+	res, err := tx.ExecContext(ctx, updateQuery, rejectedBy, reason, formatDBTime(now), approvalID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: failed to transition to REJECTED", ErrInvalidApprovalTransition)
+	}
+
+	return tx.Commit()
+}
+
+// CancelApproval transitions a PENDING approval to CANCELLED.
+func (s *SQLiteStore) CancelApproval(ctx context.Context, approvalID, reason string, now time.Time) error {
+	if strings.TrimSpace(approvalID) == "" {
+		return errors.New("approval_id cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var statusStr string
+	query := `SELECT status FROM approval_records WHERE approval_id = ?;`
+	err = tx.QueryRowContext(ctx, query, approvalID).Scan(&statusStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrApprovalNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	currStatus := types.ApprovalStatus(statusStr)
+	if currStatus == types.ApprovalStatusCancelled {
+		return nil // Idempotent
+	}
+	if currStatus == types.ApprovalStatusConsumed {
+		return fmt.Errorf("%w: cannot cancel already consumed approval", ErrInvalidApprovalTransition)
+	}
+	if currStatus.IsTerminal() {
+		return fmt.Errorf("%w: cannot cancel approval in status %s", ErrInvalidApprovalTransition, currStatus)
+	}
+
+	updateQuery := `
+	UPDATE approval_records
+	SET status = 'CANCELLED', reason = ?, updated_at = ?
+	WHERE approval_id = ? AND status IN ('PENDING', 'APPROVED');
+	`
+	res, err := tx.ExecContext(ctx, updateQuery, reason, formatDBTime(now), approvalID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: failed to transition to CANCELLED", ErrInvalidApprovalTransition)
+	}
+
+	return tx.Commit()
+}
+
+// ConsumeApproval atomically transitions an APPROVED approval to CONSUMED.
+// Fails if the approval is expired, not approved, or already consumed.
+func (s *SQLiteStore) ConsumeApproval(ctx context.Context, approvalID string, now time.Time) error {
+	if strings.TrimSpace(approvalID) == "" {
+		return errors.New("approval_id cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	// Atomic update: only succeeds if status == 'APPROVED' and expires_at > now
+	nowStr := formatDBTime(now)
+	updateQuery := `
+	UPDATE approval_records
+	SET status = 'CONSUMED', consumed_at = ?, updated_at = ?
+	WHERE approval_id = ? AND status = 'APPROVED' AND expires_at > ?;
+	`
+	res, err := tx.ExecContext(ctx, updateQuery, nowStr, nowStr, approvalID, nowStr)
+	if err != nil {
+		return fmt.Errorf("failed to execute consumption update: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 1 {
+		return tx.Commit()
+	}
+
+	// RowsAffected == 0: diagnose the specific failure cause
+	var (
+		statusStr  string
+		expiresStr string
+	)
+	diagQuery := `SELECT status, expires_at FROM approval_records WHERE approval_id = ?;`
+	err = tx.QueryRowContext(ctx, diagQuery, approvalID).Scan(&statusStr, &expiresStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrApprovalNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	currStatus := types.ApprovalStatus(statusStr)
+	if currStatus == types.ApprovalStatusConsumed {
+		return ErrApprovalAlreadyConsumed
+	}
+
+	expTime, err := parseDBTime(expiresStr)
+	if err == nil && (now.After(expTime) || now.Equal(expTime)) {
+		_, _ = tx.ExecContext(ctx, `UPDATE approval_records SET status = 'EXPIRED', updated_at = ? WHERE approval_id = ?;`, nowStr, approvalID)
+		_ = tx.Commit()
+		return ErrApprovalExpired
+	}
+
+	return fmt.Errorf("%w: status %s cannot be consumed", ErrInvalidApprovalTransition, currStatus)
+}
+
+// ExpireStaleApprovals transitions any unconsumed approvals past their expiration time to EXPIRED.
+func (s *SQLiteStore) ExpireStaleApprovals(ctx context.Context, now time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	nowStr := formatDBTime(now)
+	query := `
+	UPDATE approval_records
+	SET status = 'EXPIRED', updated_at = ?
+	WHERE status IN ('PENDING', 'APPROVED') AND expires_at <= ?;
+	`
+	res, err := tx.ExecContext(ctx, query, nowStr, nowStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to expire stale approvals: %w", err)
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	return affected, nil
+}
+
+// ListApprovals retrieves approval records matching an optional incidentID (or all if empty),
+// ordered by requested_at ASC, bounded by limit.
+func (s *SQLiteStore) ListApprovals(ctx context.Context, incidentID string, limit int) ([]*StoredApproval, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if incidentID != "" {
+		query := `
+		SELECT approval_id, decision_id, incident_id, action_id, node_id,
+		       action_type, target, policy_version, decision_fingerprint,
+		       status, requested_at, expires_at, requested_by,
+		       approved_by, rejected_by, reason, created_at, updated_at, consumed_at
+		FROM approval_records
+		WHERE incident_id = ?
+		ORDER BY requested_at ASC
+		LIMIT ?;
+		`
+		rows, err = s.db.QueryContext(ctx, query, incidentID, limit)
+	} else {
+		query := `
+		SELECT approval_id, decision_id, incident_id, action_id, node_id,
+		       action_type, target, policy_version, decision_fingerprint,
+		       status, requested_at, expires_at, requested_by,
+		       approved_by, rejected_by, reason, created_at, updated_at, consumed_at
+		FROM approval_records
+		ORDER BY requested_at ASC
+		LIMIT ?;
+		`
+		rows, err = s.db.QueryContext(ctx, query, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query approval records: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*StoredApproval
+	for rows.Next() {
+		app, err := scanApproval(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan approval record: %w", err)
+		}
+		result = append(result, app)
+	}
+	return result, rows.Err()
+}
+
+// CountApprovals returns the total count of approval records stored.
+func (s *SQLiteStore) CountApprovals(ctx context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	query := `SELECT COUNT(*) FROM approval_records;`
+	var count int64
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count approvals: %w", err)
+	}
+
+	return count, nil
+}
+
+func scanApproval(s scanner) (*StoredApproval, error) {
+	var (
+		app          StoredApproval
+		actionType   string
+		statusStr    string
+		requestedStr string
+		expiresStr   string
+		createdStr   string
+		updatedStr   string
+		consumedStr  sql.NullString
+	)
+
+	err := s.Scan(
+		&app.ApprovalID,
+		&app.DecisionID,
+		&app.IncidentID,
+		&app.ActionID,
+		&app.NodeID,
+		&actionType,
+		&app.Target,
+		&app.PolicyVersion,
+		&app.DecisionFingerprint,
+		&statusStr,
+		&requestedStr,
+		&expiresStr,
+		&app.RequestedBy,
+		&app.ApprovedBy,
+		&app.RejectedBy,
+		&app.Reason,
+		&createdStr,
+		&updatedStr,
+		&consumedStr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	app.ActionType = types.MitigationActionType(actionType)
+	app.Status = types.ApprovalStatus(statusStr)
+	app.RequestedAt, _ = parseDBTime(requestedStr)
+	app.ExpiresAt, _ = parseDBTime(expiresStr)
+	app.CreatedAt, _ = parseDBTime(createdStr)
+	app.UpdatedAt, _ = parseDBTime(updatedStr)
+	if consumedStr.Valid && consumedStr.String != "" {
+		t, err := parseDBTime(consumedStr.String)
+		if err == nil {
+			app.ConsumedAt = &t
+		}
+	}
+
+	return &app, nil
 }
