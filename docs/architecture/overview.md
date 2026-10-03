@@ -424,37 +424,36 @@ flowchart TD
    * An error or failure in incident persistence never rolls back or marks already-persisted telemetry batches as failed.
    * Background telemetry synchronization via HTTP or NATS JetStream proceeds independently.
 7. **Consistency Boundaries & Non-Claims**:
-   * AegisEdge guarantees local ACID transactional consistency within the edge SQLite WAL engine.
+   * Mitigation records, incidents, and telemetry are persisted through SQLite transactions using the project's configured WAL durability boundary. This provides the application's local durable persistence boundary under SQLite's configured semantics, but does not guarantee survival of every sudden-power-loss, storage-device, or hardware failure scenario.
    * Incident state survives application/process restart and SQLite crash-recovery scenarios covered by the configured WAL durability semantics (`synchronous=NORMAL`).
    * Physical power-loss durability depends on SQLite synchronous settings, filesystem behavior, storage hardware, and OS/device caches.
-   * AegisEdge explicitly does not claim zero data loss, nor guaranteed survival of every physical power-loss scenario.
-   * It **does not claim** distributed exactly-once delivery, distributed two-phase commits, or remote cloud durability in this phase.
+   * AegisEdge maintains strict explicit non-claims: no zero-data-loss claim, no arbitrary physical power-loss guarantee, no hardware failure guarantee, no distributed exactly-once delivery/execution, and no distributed transaction guarantee.
 
 ---
 
-## 13. Safe Autonomous Response & Remediation Architecture (Phase 6.1 — Design Only)
+## 13. Safe Autonomous Response & Remediation Architecture (Phase 6.5 — Operator Approval & Controlled Actuation Safety Boundary)
 
-Phase 6.1 establishes the architecture and safety model for autonomous, edge-local incident response ([ADR-0012](../decisions/ADR-0012-autonomous-incident-response.md)).
+Phase 6.1 established the architecture and safety model ([ADR-0012](../decisions/ADR-0012-autonomous-incident-response.md)). Phase 6.2 implemented the policy engine and safety validator, Phase 6.3 implemented the simulated action executor and dry-run pipeline, Phase 6.4 implemented durable mitigation persistence (Migration v4) and startup recovery, and Phase 6.5 implements the operator approval domain, decision fingerprint binding, 14-point execution-time authorization gate, durable approval persistence (Migration v5), and atomic single-use consumption.
 
 ```mermaid
 flowchart TD
     TEL["1. Telemetry Capture & WAL Persistence\n[IMPLEMENTED]"] --> DET["2. Local Anomaly Detection\n[IMPLEMENTED]"]
     DET --> INC["3. Incident Correlation & WAL Persistence\n[IMPLEMENTED]"]
-    INC --> POL["4. Deterministic Response Policy\n[DESIGNED - Phase 6.2+]"]
-    POL --> VAL{"5. Safety Validator (Fail-Closed)\n[DESIGNED - Phase 6.2+]"}
+    INC --> POL["4. Deterministic Response Policy\n[IMPLEMENTED - Phase 6.2]"]
+    POL --> VAL{"5. Safety Validator (Fail-Closed)\n[IMPLEMENTED - Phase 6.2]"}
 
-    VAL -- "REJECT" --> AUD_REJ["Audit Record: REJECTED\n[DESIGNED - Phase 6.2+]"]
+    VAL -- "REJECT" --> AUD_REJ["Audit Record: REJECTED\n[IMPLEMENTED - Phase 6.2]"]
     VAL -- "PASS" --> MODE{"6. Execution Mode"}
 
-    MODE -- "DRY_RUN" --> SIM["Simulated Execution (Zero Host Side Effects)\n[DESIGNED - Phase 6.3+]"]
-    MODE -- "AUTO_EXECUTE" --> EXEC["Typed Allowlisted Actuator\n[DESIGNED - Phase 6.5+]"]
-    MODE -- "APPROVAL_REQUIRED" --> QUEUE["Operator Approval Ticket\n[DESIGNED - Phase 6.5+]"]
+    MODE -- "DRY_RUN" --> SIM["Simulated Execution (Zero Host Side Effects)\n[IMPLEMENTED - Phase 6.3]"]
+    MODE -- "AUTO_EXECUTE" --> EXEC["Typed Allowlisted Actuator\n[DESIGNED - Future Phase]"]
+    MODE -- "APPROVAL_REQUIRED" --> QUEUE["Operator Approval Ticket & 14-Point Gate\n[IMPLEMENTED - Phase 6.5]"]
 
-    SIM --> RES["7. Structured ActionResult\n(types.MitigationAction)\n[DESIGNED - Phase 6.3+]"]
+    QUEUE -- "APPROVED & CONSUMED" --> SIM
+    SIM --> RES["7. Structured ActionResult\n(types.MitigationAction)\n[IMPLEMENTED - Phase 6.3]"]
     EXEC --> RES
-    QUEUE -.-> RES
 
-    RES --> AUD["8. Durable WAL Mitigation Audit\n[DESIGNED - Phase 6.4+]"]
+    RES --> AUD["8. Durable WAL Mitigation Audit\n[IMPLEMENTED - Phase 6.4]"]
 ```
 
 ### Explicit State of Implementation:
@@ -471,17 +470,18 @@ flowchart TD
 | **Edge Local Model Store & Candidate Staging** | **CURRENTLY IMPLEMENTED** | Phase 5.6B |
 | **Edge ML Model Activation & Runtime Switching** | **CURRENTLY IMPLEMENTED** | Phase 5.6C |
 | **Edge ML Model Rollback & Recovery** | **CURRENTLY IMPLEMENTED** | Phase 5.6D |
-| **Autonomous Incident Response Architecture** | *DESIGNED* | Phase 6.1 (ADR-0012 Design Only) |
+| **Autonomous Incident Response Architecture** | *DESIGNED / DOCUMENTED* | Phase 6.1 (ADR-0012 Design Only) |
 | **ML Model Distribution Transport & Registry** | *DESIGNED (Future Implementation)* | Phase 5.5D Design Only |
 | **Deterministic Response Policy Engine** | **CURRENTLY IMPLEMENTED** | Phase 6.2 (`edge/agent/response/policy.go`) |
 | **Fail-Closed Safety Validator** | **CURRENTLY IMPLEMENTED** | Phase 6.2 (`edge/agent/response/validator.go`) |
-| **Simulated Action Executor & Dry-Run Mode** | *DESIGNED (Future Implementation)* | Phase 6.3 |
-| **Durable Mitigation Persistence (Migration v4)** | *DESIGNED (Future Implementation)* | Phase 6.4 |
-| **Controlled Host Actuators & Operator Approval** | *DESIGNED (Future Implementation)* | Phase 6.5 |
-| **Automated Telemetry Verification Engine** | *DESIGNED (Future Implementation)* | Phase 6.5 |
+| **Simulated Action Executor & Dry-Run Mode** | **CURRENTLY IMPLEMENTED** | Phase 6.3 (`edge/agent/response/executor.go`) |
+| **Durable Mitigation Persistence (Migration v4)** | **CURRENTLY IMPLEMENTED** | Phase 6.4 (`edge/agent/storage/sqlite.go`) |
+| **Operator Approval & Controlled Actuation Boundary** | **CURRENTLY IMPLEMENTED** | Phase 6.5 (`edge/agent/response/approval.go`, `edge/agent/storage/sqlite.go`) |
+| **Real Host Actuation Execution** | *DESIGNED (Future Implementation)* | Future Phase |
+| **Automated Telemetry Verification Engine** | *DESIGNED (Future Implementation)* | Future Phase |
 
 ### Core Safety Invariant:
-$$\textbf{INCIDENT [IMPLEMENTED]} \longrightarrow \textbf{RESPONSE POLICY [DESIGNED]} \longrightarrow \textbf{SAFETY VALIDATION [DESIGNED]} \longrightarrow \textbf{DRY-RUN / SIMULATION [DESIGNED]} \longrightarrow \textbf{OPERATOR APPROVAL [DESIGNED]} \longrightarrow \textbf{CONTROLLED ACTION EXECUTION [DESIGNED]} \longrightarrow \textbf{VERIFY RESULT [DESIGNED]} \longrightarrow \textbf{UPDATE INCIDENT [DESIGNED]} \longrightarrow \textbf{RECORD AUDIT EVENT [DESIGNED]}$$
+$$\textbf{INCIDENT [IMPLEMENTED]} \longrightarrow \textbf{RESPONSE POLICY [IMPLEMENTED]} \longrightarrow \textbf{SAFETY VALIDATION [IMPLEMENTED]} \longrightarrow \textbf{DRY-RUN / SIMULATION [IMPLEMENTED]} \longrightarrow \textbf{DURABLE PERSISTENCE [IMPLEMENTED]} \longrightarrow \textbf{OPERATOR APPROVAL [IMPLEMENTED]} \longrightarrow \textbf{CONTROLLED ACTION EXECUTION [DESIGNED]} \longrightarrow \textbf{VERIFY RESULT [DESIGNED]} \longrightarrow \textbf{UPDATE INCIDENT [DESIGNED]} \longrightarrow \textbf{RECORD AUDIT EVENT [DESIGNED]}$$
 
 1. **Zero Arbitrary Execution**: The system must **NEVER** execute arbitrary shell commands (`/bin/sh`, `powershell.exe`) or AI-generated raw command strings.
 2. **Typed Allowlisted Actions Only**: Only compile-time typed actions (`SIMULATED_THROTTLE`, `SIMULATED_RESTART`, `SIMULATED_ISOLATE`, `SIMULATED_ALERT`) can be executed.
@@ -489,7 +489,7 @@ $$\textbf{INCIDENT [IMPLEMENTED]} \longrightarrow \textbf{RESPONSE POLICY [DESIG
 4. **Idempotency & Identity Hierarchy**:
    $$\textbf{AnomalyID} \longrightarrow \textbf{IncidentID} \longrightarrow \textbf{DecisionID} \longrightarrow \textbf{ActionID}$$
    Actions are deduplicated by `ActionID`; duplicate invocations across retries or restarts produce zero duplicate mutations.
-5. **Ambiguous State Safety**: If an action times out or the process crashes during execution, execution cancellation is requested where supported. If execution state cannot be confirmed, the action enters `UNKNOWN_RECONCILIATION_REQUIRED` (an action execution state, not an `IncidentStatus`) and the driving incident transitions to `IncidentStatus = ESCALATED`. The system **never blindly retries** an ambiguous execution. Future actuator-specific reconciliation will determine whether the action executed successfully.
+5. **Ambiguous State Safety**: If an action times out or the process crashes during execution, execution cancellation is requested where supported. If execution state cannot be confirmed, the action enters `UNKNOWN_RECONCILIATION_REQUIRED` (an action execution state, not an `IncidentStatus`). In designed future orchestration, the driving incident will transition to `IncidentStatus = ESCALATED`; in Phase 6.4, `RecoverInFlightMitigations` transitions the persisted mitigation record to `UNKNOWN_RECONCILIATION_REQUIRED` without mutating the incident FSM. The system **never blindly retries** an ambiguous execution. Future actuator-specific reconciliation will determine whether the action executed successfully.
 6. **Strict Pipeline Isolation**: A failure in response policy, safety validation, or actuation can never roll back or corrupt committed telemetry batches or incident records. Upstream synchronization proceeds unaffected.
 7. **Offline Autonomy**: All response evaluation, validation, and simulated actuation execute entirely locally without cloud, internet, control plane, or external dependencies.
 8. **Verification Requirement**: Actuator completion (exit code 0) does not prove that an incident is resolved. Telemetry conditions must be observed post-execution to verify that the anomalous metric returned within nominal bounds.
