@@ -31,6 +31,8 @@ var (
 	ErrMismatchedNodeID         = errors.New("metric sample node_id does not match batch node_id")
 	ErrInvalidResolvedTimestamp = errors.New("resolved_at cannot be prior to triggered_at")
 	ErrInvalidCompletedTime     = errors.New("completed_at cannot be prior to triggered_at")
+	ErrEmptyApprovalID          = errors.New("approval_id cannot be empty")
+	ErrInvalidApprovalStatus    = errors.New("invalid approval status")
 )
 
 // ============================================================================
@@ -225,6 +227,62 @@ func (s MitigationStatus) IsValid() bool {
 	switch s {
 	case MitigationStatusPending, MitigationStatusExecuting, MitigationStatusExecuted, MitigationStatusFailed, MitigationStatusSkipped, MitigationStatusUnknownReconciliationRequired:
 		return true
+	default:
+		return false
+	}
+}
+
+// ApprovalStatus denotes the deterministic lifecycle state of an operator approval.
+type ApprovalStatus string
+
+const (
+	ApprovalStatusPending   ApprovalStatus = "PENDING"
+	ApprovalStatusApproved  ApprovalStatus = "APPROVED"
+	ApprovalStatusConsumed  ApprovalStatus = "CONSUMED"
+	ApprovalStatusRejected  ApprovalStatus = "REJECTED"
+	ApprovalStatusExpired   ApprovalStatus = "EXPIRED"
+	ApprovalStatusCancelled ApprovalStatus = "CANCELLED"
+)
+
+// IsValid checks whether the approval status is recognized.
+func (s ApprovalStatus) IsValid() bool {
+	switch s {
+	case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusConsumed,
+		ApprovalStatusRejected, ApprovalStatusExpired, ApprovalStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTerminal checks whether the approval status is terminal (cannot transition further).
+func (s ApprovalStatus) IsTerminal() bool {
+	switch s {
+	case ApprovalStatusConsumed, ApprovalStatusRejected, ApprovalStatusExpired, ApprovalStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// CanTransitionTo enforces the deterministic approval state machine rules:
+//
+//	PENDING  -> APPROVED | REJECTED | EXPIRED | CANCELLED
+//	APPROVED -> CONSUMED | EXPIRED
+//	Terminal states (CONSUMED, REJECTED, EXPIRED, CANCELLED) cannot transition further.
+func (s ApprovalStatus) CanTransitionTo(next ApprovalStatus) bool {
+	if s == next {
+		return true
+	}
+	switch s {
+	case ApprovalStatusPending:
+		return next == ApprovalStatusApproved ||
+			next == ApprovalStatusRejected ||
+			next == ApprovalStatusExpired ||
+			next == ApprovalStatusCancelled
+	case ApprovalStatusApproved:
+		return next == ApprovalStatusConsumed ||
+			next == ApprovalStatusExpired
 	default:
 		return false
 	}
