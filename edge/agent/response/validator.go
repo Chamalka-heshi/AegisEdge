@@ -153,9 +153,19 @@ func (v *StandardSafetyValidator) ResetCooldowns() {
 
 // Validate executes all safety checks against the proposed decision and active incident.
 // It fails closed: any violation causes the action to be REJECTED.
-// Passing this validator means ONLY that the action is authorized to proceed to a future executor.
-// It does NOT execute any host mutations.
+// In automated validation without operator approval, AuthClassApprovalRequired actions are rejected.
 func (v *StandardSafetyValidator) Validate(ctx context.Context, dec *ResponseDecision, inc *types.Incident) (*SafetyResult, error) {
+	return v.validateInternal(ctx, dec, inc, false)
+}
+
+// ValidateApproved executes all safety checks against an action that has received verified operator approval.
+// CRITICAL SAFETY INVARIANT: Operator approval NEVER overrides FORBIDDEN actions, non-allowlisted actions,
+// invalid targets, or prohibited parameters. If any safety boundary is breached, the action is REJECTED.
+func (v *StandardSafetyValidator) ValidateApproved(ctx context.Context, dec *ResponseDecision, inc *types.Incident) (*SafetyResult, error) {
+	return v.validateInternal(ctx, dec, inc, true)
+}
+
+func (v *StandardSafetyValidator) validateInternal(ctx context.Context, dec *ResponseDecision, inc *types.Incident, approved bool) (*SafetyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -223,12 +233,13 @@ func (v *StandardSafetyValidator) Validate(ctx context.Context, dec *ResponseDec
 			code = ValidationCodeInvalidAuthClass
 		}
 	} else if dec.AuthorizationClass == AuthClassForbidden {
-		violations = append(violations, fmt.Sprintf("action %q on target %q is classified as FORBIDDEN", dec.ActionType, dec.Target))
+		// INVARIANT: FORBIDDEN actions can NEVER be executed, even with operator approval.
+		violations = append(violations, fmt.Sprintf("action %q on target %q is classified as FORBIDDEN and cannot be authorized", dec.ActionType, dec.Target))
 		if code == ValidationCodeAllowed {
 			code = ValidationCodeForbiddenAction
 		}
-	} else if dec.AuthorizationClass == AuthClassApprovalRequired {
-		violations = append(violations, "action requires operator approval; automatic authorization is prohibited in Phase 6.2")
+	} else if dec.AuthorizationClass == AuthClassApprovalRequired && !approved {
+		violations = append(violations, "action requires operator approval; automatic authorization is prohibited without verified approval")
 		if code == ValidationCodeAllowed {
 			code = ValidationCodeInvalidAuthClass
 		}
