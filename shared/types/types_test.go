@@ -943,3 +943,90 @@ func TestDuplicateDeliveryIdempotency(t *testing.T) {
 		t.Errorf("Identical event payloads produced different IDs on retry")
 	}
 }
+
+// ============================================================================
+// ApprovalStatus Tests
+// ============================================================================
+
+func TestApprovalStatus_LifecycleAndTransitions(t *testing.T) {
+	validStatuses := []ApprovalStatus{
+		ApprovalStatusPending,
+		ApprovalStatusApproved,
+		ApprovalStatusConsumed,
+		ApprovalStatusRejected,
+		ApprovalStatusExpired,
+		ApprovalStatusCancelled,
+	}
+
+	for _, s := range validStatuses {
+		if !s.IsValid() {
+			t.Errorf("expected status %q to be valid", s)
+		}
+	}
+
+	if ApprovalStatus("INVALID").IsValid() {
+		t.Errorf("expected INVALID status to be rejected")
+	}
+
+	// Terminal states
+	terminalStatuses := []ApprovalStatus{
+		ApprovalStatusConsumed,
+		ApprovalStatusRejected,
+		ApprovalStatusExpired,
+		ApprovalStatusCancelled,
+	}
+	for _, s := range terminalStatuses {
+		if !s.IsTerminal() {
+			t.Errorf("expected status %q to be terminal", s)
+		}
+	}
+	if ApprovalStatusPending.IsTerminal() {
+		t.Errorf("PENDING should not be terminal")
+	}
+	if ApprovalStatusApproved.IsTerminal() {
+		t.Errorf("APPROVED should not be terminal")
+	}
+
+	// Transitions from PENDING
+	if !ApprovalStatusPending.CanTransitionTo(ApprovalStatusApproved) {
+		t.Errorf("PENDING -> APPROVED should be permitted")
+	}
+	if !ApprovalStatusPending.CanTransitionTo(ApprovalStatusRejected) {
+		t.Errorf("PENDING -> REJECTED should be permitted")
+	}
+	if !ApprovalStatusPending.CanTransitionTo(ApprovalStatusExpired) {
+		t.Errorf("PENDING -> EXPIRED should be permitted")
+	}
+	if !ApprovalStatusPending.CanTransitionTo(ApprovalStatusCancelled) {
+		t.Errorf("PENDING -> CANCELLED should be permitted")
+	}
+	if ApprovalStatusPending.CanTransitionTo(ApprovalStatusConsumed) {
+		t.Errorf("PENDING -> CONSUMED directly should be prohibited")
+	}
+
+	// Transitions from APPROVED
+	if !ApprovalStatusApproved.CanTransitionTo(ApprovalStatusConsumed) {
+		t.Errorf("APPROVED -> CONSUMED should be permitted")
+	}
+	if !ApprovalStatusApproved.CanTransitionTo(ApprovalStatusExpired) {
+		t.Errorf("APPROVED -> EXPIRED should be permitted")
+	}
+	if ApprovalStatusApproved.CanTransitionTo(ApprovalStatusPending) {
+		t.Errorf("APPROVED -> PENDING should be prohibited")
+	}
+	if ApprovalStatusApproved.CanTransitionTo(ApprovalStatusRejected) {
+		t.Errorf("APPROVED -> REJECTED should be prohibited")
+	}
+	if ApprovalStatusApproved.CanTransitionTo(ApprovalStatusCancelled) {
+		t.Errorf("APPROVED -> CANCELLED should be prohibited")
+	}
+
+	// Terminal states cannot transition further
+	for _, term := range terminalStatuses {
+		for _, next := range validStatuses {
+			if term != next && term.CanTransitionTo(next) {
+				t.Errorf("terminal status %q should not be able to transition to %q", term, next)
+			}
+		}
+	}
+}
