@@ -85,7 +85,7 @@ go run ./edge/agent -node-id edge-node-01 -control-plane-url http://localhost:80
 
 A local NATS/JetStream development environment is available (see [`docs/development/local-nats.md`](docs/development/local-nats.md)). In Phase 4.3, full application-level NATS integration was completed (`NATS_ENABLED=true`), enabling `SQLite -> PENDING -> NATS JetStream -> PubAck -> PUBLISHED -> Consumer -> Idempotent Ingestion -> ACK`. Phase 4.4 formalizes the comprehensive resilience, redelivery, and failure recovery design in [`ADR-0008`](docs/decisions/ADR-0008-nats-resilience-and-recovery.md).
 
-#### 5. Edge Anomaly Detection & Autonomous Response Architecture (Phases 5.1 – 6.2)
+#### 5. Edge Anomaly Detection & Autonomous Response Architecture (Phases 5.1 – 6.5)
 
 * **IMPLEMENTED**:
   * `ThresholdDetector`: Deterministic static threshold boundaries ($W=1$) with hysteresis bands and recovery thresholds (Phases 5.1–5.2).
@@ -96,19 +96,18 @@ A local NATS/JetStream development environment is available (see [`docs/developm
   * `shared/ml`: Clean decoupled contracts for model manifests, canonical JSON SHA-256 integrity, runtime compatibility evaluation, and deployment lifecycle state machine (Phase 5.6A).
   * `edge/agent/modelstore`: Filesystem-backed edge model store and candidate staging boundary with multi-stage validation gates, safe bounded reads, Windows-compatible file operations, idempotency, and conflict rejection (Phase 5.6B).
   * `edge/agent/modelactivation`: Thread-safe runtime model activation and explicit rollback manager with pre-promotion validation pipeline, dynamic `RuntimeDetector` dispatching under `sync.RWMutex`, idempotency, conflict rejection, previous model disk retention in `previous/`, and repeated rollback swapping (Phases 5.6C & 5.6D).
-  * `edge/agent/response`: Deterministic Response Policy Engine (`RuleBasedPolicy`) with explicit rule precedence and stable SHA-256 `DecisionID`, combined with Fail-Closed Safety Validator (`StandardSafetyValidator`) enforcing typed action allowlists, target validation, risk classification, parameter limits, and process-local non-durable cooldown tracking (Phase 6.2).
+  * `edge/agent/response`: Deterministic Response Policy Engine (`RuleBasedPolicy`), Fail-Closed Safety Validator (`StandardSafetyValidator`), Operator Approval Boundary & Lifecycle Manager (`ApprovalManager`), and Simulated Action Executor (`SimulatedExecutor`) providing safe, observable simulation and dry-run execution with idempotency, 14-point decision-binding security gate, single-use approval consumption, and zero real host mutation (Phases 6.2, 6.3, 6.5).
+  * `edge/agent/storage`: Durable mitigation & approval persistence and startup crash recovery via SQLite WAL Migrations v4 (`mitigation_records`) and v5 (`approval_records`), providing local mitigation & approval identity, duplicate suppression, fail-closed restart reconciliation, and single-use atomic consumption (Phases 6.4 & 6.5).
 * **DESIGNED**:
-  * Autonomous Incident Response Architecture: Layered response pipeline, simulated execution, operator approval, and automated telemetry verification (Phase 6.1 Design Only, see [ADR-0012](docs/decisions/ADR-0012-autonomous-incident-response.md)).
+  * Autonomous Incident Response Architecture: Full response lifecycle model, operator approval ticketing, and automated telemetry verification (Phase 6.1 Design Only, see [ADR-0012](docs/decisions/ADR-0012-autonomous-incident-response.md)).
   * ML Model Distribution & Autonomous Rollback Architecture: Staged deployment, network transport, and autonomous policy-based rollback (Phase 5.5D Design Only; crash-consistent filesystem activation is not implemented, see [ADR-0009 §31](docs/decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
 * **FUTURE IMPLEMENTATION**:
-  * Simulated action executor and dry-run pipeline integration (Phase 6.3).
-  * Durable mitigation persistence in SQLite WAL storage via Migration v4 (Phase 6.4).
-  * Controlled host actuators, operator approval tickets, and automated telemetry verification (Phase 6.5).
+  * Real host actuators, production remediation, authenticated operator identities, cryptographic approval signatures, approval UI/API, identity federation, and automated telemetry-based post-action verification.
   * Ed25519 cryptographic signing, central model registry service, model distribution network transport, automated policy-driven rollback engine.
 
 ### Running Tests
 
-To verify all modules across the Go workspace:
+To verify all 17 packages across the Go workspace:
 
 ```powershell
 # Using the verification script
