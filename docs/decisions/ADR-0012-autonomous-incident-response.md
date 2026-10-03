@@ -1,6 +1,6 @@
 # ADR-0012: Autonomous Incident Response Architecture and Safety Design
 
-**Status**: Accepted (Phase 6.1 Architecture & Safety Design; Phase 6.2 Deterministic Response Policy Engine & Fail-Closed Safety Validator Implemented)  
+**Status**: Accepted (Phase 6.1 Architecture & Safety Design; Phase 6.2 Policy & Validator; Phase 6.3 Simulated Action Executor; Phase 6.4 Durable Mitigation Persistence & Recovery Implemented)
 **Date**: 2026-10-02  
 **Deciders**: AegisEdge Core Engineering Team  
 **Supersedes**: None  
@@ -450,17 +450,18 @@ In future implementation phases, the response subsystem will emit structured dom
 
 ## 17. Current vs. Future Implementation Roadmap
 
-| Subsystem / Capability | Current Status (Phase 6.2) | Target Implementation Phase |
+| Subsystem / Capability | Current Status (Phase 6.5) | Target Implementation Phase |
 | :--- | :---: | :--- |
 | **Incident Correlation & Lifecycle FSM** | **CURRENTLY IMPLEMENTED** | Phase 5.3–5.5 |
 | **MitigationAction & ActionType Contracts** | **CURRENTLY IMPLEMENTED** | `shared/types/types.go` |
-| **Response Architecture & Safety Specification** | **CURRENTLY IMPLEMENTED** | Phase 6.1 (ADR-0012) |
+| **Response Architecture & Safety Specification** | *DESIGNED / DOCUMENTED* | Phase 6.1 (ADR-0012) |
 | **Deterministic Response Policy Engine** | **CURRENTLY IMPLEMENTED** | Phase 6.2 (`edge/agent/response/policy.go`) |
 | **Fail-Closed Safety Validator** | **CURRENTLY IMPLEMENTED** | Phase 6.2 (`edge/agent/response/validator.go`) |
-| **Simulated Action Executor & Dry-Run Mode** | *DESIGNED (Future Implementation)* | Phase 6.3 |
-| **Durable Mitigation Persistence (Migration v4)** | *DESIGNED (Future Implementation)* | Phase 6.4 |
-| **Controlled Host Actuators & Operator Approval** | *DESIGNED (Future Implementation)* | Phase 6.5 |
-| **Automated Telemetry Verification Engine** | *DESIGNED (Future Implementation)* | Phase 6.5 |
+| **Simulated Action Executor & Dry-Run Mode** | **CURRENTLY IMPLEMENTED** | Phase 6.3 (`edge/agent/response/executor.go`) |
+| **Durable Mitigation Persistence (Migration v4)** | **CURRENTLY IMPLEMENTED** | Phase 6.4 (`edge/agent/storage/sqlite.go`) |
+| **Operator Approval & Safety Gate (Migration v5)** | **CURRENTLY IMPLEMENTED** | Phase 6.5 (`edge/agent/response/approval.go`, `edge/agent/storage/sqlite.go`) |
+| **Real Host Actuators & Production Remediation** | *DESIGNED (Future Implementation)* | Future Phase |
+| **Automated Telemetry Verification Engine** | *DESIGNED (Future Implementation)* | Future Phase |
 
 ---
 
@@ -481,13 +482,28 @@ In future implementation phases, the response subsystem will emit structured dom
 
 ---
 
-## 19. Explicit Limitations of Phase 6.2
+## 19. Explicit Limitations of Phase 6.4
 
-1. **Policy Engine and Safety Validator Only**: Phase 6.2 implements deterministic candidate decision evaluation (`RuleBasedPolicy`) and fail-closed safety validation (`StandardSafetyValidator`).
-2. **Validation Authorization $\neq$ Execution**: Passing the validator means ONLY that the action is authorized to proceed to a future executor (Phase 6.3+). It does NOT execute any host mutations.
-3. **Zero Host Side Effects**: No processes are terminated, no services restarted, no network interfaces altered, no shell commands invoked, and no files mutated on the host.
-4. **Process-Local Non-Durable Cooldown State**: In Phase 6.2, cooldown state is strictly in-memory (`InMemoryCooldownTracker`) and does NOT survive agent process restarts. Durable mitigation persistence and restart recovery belong to Phase 6.4.
-5. **No Database Schema Changes**: Local SQLite schema remains at Migration v3 (`telemetry_batches`, `incident_records`, `incident_observations`). Migration v4 (`mitigation_records`) is deferred to Phase 6.4.
-6. **No Operator UI or Remote Approval APIs**: Approval ticketing workflows and cryptographic authorization signatures are deferred to Phase 6.5. Actions classified as `APPROVAL_REQUIRED` are not auto-authorized in Phase 6.2.
-7. **No Real Host Actuators**: Concrete host manipulation actuators are deferred to Phase 6.5.
+1. **Durable Persistence & Simulated Execution Only**: Phase 6.4 implements durable SQLite WAL persistence (`mitigation_records` via Migration v4) and startup crash recovery for simulated mitigation decisions.
+2. **Zero Real Host Mutation**: Real host actuators remain strictly excluded. Zero process termination, zero service restarts, zero CPU throttling, zero network isolation, zero firewall modifications, zero filesystem remediation, and zero shell commands are executed.
+3. **Startup Recovery Semantics**: If the agent process crashes while a mitigation is marked `EXECUTING`, upon restart the recovery routine transitions the record to `UNKNOWN_RECONCILIATION_REQUIRED`. The system never infers that an external action completed merely because the agent process restarted. Transition of the driving incident to `ESCALATED` upon ambiguous mitigation state is designed future orchestration and is not performed by the local storage layer in this phase.
+4. **Local Durability Boundary**: Mitigation records are persisted through SQLite transactions using the project's configured WAL durability boundary. This provides the application's local durable persistence boundary under SQLite's configured semantics, but does not guarantee survival of every sudden-power-loss, storage-device, or hardware failure scenario. AegisEdge maintains strict non-claims: no zero-data-loss claim, no arbitrary physical power-loss guarantee, no hardware failure guarantee, no distributed exactly-once execution, and no distributed transaction guarantee.
+5. **No Operator UI or Remote Approval APIs**: Approval ticketing workflows and cryptographic authorization signatures remain deferred to Phase 6.5. Actions classified as `APPROVAL_REQUIRED` are not auto-authorized and are marked as `SKIPPED`.
+6. **No Real Host Actuators or Telemetry Verification**: Concrete host manipulation actuators and automated closed-loop telemetry verification belong to Phase 6.5.
 
+---
+
+## 20. Explicit Limitations of Phase 6.5
+
+1. **Operator Approval & Simulation Only**: Phase 6.5 introduces the operator approval lifecycle (`PENDING -> APPROVED -> CONSUMED`), deterministic decision fingerprint binding (`ComputeDecisionFingerprint`), 14-point fail-closed execution-time authorization gate, durable SQLite WAL persistence (Migration v5 `approval_records`), and atomic single-use consumption. Real host actuators remain completely excluded and execution operates strictly against `SimulatedExecutor`.
+2. **Zero Real Host Mutation**: Real host actuators remain strictly excluded. Zero process termination, zero service restarts, zero CPU throttling, zero network isolation, zero firewall modifications, zero filesystem remediation, and zero shell commands are executed.
+3. **Application-Level Operator Identity**: Operator identity is recorded as application-level metadata strings (`approved_by`, `rejected_by`). Strong authentication, RBAC, OAuth2/OIDC, mTLS, and cryptographic approval signatures are deferred to future security milestones.
+4. **Local Durability Boundary**: Approval records and mitigation records are persisted through SQLite transactions using the project's configured WAL durability boundary (`synchronous=NORMAL`). This provides local crash recovery across process restarts, but does not guarantee survival of arbitrary physical power-loss or storage hardware failure. AegisEdge maintains explicit non-claims: no zero-data-loss claim, no arbitrary power-loss guarantee, no hardware failure guarantee, no distributed exactly-once execution, and no distributed transaction guarantee.
+5. **No Direct Incident FSM Mutation**: Mitigation approvals and executions operate on `mitigation_records` and `approval_records`. They do NOT mutate `IncidentStatus` to `RECOVERED` or alter the incident state machine.
+6. **No Real Host Actuators or Telemetry Verification**: Concrete host manipulation actuators and automated closed-loop telemetry verification belong to future phases.
+
+---
+
+## 21. Verification Status
+
+As of Phase 6.5, all 17 packages across the Go workspace compile, pass static analysis (`go vet`), and pass all automated unit and integration tests (`go test -count=1 -p 1 ./...`) cleanly.
