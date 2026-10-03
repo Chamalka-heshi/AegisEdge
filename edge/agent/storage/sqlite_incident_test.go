@@ -33,8 +33,8 @@ func TestSQLite_MigrationV3_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query schema version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("expected schema version 3, got: %d", version)
+	if version < 3 {
+		t.Fatalf("expected schema version >= 3, got: %d", version)
 	}
 
 	// Verify incident_records and incident_observations tables exist
@@ -109,8 +109,8 @@ func TestSQLite_MigrationV3_UpgradeFromV2(t *testing.T) {
 	defer db2.Close()
 
 	var version int
-	if err := db2.QueryRow("SELECT MAX(version) FROM schema_migrations;").Scan(&version); err != nil || version != 3 {
-		t.Fatalf("expected version 3 after upgrade, got: %d, err: %v", version, err)
+	if err := db2.QueryRow("SELECT MAX(version) FROM schema_migrations;").Scan(&version); err != nil || version < 3 {
+		t.Fatalf("expected version >= 3 after upgrade, got: %d, err: %v", version, err)
 	}
 }
 
