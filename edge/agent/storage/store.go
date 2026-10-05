@@ -12,26 +12,31 @@ import (
 
 // Common storage domain errors.
 var (
-	ErrDuplicateBatch              = errors.New("batch with the given batch_id already exists")
-	ErrBatchNotFound               = errors.New("batch not found")
-	ErrStoreClosed                 = errors.New("storage engine is closed")
-	ErrInvalidBatch                = errors.New("cannot persist invalid telemetry batch")
-	ErrDuplicateAnomaly            = errors.New("anomaly with the given anomaly_id already exists")
-	ErrIncidentNotFound            = errors.New("incident not found")
-	ErrInvalidIncident             = errors.New("cannot persist invalid incident")
-	ErrDuplicateMitigation         = errors.New("mitigation with the given action_id or decision_id already exists")
-	ErrMitigationNotFound          = errors.New("mitigation not found")
-	ErrInvalidMitigation           = errors.New("cannot persist invalid mitigation record")
-	ErrInvalidMitigationTransition = errors.New("invalid mitigation status transition")
-	ErrDuplicateApproval           = errors.New("approval with the given decision_id or approval_id already exists")
-	ErrApprovalNotFound            = errors.New("approval not found")
-	ErrInvalidApproval             = errors.New("cannot persist invalid approval record")
-	ErrInvalidApprovalTransition   = errors.New("invalid approval status transition")
-	ErrApprovalExpired             = errors.New("approval has expired")
-	ErrApprovalAlreadyConsumed     = errors.New("approval has already been consumed")
-	ErrApprovalDecisionMismatch    = errors.New("approval decision binding mismatch")
-	ErrForbiddenNotOverridable     = errors.New("forbidden actions cannot be approved or overridden")
-	ErrCannotRejectApproved        = errors.New("cannot reject an already approved approval")
+	ErrDuplicateBatch                = errors.New("batch with the given batch_id already exists")
+	ErrBatchNotFound                 = errors.New("batch not found")
+	ErrStoreClosed                   = errors.New("storage engine is closed")
+	ErrInvalidBatch                  = errors.New("cannot persist invalid telemetry batch")
+	ErrDuplicateAnomaly              = errors.New("anomaly with the given anomaly_id already exists")
+	ErrIncidentNotFound              = errors.New("incident not found")
+	ErrInvalidIncident               = errors.New("cannot persist invalid incident")
+	ErrDuplicateMitigation           = errors.New("mitigation with the given action_id or decision_id already exists")
+	ErrMitigationNotFound            = errors.New("mitigation not found")
+	ErrInvalidMitigation             = errors.New("cannot persist invalid mitigation record")
+	ErrInvalidMitigationTransition   = errors.New("invalid mitigation status transition")
+	ErrDuplicateApproval             = errors.New("approval with the given decision_id or approval_id already exists")
+	ErrApprovalNotFound              = errors.New("approval not found")
+	ErrInvalidApproval               = errors.New("cannot persist invalid approval record")
+	ErrInvalidApprovalTransition     = errors.New("invalid approval status transition")
+	ErrApprovalExpired               = errors.New("approval has expired")
+	ErrApprovalAlreadyConsumed       = errors.New("approval has already been consumed")
+	ErrForbiddenNotOverridable       = errors.New("forbidden actions cannot be approved or overridden")
+	ErrCannotRejectApproved          = errors.New("cannot reject an already approved approval")
+	ErrDuplicateVerification         = errors.New("verification with the given verification_id already exists")
+	ErrVerificationNotFound          = errors.New("verification not found")
+	ErrInvalidVerification           = errors.New("cannot persist invalid verification record")
+	ErrInvalidVerificationTransition = errors.New("invalid verification status transition")
+	ErrVerificationExpired           = errors.New("verification has timed out or expired")
+	ErrVerificationTerminal          = errors.New("verification is in a terminal status and cannot be modified")
 )
 
 // SyncStatus represents the synchronization lifecycle state of a locally stored batch.
@@ -425,4 +430,116 @@ type ApprovalStore interface {
 
 	// CountApprovals returns the total count of approval records stored.
 	CountApprovals(ctx context.Context) (int64, error)
+}
+
+// StoredVerification represents a durably recorded incident recovery verification in SQLite.
+type StoredVerification struct {
+	VerificationID       string                   `json:"verification_id"`
+	IncidentID           string                   `json:"incident_id"`
+	ActionID             string                   `json:"action_id"`
+	DecisionID           string                   `json:"decision_id"`
+	NodeID               string                   `json:"node_id"`
+	MetricName           string                   `json:"metric_name"`
+	ConditionType        string                   `json:"condition_type"`
+	RecoveryThreshold    float64                  `json:"recovery_threshold"`
+	Comparator           string                   `json:"comparator"`
+	Status               types.VerificationStatus `json:"status"`
+	RequiredObservations int                      `json:"required_observations"`
+	ConsecutiveHealthy   int                      `json:"consecutive_healthy"`
+	TotalObservations    int                      `json:"total_observations"`
+	StartedAt            time.Time                `json:"started_at"`
+	ExpiresAt            time.Time                `json:"expires_at"`
+	CompletedAt          *time.Time               `json:"completed_at,omitempty"`
+	RecoveredAt          *time.Time               `json:"recovered_at,omitempty"`
+	LastObservationAt    *time.Time               `json:"last_observation_at,omitempty"`
+	LastObservedValue    *float64                 `json:"last_observed_value,omitempty"`
+	Reason               string                   `json:"reason"`
+	Evidence             map[string]string        `json:"evidence,omitempty"`
+	CreatedAt            time.Time                `json:"created_at"`
+	UpdatedAt            time.Time                `json:"updated_at"`
+}
+
+// Validate checks the structural validity of StoredVerification.
+func (v *StoredVerification) Validate() error {
+	if v == nil {
+		return ErrInvalidVerification
+	}
+	if strings.TrimSpace(v.VerificationID) == "" {
+		return fmt.Errorf("%w: verification_id cannot be empty", ErrInvalidVerification)
+	}
+	if strings.TrimSpace(v.IncidentID) == "" {
+		return fmt.Errorf("%w: incident_id cannot be empty", ErrInvalidVerification)
+	}
+	if strings.TrimSpace(v.ActionID) == "" {
+		return fmt.Errorf("%w: action_id cannot be empty", ErrInvalidVerification)
+	}
+	if strings.TrimSpace(v.DecisionID) == "" {
+		return fmt.Errorf("%w: decision_id cannot be empty", ErrInvalidVerification)
+	}
+	if strings.TrimSpace(v.NodeID) == "" {
+		return fmt.Errorf("%w: node_id cannot be empty", ErrInvalidVerification)
+	}
+	if strings.TrimSpace(v.MetricName) == "" {
+		return fmt.Errorf("%w: metric_name cannot be empty", ErrInvalidVerification)
+	}
+	if strings.TrimSpace(v.ConditionType) == "" {
+		return fmt.Errorf("%w: condition_type cannot be empty", ErrInvalidVerification)
+	}
+	if !v.Status.IsValid() {
+		return fmt.Errorf("%w: invalid verification status %q", ErrInvalidVerification, v.Status)
+	}
+	if v.RequiredObservations <= 0 {
+		return fmt.Errorf("%w: required_observations must be positive", ErrInvalidVerification)
+	}
+	if v.StartedAt.IsZero() {
+		return fmt.Errorf("%w: started_at cannot be zero", ErrInvalidVerification)
+	}
+	if v.ExpiresAt.IsZero() {
+		return fmt.Errorf("%w: expires_at cannot be zero", ErrInvalidVerification)
+	}
+	if v.ExpiresAt.Before(v.StartedAt) {
+		return fmt.Errorf("%w: expires_at cannot be before started_at", ErrInvalidVerification)
+	}
+	return nil
+}
+
+// CanVerificationTransition enforces safe, deterministic state machine transitions for verifications:
+//
+//	PENDING -> RECOVERED | NOT_RECOVERED | TIMED_OUT | CANCELLED
+//
+// Terminal states cannot transition further.
+func CanVerificationTransition(current, next types.VerificationStatus) bool {
+	return current.CanTransitionTo(next)
+}
+
+// VerificationStore defines the durable persistence and recovery contract for incident recovery verifications.
+// Local SQLite WAL storage serves as the durable authority for verification state.
+type VerificationStore interface {
+	// RecordVerification transactionally validates and persists a verification record in PENDING status.
+	// Returns ErrDuplicateVerification if a verification with the same verification_id already exists.
+	RecordVerification(ctx context.Context, v *StoredVerification) error
+
+	// GetVerification retrieves a verification record by its unique VerificationID.
+	// Returns (nil, ErrVerificationNotFound) if not found.
+	GetVerification(ctx context.Context, verificationID string) (*StoredVerification, error)
+
+	// GetVerificationByActionID retrieves a verification record by its ActionID.
+	// Returns (nil, ErrVerificationNotFound) if not found.
+	GetVerificationByActionID(ctx context.Context, actionID string) (*StoredVerification, error)
+
+	// GetActiveVerification retrieves the active (PENDING) verification for a node and metric stream, or nil if none.
+	GetActiveVerification(ctx context.Context, nodeID, metricName string) (*StoredVerification, error)
+
+	// UpdateVerificationProgress updates observations, consecutive healthy count, status, timestamps, and reason.
+	UpdateVerificationProgress(ctx context.Context, verificationID string, status types.VerificationStatus, consecutiveHealthy, totalObservations int, lastObservedValue float64, lastObsAt, completedAt, recoveredAt *time.Time, reason string, evidence map[string]string, now time.Time) error
+
+	// ExpireStaleVerifications transitions any PENDING verifications past their expiration time to TIMED_OUT.
+	ExpireStaleVerifications(ctx context.Context, now time.Time) (int64, error)
+
+	// ListVerifications retrieves verification records matching an optional incidentID (or all if empty),
+	// ordered by started_at ASC, bounded by limit.
+	ListVerifications(ctx context.Context, incidentID string, limit int) ([]*StoredVerification, error)
+
+	// CountVerifications returns the total count of verification records stored.
+	CountVerifications(ctx context.Context) (int64, error)
 }
