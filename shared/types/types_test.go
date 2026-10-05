@@ -1030,3 +1030,147 @@ func TestApprovalStatus_LifecycleAndTransitions(t *testing.T) {
 		}
 	}
 }
+
+// ============================================================================
+// VerificationStatus Lifecycle Tests
+// ============================================================================
+
+func TestVerificationStatus_LifecycleAndTransitions(t *testing.T) {
+	validStatuses := []VerificationStatus{
+		VerificationStatusPending,
+		VerificationStatusRecovered,
+		VerificationStatusNotRecovered,
+		VerificationStatusTimedOut,
+		VerificationStatusCancelled,
+	}
+
+	for _, s := range validStatuses {
+		if !s.IsValid() {
+			t.Errorf("expected status %q to be valid", s)
+		}
+	}
+
+	invalid := VerificationStatus("UNKNOWN_STATUS")
+	if invalid.IsValid() {
+		t.Errorf("expected invalid status to return false")
+	}
+
+	terminalStatuses := []VerificationStatus{
+		VerificationStatusRecovered,
+		VerificationStatusNotRecovered,
+		VerificationStatusTimedOut,
+		VerificationStatusCancelled,
+	}
+	for _, s := range terminalStatuses {
+		if !s.IsTerminal() {
+			t.Errorf("expected status %q to be terminal", s)
+		}
+	}
+	if VerificationStatusPending.IsTerminal() {
+		t.Errorf("PENDING should not be terminal")
+	}
+
+	// Transitions from PENDING
+	allowedFromPending := []VerificationStatus{
+		VerificationStatusRecovered,
+		VerificationStatusNotRecovered,
+		VerificationStatusTimedOut,
+		VerificationStatusCancelled,
+	}
+	for _, next := range allowedFromPending {
+		if !VerificationStatusPending.CanTransitionTo(next) {
+			t.Errorf("PENDING -> %s should be permitted", next)
+		}
+	}
+
+	// Self-transition is permitted
+	if !VerificationStatusPending.CanTransitionTo(VerificationStatusPending) {
+		t.Errorf("PENDING -> PENDING should be permitted")
+	}
+
+	// Terminal states cannot transition further
+	for _, term := range terminalStatuses {
+		for _, next := range validStatuses {
+			if term != next && term.CanTransitionTo(next) {
+				t.Errorf("terminal status %q should not be able to transition to %q", term, next)
+			}
+		}
+	}
+}
+
+// Regression Test: Proves that the original canonical Incident FSM remains strictly unchanged.
+// The established canonical Incident FSM is:
+//
+//	NORMAL -> ANOMALY_DETECTED -> MITIGATING | ESCALATED -> RECOVERED -> NORMAL
+//
+// Phase 6.6 does NOT introduce CONFIRMED, CLOSED, or alter these invariants.
+func TestIncidentFSM_OriginalCanonicalLifecycleRemainsUnchanged(t *testing.T) {
+	// 1. Verify exactly the 5 canonical IncidentStatus values exist and are valid
+	canonicalStatuses := []IncidentStatus{
+		StatusNormal,
+		StatusAnomalyDetected,
+		StatusMitigating,
+		StatusRecovered,
+		StatusEscalated,
+	}
+	for _, s := range canonicalStatuses {
+		if !s.IsValid() {
+			t.Errorf("expected canonical status %q to be valid", s)
+		}
+	}
+
+	// Prohibit non-canonical statuses like CONFIRMED or CLOSED
+	nonCanonical := []IncidentStatus{"CONFIRMED", "CLOSED", "RESOLVED", "TRIAGED"}
+	for _, nc := range nonCanonical {
+		if nc.IsValid() {
+			t.Errorf("non-canonical status %q must NOT be recognized as valid", nc)
+		}
+	}
+
+	// 2. Test exact canonical transitions
+	// NORMAL -> ANOMALY_DETECTED only
+	if !StatusNormal.CanTransitionTo(StatusAnomalyDetected) {
+		t.Errorf("NORMAL -> ANOMALY_DETECTED must be allowed")
+	}
+	if StatusNormal.CanTransitionTo(StatusMitigating) || StatusNormal.CanTransitionTo(StatusRecovered) {
+		t.Errorf("NORMAL cannot directly jump to MITIGATING or RECOVERED")
+	}
+
+	// ANOMALY_DETECTED -> MITIGATING | ESCALATED only (NEVER directly to RECOVERED)
+	if !StatusAnomalyDetected.CanTransitionTo(StatusMitigating) {
+		t.Errorf("ANOMALY_DETECTED -> MITIGATING must be allowed")
+	}
+	if !StatusAnomalyDetected.CanTransitionTo(StatusEscalated) {
+		t.Errorf("ANOMALY_DETECTED -> ESCALATED must be allowed")
+	}
+	if StatusAnomalyDetected.CanTransitionTo(StatusRecovered) {
+		t.Errorf("ANOMALY_DETECTED must NEVER directly transition to RECOVERED")
+	}
+
+	// MITIGATING -> RECOVERED | ESCALATED
+	if !StatusMitigating.CanTransitionTo(StatusRecovered) {
+		t.Errorf("MITIGATING -> RECOVERED must be allowed")
+	}
+	if !StatusMitigating.CanTransitionTo(StatusEscalated) {
+		t.Errorf("MITIGATING -> ESCALATED must be allowed")
+	}
+	if StatusMitigating.CanTransitionTo(StatusNormal) {
+		t.Errorf("MITIGATING cannot transition directly to NORMAL")
+	}
+
+	// RECOVERED -> NORMAL
+	if !StatusRecovered.CanTransitionTo(StatusNormal) {
+		t.Errorf("RECOVERED -> NORMAL must be allowed")
+	}
+	if StatusRecovered.CanTransitionTo(StatusMitigating) {
+		t.Errorf("RECOVERED cannot transition directly to MITIGATING")
+	}
+
+	// ESCALATED -> RECOVERED | NORMAL
+	if !StatusEscalated.CanTransitionTo(StatusRecovered) {
+		t.Errorf("ESCALATED -> RECOVERED must be allowed")
+	}
+	if !StatusEscalated.CanTransitionTo(StatusNormal) {
+		t.Errorf("ESCALATED -> NORMAL must be allowed")
+	}
+}

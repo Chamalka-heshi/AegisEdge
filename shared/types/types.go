@@ -10,29 +10,31 @@ import (
 
 // Common validation errors for domain contracts.
 var (
-	ErrEmptyNodeID              = errors.New("node_id cannot be empty")
-	ErrEmptyBatchID             = errors.New("batch_id cannot be empty")
-	ErrEmptyIncidentID          = errors.New("incident_id cannot be empty")
-	ErrEmptyHostname            = errors.New("hostname cannot be empty")
-	ErrInvalidSequence          = errors.New("sequence_number must be greater than or equal to zero")
-	ErrEmptyMetrics             = errors.New("telemetry batch must contain at least one metric sample")
-	ErrInvalidSeverity          = errors.New("invalid incident severity")
-	ErrInvalidStatus            = errors.New("invalid incident status")
-	ErrInvalidNodeStatus        = errors.New("invalid node status")
-	ErrInvalidTimestamp         = errors.New("timestamp must be positive and non-zero")
-	ErrEmptyMetricName          = errors.New("metric name cannot be empty")
-	ErrInvalidMetricValue       = errors.New("metric value must be a valid finite number (not NaN or Inf)")
-	ErrEmptyActionID            = errors.New("action_id cannot be empty")
-	ErrInvalidActionType        = errors.New("invalid or unauthorized mitigation action type")
-	ErrInvalidActionStatus      = errors.New("invalid mitigation action status")
-	ErrEmptyRuleName            = errors.New("rule_name cannot be empty")
-	ErrInvalidStateTransition   = errors.New("illegal incident state transition")
-	ErrMismatchedIncidentID     = errors.New("mitigation incident_id does not match parent incident_id")
-	ErrMismatchedNodeID         = errors.New("metric sample node_id does not match batch node_id")
-	ErrInvalidResolvedTimestamp = errors.New("resolved_at cannot be prior to triggered_at")
-	ErrInvalidCompletedTime     = errors.New("completed_at cannot be prior to triggered_at")
-	ErrEmptyApprovalID          = errors.New("approval_id cannot be empty")
-	ErrInvalidApprovalStatus    = errors.New("invalid approval status")
+	ErrEmptyNodeID               = errors.New("node_id cannot be empty")
+	ErrEmptyBatchID              = errors.New("batch_id cannot be empty")
+	ErrEmptyIncidentID           = errors.New("incident_id cannot be empty")
+	ErrEmptyHostname             = errors.New("hostname cannot be empty")
+	ErrInvalidSequence           = errors.New("sequence_number must be greater than or equal to zero")
+	ErrEmptyMetrics              = errors.New("telemetry batch must contain at least one metric sample")
+	ErrInvalidSeverity           = errors.New("invalid incident severity")
+	ErrInvalidStatus             = errors.New("invalid incident status")
+	ErrInvalidNodeStatus         = errors.New("invalid node status")
+	ErrInvalidTimestamp          = errors.New("timestamp must be positive and non-zero")
+	ErrEmptyMetricName           = errors.New("metric name cannot be empty")
+	ErrInvalidMetricValue        = errors.New("metric value must be a valid finite number (not NaN or Inf)")
+	ErrEmptyActionID             = errors.New("action_id cannot be empty")
+	ErrInvalidActionType         = errors.New("invalid or unauthorized mitigation action type")
+	ErrInvalidActionStatus       = errors.New("invalid mitigation action status")
+	ErrEmptyRuleName             = errors.New("rule_name cannot be empty")
+	ErrInvalidStateTransition    = errors.New("illegal incident state transition")
+	ErrMismatchedIncidentID      = errors.New("mitigation incident_id does not match parent incident_id")
+	ErrMismatchedNodeID          = errors.New("metric sample node_id does not match batch node_id")
+	ErrInvalidResolvedTimestamp  = errors.New("resolved_at cannot be prior to triggered_at")
+	ErrInvalidCompletedTime      = errors.New("completed_at cannot be prior to triggered_at")
+	ErrEmptyApprovalID           = errors.New("approval_id cannot be empty")
+	ErrInvalidApprovalStatus     = errors.New("invalid approval status")
+	ErrEmptyVerificationID       = errors.New("verification_id cannot be empty")
+	ErrInvalidVerificationStatus = errors.New("invalid verification status")
 )
 
 // ============================================================================
@@ -283,6 +285,58 @@ func (s ApprovalStatus) CanTransitionTo(next ApprovalStatus) bool {
 	case ApprovalStatusApproved:
 		return next == ApprovalStatusConsumed ||
 			next == ApprovalStatusExpired
+	default:
+		return false
+	}
+}
+
+// VerificationStatus denotes the deterministic lifecycle state of incident recovery verification.
+type VerificationStatus string
+
+const (
+	VerificationStatusPending      VerificationStatus = "PENDING"
+	VerificationStatusRecovered    VerificationStatus = "RECOVERED"
+	VerificationStatusNotRecovered VerificationStatus = "NOT_RECOVERED"
+	VerificationStatusTimedOut     VerificationStatus = "TIMED_OUT"
+	VerificationStatusCancelled    VerificationStatus = "CANCELLED"
+)
+
+// IsValid checks whether the verification status is recognized.
+func (s VerificationStatus) IsValid() bool {
+	switch s {
+	case VerificationStatusPending, VerificationStatusRecovered, VerificationStatusNotRecovered,
+		VerificationStatusTimedOut, VerificationStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTerminal checks whether the verification status is terminal (cannot transition further).
+func (s VerificationStatus) IsTerminal() bool {
+	switch s {
+	case VerificationStatusRecovered, VerificationStatusNotRecovered, VerificationStatusTimedOut,
+		VerificationStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// CanTransitionTo enforces the deterministic verification state machine rules:
+//
+//	PENDING -> RECOVERED | NOT_RECOVERED | TIMED_OUT | CANCELLED
+//	Terminal states cannot transition further.
+func (s VerificationStatus) CanTransitionTo(next VerificationStatus) bool {
+	if s == next {
+		return true
+	}
+	switch s {
+	case VerificationStatusPending:
+		return next == VerificationStatusRecovered ||
+			next == VerificationStatusNotRecovered ||
+			next == VerificationStatusTimedOut ||
+			next == VerificationStatusCancelled
 	default:
 		return false
 	}
