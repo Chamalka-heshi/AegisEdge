@@ -10,31 +10,35 @@ import (
 
 // Common validation errors for domain contracts.
 var (
-	ErrEmptyNodeID               = errors.New("node_id cannot be empty")
-	ErrEmptyBatchID              = errors.New("batch_id cannot be empty")
-	ErrEmptyIncidentID           = errors.New("incident_id cannot be empty")
-	ErrEmptyHostname             = errors.New("hostname cannot be empty")
-	ErrInvalidSequence           = errors.New("sequence_number must be greater than or equal to zero")
-	ErrEmptyMetrics              = errors.New("telemetry batch must contain at least one metric sample")
-	ErrInvalidSeverity           = errors.New("invalid incident severity")
-	ErrInvalidStatus             = errors.New("invalid incident status")
-	ErrInvalidNodeStatus         = errors.New("invalid node status")
-	ErrInvalidTimestamp          = errors.New("timestamp must be positive and non-zero")
-	ErrEmptyMetricName           = errors.New("metric name cannot be empty")
-	ErrInvalidMetricValue        = errors.New("metric value must be a valid finite number (not NaN or Inf)")
-	ErrEmptyActionID             = errors.New("action_id cannot be empty")
-	ErrInvalidActionType         = errors.New("invalid or unauthorized mitigation action type")
-	ErrInvalidActionStatus       = errors.New("invalid mitigation action status")
-	ErrEmptyRuleName             = errors.New("rule_name cannot be empty")
-	ErrInvalidStateTransition    = errors.New("illegal incident state transition")
-	ErrMismatchedIncidentID      = errors.New("mitigation incident_id does not match parent incident_id")
-	ErrMismatchedNodeID          = errors.New("metric sample node_id does not match batch node_id")
-	ErrInvalidResolvedTimestamp  = errors.New("resolved_at cannot be prior to triggered_at")
-	ErrInvalidCompletedTime      = errors.New("completed_at cannot be prior to triggered_at")
-	ErrEmptyApprovalID           = errors.New("approval_id cannot be empty")
-	ErrInvalidApprovalStatus     = errors.New("invalid approval status")
-	ErrEmptyVerificationID       = errors.New("verification_id cannot be empty")
-	ErrInvalidVerificationStatus = errors.New("invalid verification status")
+	ErrEmptyNodeID                  = errors.New("node_id cannot be empty")
+	ErrEmptyBatchID                 = errors.New("batch_id cannot be empty")
+	ErrEmptyIncidentID              = errors.New("incident_id cannot be empty")
+	ErrEmptyHostname                = errors.New("hostname cannot be empty")
+	ErrInvalidSequence              = errors.New("sequence_number must be greater than or equal to zero")
+	ErrEmptyMetrics                 = errors.New("telemetry batch must contain at least one metric sample")
+	ErrInvalidSeverity              = errors.New("invalid incident severity")
+	ErrInvalidStatus                = errors.New("invalid incident status")
+	ErrInvalidNodeStatus            = errors.New("invalid node status")
+	ErrInvalidTimestamp             = errors.New("timestamp must be positive and non-zero")
+	ErrEmptyMetricName              = errors.New("metric name cannot be empty")
+	ErrInvalidMetricValue           = errors.New("metric value must be a valid finite number (not NaN or Inf)")
+	ErrEmptyActionID                = errors.New("action_id cannot be empty")
+	ErrInvalidActionType            = errors.New("invalid or unauthorized mitigation action type")
+	ErrInvalidActionStatus          = errors.New("invalid mitigation action status")
+	ErrEmptyRuleName                = errors.New("rule_name cannot be empty")
+	ErrInvalidStateTransition       = errors.New("illegal incident state transition")
+	ErrMismatchedIncidentID         = errors.New("mitigation incident_id does not match parent incident_id")
+	ErrMismatchedNodeID             = errors.New("metric sample node_id does not match batch node_id")
+	ErrInvalidResolvedTimestamp     = errors.New("resolved_at cannot be prior to triggered_at")
+	ErrInvalidCompletedTime         = errors.New("completed_at cannot be prior to triggered_at")
+	ErrEmptyApprovalID              = errors.New("approval_id cannot be empty")
+	ErrInvalidApprovalStatus        = errors.New("invalid approval status")
+	ErrEmptyVerificationID          = errors.New("verification_id cannot be empty")
+	ErrInvalidVerificationStatus    = errors.New("invalid verification status")
+	ErrEmptyEscalationID            = errors.New("escalation_id cannot be empty")
+	ErrInvalidFailureClassification = errors.New("invalid failure classification")
+	ErrInvalidCircuitState          = errors.New("invalid circuit state")
+	ErrInvalidEscalationStatus      = errors.New("invalid escalation status")
 )
 
 // ============================================================================
@@ -337,6 +341,96 @@ func (s VerificationStatus) CanTransitionTo(next VerificationStatus) bool {
 			next == VerificationStatusNotRecovered ||
 			next == VerificationStatusTimedOut ||
 			next == VerificationStatusCancelled
+	default:
+		return false
+	}
+}
+
+// FailureClassification categorizes the exact reason for an automated remediation or verification failure.
+type FailureClassification string
+
+const (
+	FailureMitigationFailed              FailureClassification = "MITIGATION_FAILED"
+	FailureVerificationTimedOut          FailureClassification = "VERIFICATION_TIMED_OUT"
+	FailureVerificationRejected          FailureClassification = "VERIFICATION_REJECTED"
+	FailureUnknownReconciliationRequired FailureClassification = "UNKNOWN_RECONCILIATION_REQUIRED"
+	FailureCooldownActive                FailureClassification = "COOLDOWN_ACTIVE"
+	FailureRetryBudgetExhausted          FailureClassification = "RETRY_BUDGET_EXHAUSTED"
+	FailureCircuitBreakerOpen            FailureClassification = "CIRCUIT_BREAKER_OPEN"
+)
+
+// IsValid checks whether the failure classification is recognized.
+func (f FailureClassification) IsValid() bool {
+	switch f {
+	case FailureMitigationFailed,
+		FailureVerificationTimedOut,
+		FailureVerificationRejected,
+		FailureUnknownReconciliationRequired,
+		FailureCooldownActive,
+		FailureRetryBudgetExhausted,
+		FailureCircuitBreakerOpen:
+		return true
+	default:
+		return false
+	}
+}
+
+// CircuitState represents the operational state of the incident circuit breaker.
+type CircuitState string
+
+const (
+	CircuitClosed CircuitState = "CLOSED"
+	CircuitOpen   CircuitState = "OPEN"
+)
+
+// IsValid checks whether the circuit state is recognized.
+func (c CircuitState) IsValid() bool {
+	switch c {
+	case CircuitClosed, CircuitOpen:
+		return true
+	default:
+		return false
+	}
+}
+
+// EscalationStatus denotes the deterministic lifecycle state of an escalation event.
+type EscalationStatus string
+
+const (
+	EscalationStatusPending   EscalationStatus = "PENDING"
+	EscalationStatusEscalated EscalationStatus = "ESCALATED"
+	EscalationStatusResolved  EscalationStatus = "RESOLVED"
+)
+
+// IsValid checks whether the escalation status is recognized.
+func (s EscalationStatus) IsValid() bool {
+	switch s {
+	case EscalationStatusPending, EscalationStatusEscalated, EscalationStatusResolved:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTerminal checks whether the escalation status is terminal.
+func (s EscalationStatus) IsTerminal() bool {
+	return s == EscalationStatusResolved
+}
+
+// CanTransitionTo enforces deterministic transition rules for escalations:
+//
+//	PENDING   -> ESCALATED | RESOLVED
+//	ESCALATED -> RESOLVED
+//	RESOLVED is terminal.
+func (s EscalationStatus) CanTransitionTo(next EscalationStatus) bool {
+	if s == next {
+		return true
+	}
+	switch s {
+	case EscalationStatusPending:
+		return next == EscalationStatusEscalated || next == EscalationStatusResolved
+	case EscalationStatusEscalated:
+		return next == EscalationStatusResolved
 	default:
 		return false
 	}

@@ -1174,3 +1174,98 @@ func TestIncidentFSM_OriginalCanonicalLifecycleRemainsUnchanged(t *testing.T) {
 		t.Errorf("ESCALATED -> NORMAL must be allowed")
 	}
 }
+
+// ============================================================================
+// Phase 6.7 Escalation & Circuit Breaker Tests
+// ============================================================================
+
+func TestFailureClassification_IsValid(t *testing.T) {
+	valid := []FailureClassification{
+		FailureMitigationFailed,
+		FailureVerificationTimedOut,
+		FailureVerificationRejected,
+		FailureUnknownReconciliationRequired,
+		FailureCooldownActive,
+		FailureRetryBudgetExhausted,
+		FailureCircuitBreakerOpen,
+	}
+
+	for _, fc := range valid {
+		if !fc.IsValid() {
+			t.Errorf("expected classification %q to be valid", fc)
+		}
+	}
+
+	invalid := []FailureClassification{"", "RANDOM_FAILURE", "TIMEOUT", "FAILED"}
+	for _, ifc := range invalid {
+		if ifc.IsValid() {
+			t.Errorf("expected classification %q to be invalid", ifc)
+		}
+	}
+}
+
+func TestCircuitState_IsValid(t *testing.T) {
+	if !CircuitClosed.IsValid() {
+		t.Errorf("CircuitClosed must be valid")
+	}
+	if !CircuitOpen.IsValid() {
+		t.Errorf("CircuitOpen must be valid")
+	}
+	if CircuitState("HALF_OPEN").IsValid() {
+		t.Errorf("HALF_OPEN must not be valid (Phase 6.7 strictly supports CLOSED -> OPEN -> explicit reset -> CLOSED)")
+	}
+	if CircuitState("").IsValid() {
+		t.Errorf("empty circuit state must not be valid")
+	}
+}
+
+func TestEscalationStatus_Lifecycle(t *testing.T) {
+	valid := []EscalationStatus{
+		EscalationStatusPending,
+		EscalationStatusEscalated,
+		EscalationStatusResolved,
+	}
+	for _, s := range valid {
+		if !s.IsValid() {
+			t.Errorf("expected status %q to be valid", s)
+		}
+	}
+	if EscalationStatus("INVALID").IsValid() {
+		t.Errorf("expected INVALID to not be valid")
+	}
+
+	// Terminal check
+	if EscalationStatusPending.IsTerminal() {
+		t.Errorf("PENDING must not be terminal")
+	}
+	if EscalationStatusEscalated.IsTerminal() {
+		t.Errorf("ESCALATED must not be terminal")
+	}
+	if !EscalationStatusResolved.IsTerminal() {
+		t.Errorf("RESOLVED must be terminal")
+	}
+
+	// Transitions
+	if !EscalationStatusPending.CanTransitionTo(EscalationStatusEscalated) {
+		t.Errorf("PENDING -> ESCALATED must be allowed")
+	}
+	if !EscalationStatusPending.CanTransitionTo(EscalationStatusResolved) {
+		t.Errorf("PENDING -> RESOLVED must be allowed")
+	}
+	if !EscalationStatusEscalated.CanTransitionTo(EscalationStatusResolved) {
+		t.Errorf("ESCALATED -> RESOLVED must be allowed")
+	}
+	if EscalationStatusEscalated.CanTransitionTo(EscalationStatusPending) {
+		t.Errorf("ESCALATED -> PENDING must be rejected")
+	}
+	if EscalationStatusResolved.CanTransitionTo(EscalationStatusPending) {
+		t.Errorf("RESOLVED -> PENDING must be rejected")
+	}
+	if EscalationStatusResolved.CanTransitionTo(EscalationStatusEscalated) {
+		t.Errorf("RESOLVED -> ESCALATED must be rejected")
+	}
+	// Self transitions are allowed idempotent no-ops
+	if !EscalationStatusEscalated.CanTransitionTo(EscalationStatusEscalated) {
+		t.Errorf("self-transition must be allowed")
+	}
+}
