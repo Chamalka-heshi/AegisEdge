@@ -1,6 +1,6 @@
 # ADR-0012: Autonomous Incident Response Architecture and Safety Design
 
-**Status**: Accepted (Phase 6.1 Architecture & Safety Design; Phase 6.2 Policy & Validator; Phase 6.3 Simulated Action Executor; Phase 6.4 Durable Mitigation Persistence & Recovery Implemented)
+**Status**: Accepted (Phase 6.1 Architecture & Safety Design; Phase 6.2 Policy & Validator; Phase 6.3 Simulated Action Executor; Phase 6.4 Durable Mitigation Persistence & Recovery; Phase 6.5 Operator Approval; Phase 6.6 Closed-Loop Incident Verification & Recovery Implemented)
 **Date**: 2026-10-02  
 **Deciders**: AegisEdge Core Engineering Team  
 **Supersedes**: None  
@@ -450,7 +450,7 @@ In future implementation phases, the response subsystem will emit structured dom
 
 ## 17. Current vs. Future Implementation Roadmap
 
-| Subsystem / Capability | Current Status (Phase 6.5) | Target Implementation Phase |
+| Subsystem / Capability | Current Status (Phase 6.6) | Target Implementation Phase |
 | :--- | :---: | :--- |
 | **Incident Correlation & Lifecycle FSM** | **CURRENTLY IMPLEMENTED** | Phase 5.3–5.5 |
 | **MitigationAction & ActionType Contracts** | **CURRENTLY IMPLEMENTED** | `shared/types/types.go` |
@@ -460,8 +460,8 @@ In future implementation phases, the response subsystem will emit structured dom
 | **Simulated Action Executor & Dry-Run Mode** | **CURRENTLY IMPLEMENTED** | Phase 6.3 (`edge/agent/response/executor.go`) |
 | **Durable Mitigation Persistence (Migration v4)** | **CURRENTLY IMPLEMENTED** | Phase 6.4 (`edge/agent/storage/sqlite.go`) |
 | **Operator Approval & Safety Gate (Migration v5)** | **CURRENTLY IMPLEMENTED** | Phase 6.5 (`edge/agent/response/approval.go`, `edge/agent/storage/sqlite.go`) |
+| **Automated Telemetry Verification Engine (Migration v6)** | **CURRENTLY IMPLEMENTED** | Phase 6.6 (`edge/agent/verification/engine.go`, `edge/agent/storage/sqlite.go`) |
 | **Real Host Actuators & Production Remediation** | *DESIGNED (Future Implementation)* | Future Phase |
-| **Automated Telemetry Verification Engine** | *DESIGNED (Future Implementation)* | Future Phase |
 
 ---
 
@@ -496,14 +496,67 @@ In future implementation phases, the response subsystem will emit structured dom
 ## 20. Explicit Limitations of Phase 6.5
 
 1. **Operator Approval & Simulation Only**: Phase 6.5 introduces the operator approval lifecycle (`PENDING -> APPROVED -> CONSUMED`), deterministic decision fingerprint binding (`ComputeDecisionFingerprint`), 14-point fail-closed execution-time authorization gate, durable SQLite WAL persistence (Migration v5 `approval_records`), and atomic single-use consumption. Real host actuators remain completely excluded and execution operates strictly against `SimulatedExecutor`.
-2. **Zero Real Host Mutation**: Real host actuators remain strictly excluded. Zero process termination, zero service restarts, zero CPU throttling, zero network isolation, zero firewall modifications, zero filesystem remediation, and zero shell commands are executed.
-3. **Application-Level Operator Identity**: Operator identity is recorded as application-level metadata strings (`approved_by`, `rejected_by`). Strong authentication, RBAC, OAuth2/OIDC, mTLS, and cryptographic approval signatures are deferred to future security milestones.
-4. **Local Durability Boundary**: Approval records and mitigation records are persisted through SQLite transactions using the project's configured WAL durability boundary (`synchronous=NORMAL`). This provides local crash recovery across process restarts, but does not guarantee survival of arbitrary physical power-loss or storage hardware failure. AegisEdge maintains explicit non-claims: no zero-data-loss claim, no arbitrary power-loss guarantee, no hardware failure guarantee, no distributed exactly-once execution, and no distributed transaction guarantee.
-5. **No Direct Incident FSM Mutation**: Mitigation approvals and executions operate on `mitigation_records` and `approval_records`. They do NOT mutate `IncidentStatus` to `RECOVERED` or alter the incident state machine.
-6. **No Real Host Actuators or Telemetry Verification**: Concrete host manipulation actuators and automated closed-loop telemetry verification belong to future phases.
+2. **Deterministic Decision Fingerprint Binding**: The approval decision fingerprint binds exactly eight canonical fields: `DecisionID`, `IncidentID`, `ActionID`, `NodeID`, `ActionType`, `Target`, `PolicyVersion`, and canonical sorted `Parameters`. No timestamps, random nonces, or volatile fields are included. At execution time, `ValidateApprovalForExecution` enforces explicit equality on `IncidentID`, `ActionID`, `NodeID`, `PolicyVersion`, `Target`, `ActionType`, `DecisionID`, and `DecisionFingerprint`.
+3. **Explicit Non-Claims**:
+   - **No Cryptographic Signatures**: Approvals are not digitally signed using asymmetric keys (e.g., Ed25519, RSA).
+   - **No Authenticated Operator Identity**: Operator identities (`approved_by`, `requested_by`, `rejected_by`) are plain application-level metadata strings; no RBAC, OAuth2/OIDC, mTLS, or identity verification is performed.
+   - **No Non-Repudiation**: Without cryptographic signing, approvals provide operational safety binding but cannot guarantee cryptographic non-repudiation.
+   - **No Tamper-Proof Audit Logging**: Approval records are stored in local SQLite WAL tables; cryptographic hash chaining and tamper-evident storage are deferred to future security milestones.
+4. **Zero Real Host Mutation**: Real host actuators remain strictly excluded. Zero process termination, zero service restarts, zero CPU throttling, zero network isolation, zero firewall modifications, zero filesystem remediation, and zero shell commands are executed.
+5. **Local Durability Boundary**: Approval records and mitigation records are persisted through SQLite transactions using the project's configured WAL durability boundary (`synchronous=NORMAL`). This provides local crash recovery across process restarts, but does not guarantee survival of arbitrary physical power-loss or storage hardware failure. AegisEdge maintains explicit non-claims: no zero-data-loss claim, no arbitrary power-loss guarantee, no hardware failure guarantee, no distributed exactly-once execution, and no distributed transaction guarantee.
+6. **No Direct Incident FSM Mutation**: Mitigation approvals and executions operate on `mitigation_records` and `approval_records`. They do NOT mutate `IncidentStatus` to `RECOVERED` or alter the incident state machine.
 
 ---
 
-## 21. Verification Status
+## 21. Phase 6.6 Closed-Loop Incident Verification & Recovery Design & Invariants
 
-As of Phase 6.5, all 17 packages across the Go workspace compile, pass static analysis (`go vet`), and pass all automated unit and integration tests (`go test -count=1 -p 1 ./...`) cleanly.
+Phase 6.6 introduces the closed-loop incident verification subsystem (`edge/agent/verification/engine.go`) situated between action execution and incident recovery.
+
+### 1. Fundamental Principle: Execution Success $\neq$ Incident Recovery
+$$\textbf{"Execution success does not equal recovery."}$$
+A successful mitigation execution (e.g. exit code 0, simulated completion) merely confirms that the actuator completed its configured invocation. It does NOT prove that host health was restored. Recovery must be established exclusively from subsequent empirical telemetry evidence.
+
+### 2. Causality Non-Claim
+$$\textbf{"Recovery confirmation means that the configured recovery condition was satisfied by subsequent telemetry; it does not prove that the mitigation caused the recovery."}$$
+The verification engine confirms temporal correlation between mitigation execution and telemetry stabilization; external environmental shifts, parallel processes, or natural metric dissipation could also account for the recovery. AegisEdge makes no causal proof claims.
+
+### 3. Verification Lifecycle State Machine
+Verification records transition through explicit deterministic states:
+- `PENDING`: Verification active, observing subsequent telemetry stream.
+- `RECOVERED`: Required consecutive healthy observations met before timeout. (Terminal)
+- `NOT_RECOVERED`: Explicit terminal non-recovery decision (e.g. operator/supervisor rejection or hard policy limit). Normal telemetry evaluation on an unhealthy sample resets the consecutive streak to 0 while status remains `PENDING`. (Terminal)
+- `TIMED_OUT`: Observation window expired without meeting required consecutive healthy observations. (Terminal)
+- `CANCELLED`: Explicitly cancelled due to incident escalation, supervisor override, or supersede. (Terminal)
+
+### 4. Streak Dynamics & Hysteresis Semantics
+- **Consecutive Observation Count**: Recovery requires $N$ consecutive healthy samples (default: 3).
+- **Streak Reset**: Any unhealthy telemetry sample resets the consecutive healthy counter to zero (`observed_count = 0`), requiring a fresh streak while remaining in `PENDING`.
+- **Hysteresis Recovery Threshold**: When evaluating threshold rules, the engine tests `sample.Value <= UpperRecoveryThreshold` (or `>= LowerRecoveryThreshold`), preventing flapping around the trigger threshold. Statistical (z-score) and ML recovery conditions are unsupported in this phase and reserved for future implementation.
+
+### 5. Freshness & Idempotent Ordering Guarantees
+- **Freshness Boundary**: Telemetry samples with timestamps prior to mitigation execution completion are rejected as stale (`ErrStaleTelemetrySample`).
+- **SampleID Duplicate Suppression**: Telemetry `SampleID` is the primary deduplication identity. Re-submitting an already processed `SampleID` is rejected with `ErrDuplicateTelemetrySample`. Different `SampleID`s with the same timestamp or value are evaluated normally. Processed `SampleID`s are persisted across restarts to ensure idempotency.
+- **Multi-Dimensional Isolation**: Verifications are strictly isolated by `(NodeID, IncidentID, ActionID, MetricName)`.
+
+### 6. SQLite WAL Durability & Crash Recovery (Migration v6)
+- **Schema**: Dedicated `verification_records` table with indexes on incident, action, status, and node/metric.
+- **Crash Recovery**: On agent restart, `RecoverFromStore` scans pending verifications. Records whose deadline elapsed during downtime are reconciled to `TIMED_OUT`. Unexpired records remain `PENDING` and resume observation in-memory without losing prior streak progress or seen sample identity history.
+
+### 7. Authoritative Incident Engine Handoff Invariants
+- **Authority**: Verification `RECOVERED` does not automatically imply Incident `RECOVERED`. The existing `IncidentEngine` FSM remains authoritative.
+- **Canonical Incident FSM**:
+  $$\textbf{NORMAL} \longrightarrow \textbf{ANOMALY\_DETECTED} \longrightarrow \textbf{MITIGATING / ESCALATED} \longrightarrow \textbf{RECOVERED} \longrightarrow \textbf{NORMAL}$$
+  Phase 6.6 does NOT introduce `CONFIRMED`, `CLOSED`, or any new Incident states.
+- **Strict Handoff Invariant**: `HandoffToIncidentEngine` only resolves the incident via the existing `IncidentEngine.ResolveIncident` method if the incident status is currently `MITIGATING`.
+- **Non-Mitigating Safety**: If the incident is in any other status (`ANOMALY_DETECTED`, `ESCALATED`, or `NORMAL`), the incident remains completely unchanged and returns without error. Incident status is never directly assigned.
+
+### 8. Strict Scope & Safety Boundaries
+- **Zero Real Host Actuation**: All executions remain simulated.
+- **Simulation Boundary Maintained**: No OS commands, shell processes, or container mutations.
+- **Durability Non-Claims**: Local WAL crash recovery under `synchronous=NORMAL`; no claims of zero-data-loss, hardware failure resilience, or distributed consensus.
+
+---
+
+## 22. Verification Status
+
+As of Phase 6.6, all 18 packages across the Go workspace compile, pass static analysis (`go vet`), and pass all automated unit and integration tests (`go test -count=1 -p 1 ./...`) cleanly.
