@@ -557,6 +557,79 @@ Verification records transition through explicit deterministic states:
 
 ---
 
-## 22. Verification Status
+## 22. Phase 6.7 Deterministic Incident Escalation & Circuit Breaker Design & Invariants
 
-As of Phase 6.6, all 18 packages across the Go workspace compile, pass static analysis (`go vet`), and pass all automated unit and integration tests (`go test -count=1 -p 1 ./...`) cleanly.
+Phase 6.7 introduces the deterministic escalation and failure-handling engine (`edge/agent/escalation`) to enforce the critical safety invariant:
+$$\textbf{"NO UNBOUNDED AUTONOMOUS REMEDIATION LOOP."}$$
+
+### 1. Fundamental Principle: Bounded Autonomous Remediation
+AegisEdge must not repeatedly execute the same mitigation forever when recovery fails or conditions worsen. Autonomous remediation must be strictly bounded in retry count, rate-limited by cooldown intervals, constrained within a temporal failure window, and guarded by a fail-closed circuit breaker.
+
+### 2. Failure Classifications
+Phase 6.7 formalizes 7 deterministic failure classifications:
+- `MITIGATION_FAILED`: The simulated mitigation action failed during execution.
+- `VERIFICATION_TIMED_OUT`: The closed-loop verification observation window elapsed without satisfying recovery criteria.
+- `VERIFICATION_REJECTED`: Verification observed immediate negative regression or explicit policy rejection, requiring immediate escalation.
+- `UNKNOWN_RECONCILIATION_REQUIRED`: The actuator or execution engine reached an unknown state, requiring immediate operator investigation; autonomous retry is strictly forbidden.
+- `COOLDOWN_ACTIVE`: An autonomous retry was evaluated while the cooldown timer has not yet expired; execution is held.
+- `RETRY_BUDGET_EXHAUSTED`: The maximum number of automatic mitigation retries has been reached; autonomous retries cease.
+- `CIRCUIT_BREAKER_OPEN`: Repeated failures within the sliding window reached the failure threshold, tripping the circuit breaker to `OPEN`.
+
+### 3. Circuit Breaker Semantics
+- **State Transition**: strictly `CLOSED` $\rightarrow$ `OPEN` $\rightarrow$ explicit operator reset $\rightarrow$ `CLOSED`.
+- **Fail-Closed**: Once the circuit breaker is `OPEN`, ALL autonomous remediation on the node and incident is strictly prohibited.
+- **Explicit Reset**: Resetting the breaker requires operator identity (`reset_by`). No automated timer resets `OPEN` back to `CLOSED` (no half-open state in Phase 6.7).
+- **Restart Survival**: The `OPEN` state is persisted durably in the `circuit_breaker_states` SQLite table and survives process crashes and restarts.
+
+### 4. Deterministic Identity Formula
+Escalation identity is computed via SHA-256 over:
+$$\text{IncidentID} \mid \text{NodeID} \mid \text{ActionID} \mid \text{FailureClassification} \mid \text{PolicyVersion} \mid \text{Attempt}$$
+This contains zero random bytes and zero timestamps, guaranteeing identical, idempotent IDs across concurrent evaluations and retries.
+
+### 5. SQLite WAL Persistence (Migration v7)
+- `escalation_records`: Durably logs every escalation and retry attempt with classification, attempt counter, status, reason, evidence, and timestamps.
+- `circuit_breaker_states`: Durably tracks breaker state (`CLOSED`/`OPEN`), failure count, tripped timestamp, and operator reset details.
+
+### 6. Authoritative Incident Engine Handoff
+- **Authority**: The canonical Incident FSM (`NORMAL -> ANOMALY_DETECTED -> MITIGATING / ESCALATED -> RECOVERED -> NORMAL`) remains authoritative.
+- Escalation engine calls `IncidentEngine.TransitionActiveIncident(..., types.StatusEscalated, now)`.
+- It never directly mutates `Incident.Status` and never bypasses IncidentEngine validation.
+- If the incident is already `ESCALATED`, handoff is a safe idempotent no-op.
+- If the incident is in `RECOVERED` or `NORMAL`, the handoff does not forge invalid transitions.
+
+### 7. Retry Semantics & Scope
+- **Retry Semantics**: `MaxAutomaticRetries` defines the maximum number of automatic retries permitted AFTER the initial failed mitigation attempt. For `MaxAutomaticRetries = 3`, the engine permits at most 3 retries following the initial failure (yielding a maximum bound of 1 initial + 3 retries = 4 total mitigation executions). When attempt count reaches `MaxAutomaticRetries + 1` (attempt 4), the retry budget is exhausted and no further retries occur.
+- **Circuit Breaker Scope**: The Phase 6.7 circuit breaker is scoped to the node/incident pair `(NodeID, IncidentID)`. Opening the circuit for Incident A on Node 1 does not affect Incident B on Node 1, nor Incident A on Node 2.
+- **Integration Boundary**: Phase 6.7 provides `EvaluateFailure`, `EvaluateMitigationResult`, and `EvaluateVerificationResult` as domain services. In the current Phase 6.7 implementation, these services are exposed for invocation by upstream orchestrators and domain workflows; automatic end-to-end chaining across separate pipeline packages is designed for subsequent orchestration phases.
+
+### 8. Failure Handling & Resilience Matrix (16 Conditions)
+
+| # | Failure / Edge Condition | Engine Behavior | Circuit Breaker Impact | Incident FSM Impact |
+| :---: | :--- | :--- | :--- | :--- |
+| **1** | **Mitigation Failure** | Evaluates failure; permits retry if within budget and cooldown elapsed. | Remains `CLOSED` unless threshold reached | Remains `MITIGATING` |
+| **2** | **Verification Timeout** | Evaluates failure as `VERIFICATION_TIMED_OUT`; permits retry if within budget. | Remains `CLOSED` unless threshold reached | Remains `MITIGATING` |
+| **3** | **Verification Rejection** | Terminal `NOT_RECOVERED` or regression; evaluates as `VERIFICATION_REJECTED`. | Remains `CLOSED` (isolated policy event) | Transitions to `ESCALATED` |
+| **4** | **Cooldown Active** | Returns `DecisionActionNone` and `COOLDOWN_ACTIVE`; does NOT increment failure count. | Unchanged | Unchanged |
+| **5** | **Retry Budget Exhausted** | Attempt exceeds `MaxAutomaticRetries`; produces `RETRY_BUDGET_EXHAUSTED`. | Trips to `OPEN` | Transitions to `ESCALATED` |
+| **6** | **Circuit Open** | Autonomous remediation blocked; returns `CIRCUIT_BREAKER_OPEN`. | Remains `OPEN` until operator reset | Transitions to `ESCALATED` |
+| **7** | **Duplicate Failure** | Idempotently recognized by deterministic SHA-256 `EscalationID`. | Unchanged | Unchanged |
+| **8** | **Restart During Cooldown** | Cooldown timestamp reconstructed from SQLite; holds retries until expiry. | Unchanged | Unchanged |
+| **9** | **Restart While Circuit Open** | Breaker `OPEN` state reconstructed from SQLite; blocks remediation immediately. | Remains `OPEN` | Unchanged |
+| **10** | **Stale Failure for Recovered Incident** | Handoff checks canonical FSM; `RECOVERED -> ESCALATED` is rejected. | Unchanged | FSM rejects transition; stays `RECOVERED` |
+| **11** | **Stale Failure for Normal Incident** | Handoff checks canonical FSM; `NORMAL -> ESCALATED` is rejected. | Unchanged | FSM rejects transition; stays `NORMAL` |
+| **12** | **Unknown Mitigation State** | `UNKNOWN_RECONCILIATION_REQUIRED`; immediate escalation; retry forbidden. | Remains `CLOSED` | Transitions to `ESCALATED` |
+| **13** | **Corrupted Escalation Record** | Store validation rejects malformed payload with `ErrInvalidEscalation`. | Unchanged | Unchanged |
+| **14** | **Concurrent Duplicate Escalation** | Mutex serializes evaluation; unique index in SQLite prevents duplicate records. | Consistently trips if threshold reached | Transitions once idempotently |
+| **15** | **SQLite Storage Unavailable** | Fail-closed: storage errors reject evaluation; no unpersisted retries permitted. | Fails closed | Holds active state |
+| **16** | **Invalid Policy Config** | `Validate()` rejects negative cooldown, negative retries, or zero window at init. | Engine initialization fails closed | Unchanged |
+
+### 9. Strict Safety Boundaries & Non-Claims
+- **Zero Real Host Actuation**: All executions remain simulated.
+- **Simulation Boundary Maintained**: No OS commands, shell processes, or container mutations.
+- **Durability Non-Claims**: Local WAL crash recovery under `synchronous=NORMAL`; no claims of zero-data-loss, hardware failure resilience, or distributed consensus.
+
+---
+
+## 23. Verification Status
+
+As of Phase 6.7, all 19 packages across the Go workspace compile, pass static analysis (`go vet`), and pass all automated unit and integration tests (`go test -count=1 -p 1 ./...`) cleanly.
