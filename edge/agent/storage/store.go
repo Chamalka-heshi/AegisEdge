@@ -37,6 +37,10 @@ var (
 	ErrInvalidVerificationTransition = errors.New("invalid verification status transition")
 	ErrVerificationExpired           = errors.New("verification has timed out or expired")
 	ErrVerificationTerminal          = errors.New("verification is in a terminal status and cannot be modified")
+	ErrDuplicateEscalation           = errors.New("escalation record with the given escalation_id already exists")
+	ErrEscalationNotFound            = errors.New("escalation record not found")
+	ErrInvalidEscalation             = errors.New("cannot persist invalid escalation record")
+	ErrInvalidCircuitStateRecord     = errors.New("cannot persist invalid circuit breaker state")
 )
 
 // SyncStatus represents the synchronization lifecycle state of a locally stored batch.
@@ -542,4 +546,119 @@ type VerificationStore interface {
 
 	// CountVerifications returns the total count of verification records stored.
 	CountVerifications(ctx context.Context) (int64, error)
+}
+
+// StoredEscalation represents a durably recorded failure escalation record in SQLite.
+type StoredEscalation struct {
+	EscalationID          string                      `json:"escalation_id"`
+	IncidentID            string                      `json:"incident_id"`
+	NodeID                string                      `json:"node_id"`
+	ActionID              string                      `json:"action_id"`
+	PolicyVersion         string                      `json:"policy_version"`
+	FailureClassification types.FailureClassification `json:"failure_classification"`
+	Status                types.EscalationStatus      `json:"status"`
+	Attempt               int                         `json:"attempt"`
+	MaxAttempts           int                         `json:"max_attempts"`
+	Reason                string                      `json:"reason"`
+	Evidence              map[string]string           `json:"evidence,omitempty"`
+	CreatedAt             time.Time                   `json:"created_at"`
+	UpdatedAt             time.Time                   `json:"updated_at"`
+	ResolvedAt            *time.Time                  `json:"resolved_at,omitempty"`
+}
+
+// Validate verifies the StoredEscalation payload before persistence.
+func (e *StoredEscalation) Validate() error {
+	if strings.TrimSpace(e.EscalationID) == "" {
+		return fmt.Errorf("%w: escalation_id cannot be empty", ErrInvalidEscalation)
+	}
+	if strings.TrimSpace(e.IncidentID) == "" {
+		return fmt.Errorf("%w: incident_id cannot be empty", ErrInvalidEscalation)
+	}
+	if strings.TrimSpace(e.NodeID) == "" {
+		return fmt.Errorf("%w: node_id cannot be empty", ErrInvalidEscalation)
+	}
+	if !e.FailureClassification.IsValid() {
+		return fmt.Errorf("%w: invalid failure classification %q", ErrInvalidEscalation, e.FailureClassification)
+	}
+	if !e.Status.IsValid() {
+		return fmt.Errorf("%w: invalid escalation status %q", ErrInvalidEscalation, e.Status)
+	}
+	if e.Attempt < 0 {
+		return fmt.Errorf("%w: attempt cannot be negative", ErrInvalidEscalation)
+	}
+	if e.MaxAttempts < 0 {
+		return fmt.Errorf("%w: max_attempts cannot be negative", ErrInvalidEscalation)
+	}
+	if e.CreatedAt.IsZero() {
+		return fmt.Errorf("%w: created_at cannot be zero", ErrInvalidEscalation)
+	}
+	if e.ResolvedAt != nil && e.ResolvedAt.Before(e.CreatedAt) {
+		return fmt.Errorf("%w: resolved_at cannot be before created_at", ErrInvalidEscalation)
+	}
+	return nil
+}
+
+// StoredCircuitState records the persistent circuit breaker state for a node and incident in SQLite.
+type StoredCircuitState struct {
+	NodeID       string             `json:"node_id"`
+	IncidentID   string             `json:"incident_id"`
+	State        types.CircuitState `json:"circuit_state"`
+	FailureCount int                `json:"failure_count"`
+	TrippedAt    *time.Time         `json:"tripped_at,omitempty"`
+	ResetAt      *time.Time         `json:"reset_at,omitempty"`
+	ResetBy      string             `json:"reset_by,omitempty"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+}
+
+// Validate verifies the StoredCircuitState payload.
+func (c *StoredCircuitState) Validate() error {
+	if strings.TrimSpace(c.NodeID) == "" {
+		return fmt.Errorf("%w: node_id cannot be empty", ErrInvalidCircuitStateRecord)
+	}
+	if strings.TrimSpace(c.IncidentID) == "" {
+		return fmt.Errorf("%w: incident_id cannot be empty", ErrInvalidCircuitStateRecord)
+	}
+	if !c.State.IsValid() {
+		return fmt.Errorf("%w: invalid circuit state %q", ErrInvalidCircuitStateRecord, c.State)
+	}
+	if c.FailureCount < 0 {
+		return fmt.Errorf("%w: failure_count cannot be negative", ErrInvalidCircuitStateRecord)
+	}
+	if c.UpdatedAt.IsZero() {
+		return fmt.Errorf("%w: updated_at cannot be zero", ErrInvalidCircuitStateRecord)
+	}
+	return nil
+}
+
+// EscalationStore defines the durable persistence and recovery contract for incident escalations and circuit breaker states.
+type EscalationStore interface {
+	// RecordEscalation transactionally validates and persists an escalation record.
+	// Returns ErrDuplicateEscalation if a record with the same escalation_id already exists.
+	RecordEscalation(ctx context.Context, esc *StoredEscalation) error
+
+	// GetEscalation retrieves an escalation record by its unique EscalationID.
+	// Returns (nil, ErrEscalationNotFound) if not found.
+	GetEscalation(ctx context.Context, escalationID string) (*StoredEscalation, error)
+
+	// ListEscalations retrieves escalation records matching an optional incidentID (or all if empty),
+	// ordered by created_at ASC, bounded by limit.
+	ListEscalations(ctx context.Context, incidentID string, limit int) ([]*StoredEscalation, error)
+
+	// CountFailuresInWindow counts how many failure records occurred for a given node and incident within [since, now].
+	CountFailuresInWindow(ctx context.Context, nodeID, incidentID string, since time.Time) (int, error)
+
+	// GetLatestEscalation retrieves the most recent escalation record for a given node and incident, or nil if none.
+	GetLatestEscalation(ctx context.Context, nodeID, incidentID string) (*StoredEscalation, error)
+
+	// UpdateEscalationStatus updates status, resolved_at, reason, and updated_at.
+	UpdateEscalationStatus(ctx context.Context, escalationID string, next types.EscalationStatus, resolvedAt *time.Time, reason string, now time.Time) error
+
+	// GetCircuitState retrieves the circuit breaker state for a node and incident, or nil if none.
+	GetCircuitState(ctx context.Context, nodeID, incidentID string) (*StoredCircuitState, error)
+
+	// SetCircuitState persists or updates the circuit breaker state.
+	SetCircuitState(ctx context.Context, state *StoredCircuitState) error
+
+	// CountEscalations returns total escalation records stored.
+	CountEscalations(ctx context.Context) (int64, error)
 }
