@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -275,6 +276,49 @@ func (s *SQLiteStore) runMigrations() error {
 		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?);`
 		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("failed to record migration v5: %w", err)
+		}
+	}
+
+	// 8. Migration v6: verification_records table and indexes for closed-loop incident verification (Phase 6.6)
+	if currentVersion < 6 {
+		createVerificationTable := `
+		CREATE TABLE IF NOT EXISTS verification_records (
+			verification_id TEXT PRIMARY KEY,
+			incident_id TEXT NOT NULL,
+			action_id TEXT NOT NULL,
+			decision_id TEXT NOT NULL,
+			node_id TEXT NOT NULL,
+			metric_name TEXT NOT NULL,
+			condition_type TEXT NOT NULL,
+			recovery_threshold REAL NOT NULL,
+			comparator TEXT NOT NULL,
+			status TEXT NOT NULL,
+			required_observations INTEGER NOT NULL,
+			consecutive_healthy INTEGER NOT NULL DEFAULT 0,
+			total_observations INTEGER NOT NULL DEFAULT 0,
+			started_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			completed_at TEXT,
+			recovered_at TEXT,
+			last_observation_at TEXT,
+			last_observed_value REAL,
+			reason TEXT NOT NULL DEFAULT '',
+			evidence TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_verification_records_incident ON verification_records(incident_id);
+		CREATE INDEX IF NOT EXISTS idx_verification_records_node_metric ON verification_records(node_id, metric_name);
+		CREATE INDEX IF NOT EXISTS idx_verification_records_status ON verification_records(status);
+		CREATE INDEX IF NOT EXISTS idx_verification_records_action ON verification_records(action_id);
+		`
+		if _, err := tx.ExecContext(ctx, createVerificationTable); err != nil {
+			return fmt.Errorf("migration v6 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v6: %w", err)
 		}
 	}
 
@@ -1289,10 +1333,18 @@ func formatDBTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-// Ensure SQLiteStore implements MitigationStore and ApprovalStore.
+func nullStringFromTimePtr(t *time.Time) sql.NullString {
+	if t == nil || t.IsZero() {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: formatDBTime(*t), Valid: true}
+}
+
+// Ensure SQLiteStore implements MitigationStore, ApprovalStore, and VerificationStore.
 var (
-	_ MitigationStore = (*SQLiteStore)(nil)
-	_ ApprovalStore   = (*SQLiteStore)(nil)
+	_ MitigationStore   = (*SQLiteStore)(nil)
+	_ ApprovalStore     = (*SQLiteStore)(nil)
+	_ VerificationStore = (*SQLiteStore)(nil)
 )
 
 // RecordMitigation transactionally validates and persists a mitigation record.
@@ -2378,4 +2430,456 @@ func scanApproval(s scanner) (*StoredApproval, error) {
 	}
 
 	return &app, nil
+}
+
+// ============================================================================
+// VerificationStore Implementation (Phase 6.6)
+// ============================================================================
+
+// RecordVerification transactionally validates and persists a verification record in PENDING status.
+func (s *SQLiteStore) RecordVerification(ctx context.Context, v *StoredVerification) error {
+	if err := v.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	evidenceJSON := "{}"
+	if len(v.Evidence) > 0 {
+		b, err := json.Marshal(v.Evidence)
+		if err == nil {
+			evidenceJSON = string(b)
+		}
+	}
+
+	query := `
+	INSERT INTO verification_records (
+		verification_id, incident_id, action_id, decision_id, node_id,
+		metric_name, condition_type, recovery_threshold, comparator, status,
+		required_observations, consecutive_healthy, total_observations,
+		started_at, expires_at, completed_at, recovered_at,
+		last_observation_at, last_observed_value, reason, evidence,
+		created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	`
+
+	_, err := s.db.ExecContext(ctx, query,
+		v.VerificationID,
+		v.IncidentID,
+		v.ActionID,
+		v.DecisionID,
+		v.NodeID,
+		v.MetricName,
+		v.ConditionType,
+		v.RecoveryThreshold,
+		v.Comparator,
+		string(v.Status),
+		v.RequiredObservations,
+		v.ConsecutiveHealthy,
+		v.TotalObservations,
+		formatDBTime(v.StartedAt),
+		formatDBTime(v.ExpiresAt),
+		nullStringFromTimePtr(v.CompletedAt),
+		nullStringFromTimePtr(v.RecoveredAt),
+		nullStringFromTimePtr(v.LastObservationAt),
+		v.LastObservedValue,
+		v.Reason,
+		evidenceJSON,
+		formatDBTime(v.CreatedAt),
+		formatDBTime(v.UpdatedAt),
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return ErrDuplicateVerification
+		}
+		return fmt.Errorf("failed to record verification: %w", err)
+	}
+
+	return nil
+}
+
+// GetVerification retrieves a verification record by its unique VerificationID.
+func (s *SQLiteStore) GetVerification(ctx context.Context, verificationID string) (*StoredVerification, error) {
+	if strings.TrimSpace(verificationID) == "" {
+		return nil, errors.New("verification_id cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT verification_id, incident_id, action_id, decision_id, node_id,
+	       metric_name, condition_type, recovery_threshold, comparator, status,
+	       required_observations, consecutive_healthy, total_observations,
+	       started_at, expires_at, completed_at, recovered_at,
+	       last_observation_at, last_observed_value, reason, evidence,
+	       created_at, updated_at
+	FROM verification_records
+	WHERE verification_id = ?;
+	`
+	row := s.db.QueryRowContext(ctx, query, verificationID)
+	v, err := scanVerification(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrVerificationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// GetVerificationByActionID retrieves a verification record by its ActionID.
+func (s *SQLiteStore) GetVerificationByActionID(ctx context.Context, actionID string) (*StoredVerification, error) {
+	if strings.TrimSpace(actionID) == "" {
+		return nil, errors.New("action_id cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT verification_id, incident_id, action_id, decision_id, node_id,
+	       metric_name, condition_type, recovery_threshold, comparator, status,
+	       required_observations, consecutive_healthy, total_observations,
+	       started_at, expires_at, completed_at, recovered_at,
+	       last_observation_at, last_observed_value, reason, evidence,
+	       created_at, updated_at
+	FROM verification_records
+	WHERE action_id = ?
+	ORDER BY started_at DESC LIMIT 1;
+	`
+	row := s.db.QueryRowContext(ctx, query, actionID)
+	v, err := scanVerification(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrVerificationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// GetActiveVerification retrieves the active (PENDING) verification for a node and metric stream, or nil if none.
+func (s *SQLiteStore) GetActiveVerification(ctx context.Context, nodeID, metricName string) (*StoredVerification, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT verification_id, incident_id, action_id, decision_id, node_id,
+	       metric_name, condition_type, recovery_threshold, comparator, status,
+	       required_observations, consecutive_healthy, total_observations,
+	       started_at, expires_at, completed_at, recovered_at,
+	       last_observation_at, last_observed_value, reason, evidence,
+	       created_at, updated_at
+	FROM verification_records
+	WHERE node_id = ? AND metric_name = ? AND status = 'PENDING'
+	ORDER BY started_at DESC LIMIT 1;
+	`
+	row := s.db.QueryRowContext(ctx, query, nodeID, metricName)
+	v, err := scanVerification(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// UpdateVerificationProgress updates observations, consecutive healthy count, status, timestamps, and reason.
+func (s *SQLiteStore) UpdateVerificationProgress(ctx context.Context, verificationID string, status types.VerificationStatus, consecutiveHealthy, totalObservations int, lastObservedValue float64, lastObsAt, completedAt, recoveredAt *time.Time, reason string, evidence map[string]string, now time.Time) error {
+	if strings.TrimSpace(verificationID) == "" {
+		return errors.New("verification_id cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var currStatusStr string
+	queryCurr := `SELECT status FROM verification_records WHERE verification_id = ?;`
+	err = tx.QueryRowContext(ctx, queryCurr, verificationID).Scan(&currStatusStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrVerificationNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	currStatus := types.VerificationStatus(currStatusStr)
+	if currStatus.IsTerminal() && currStatus != status {
+		return ErrVerificationTerminal
+	}
+	if !currStatus.CanTransitionTo(status) {
+		return fmt.Errorf("%w: cannot transition from %s to %s", ErrInvalidVerificationTransition, currStatus, status)
+	}
+
+	evidenceJSON := "{}"
+	if len(evidence) > 0 {
+		b, err := json.Marshal(evidence)
+		if err == nil {
+			evidenceJSON = string(b)
+		}
+	}
+
+	var lastObsValPtr *float64
+	if !math.IsNaN(lastObservedValue) && !math.IsInf(lastObservedValue, 0) {
+		lastObsValPtr = &lastObservedValue
+	}
+
+	updateQuery := `
+	UPDATE verification_records
+	SET status = ?, consecutive_healthy = ?, total_observations = ?,
+	    last_observed_value = ?, last_observation_at = ?,
+	    completed_at = ?, recovered_at = ?, reason = ?, evidence = ?, updated_at = ?
+	WHERE verification_id = ?;
+	`
+	_, err = tx.ExecContext(ctx, updateQuery,
+		string(status),
+		consecutiveHealthy,
+		totalObservations,
+		lastObsValPtr,
+		nullStringFromTimePtr(lastObsAt),
+		nullStringFromTimePtr(completedAt),
+		nullStringFromTimePtr(recoveredAt),
+		reason,
+		evidenceJSON,
+		formatDBTime(now),
+		verificationID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update verification progress: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// ExpireStaleVerifications transitions any PENDING verifications past their expiration time to TIMED_OUT.
+func (s *SQLiteStore) ExpireStaleVerifications(ctx context.Context, now time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	query := `
+	UPDATE verification_records
+	SET status = 'TIMED_OUT', reason = 'verification deadline elapsed without recovery confirmation', updated_at = ?
+	WHERE status = 'PENDING' AND expires_at <= ?;
+	`
+	res, err := s.db.ExecContext(ctx, query, formatDBTime(now), formatDBTime(now))
+	if err != nil {
+		return 0, fmt.Errorf("failed to expire stale verifications: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// RecoverInFlightVerifications checks PENDING verifications upon process startup/reboot.
+// Records whose expiration deadline has passed are transitioned to TIMED_OUT.
+// Records whose expiration deadline is in the future remain PENDING.
+func (s *SQLiteStore) RecoverInFlightVerifications(ctx context.Context, now time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	query := `
+	UPDATE verification_records
+	SET status = 'TIMED_OUT',
+	    reason = 'verification expired during agent restart or offline window',
+	    updated_at = ?
+	WHERE status = 'PENDING' AND expires_at <= ?;
+	`
+	res, err := s.db.ExecContext(ctx, query, formatDBTime(now), formatDBTime(now))
+	if err != nil {
+		return 0, fmt.Errorf("failed to recover in-flight verifications: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// ListVerifications retrieves verification records matching an optional incidentID (or all if empty),
+// ordered by started_at ASC, bounded by limit.
+func (s *SQLiteStore) ListVerifications(ctx context.Context, incidentID string, limit int) ([]*StoredVerification, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var rows *sql.Rows
+	var err error
+	if incidentID != "" {
+		query := `
+		SELECT verification_id, incident_id, action_id, decision_id, node_id,
+		       metric_name, condition_type, recovery_threshold, comparator, status,
+		       required_observations, consecutive_healthy, total_observations,
+		       started_at, expires_at, completed_at, recovered_at,
+		       last_observation_at, last_observed_value, reason, evidence,
+		       created_at, updated_at
+		FROM verification_records
+		WHERE incident_id = ?
+		ORDER BY started_at ASC
+		LIMIT ?;
+		`
+		rows, err = s.db.QueryContext(ctx, query, incidentID, limit)
+	} else {
+		query := `
+		SELECT verification_id, incident_id, action_id, decision_id, node_id,
+		       metric_name, condition_type, recovery_threshold, comparator, status,
+		       required_observations, consecutive_healthy, total_observations,
+		       started_at, expires_at, completed_at, recovered_at,
+		       last_observation_at, last_observed_value, reason, evidence,
+		       created_at, updated_at
+		FROM verification_records
+		ORDER BY started_at ASC
+		LIMIT ?;
+		`
+		rows, err = s.db.QueryContext(ctx, query, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []*StoredVerification
+	for rows.Next() {
+		v, err := scanVerification(rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// CountVerifications returns the total count of verification records stored.
+func (s *SQLiteStore) CountVerifications(ctx context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	query := `SELECT COUNT(*) FROM verification_records;`
+	var count int64
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count verifications: %w", err)
+	}
+	return count, nil
+}
+
+func scanVerification(s scanner) (*StoredVerification, error) {
+	var (
+		v            StoredVerification
+		statusStr    string
+		startedStr   string
+		expiresStr   string
+		completedStr sql.NullString
+		recoveredStr sql.NullString
+		lastObsAtStr sql.NullString
+		lastObsVal   sql.NullFloat64
+		evidenceStr  string
+		createdStr   string
+		updatedStr   string
+	)
+
+	err := s.Scan(
+		&v.VerificationID,
+		&v.IncidentID,
+		&v.ActionID,
+		&v.DecisionID,
+		&v.NodeID,
+		&v.MetricName,
+		&v.ConditionType,
+		&v.RecoveryThreshold,
+		&v.Comparator,
+		&statusStr,
+		&v.RequiredObservations,
+		&v.ConsecutiveHealthy,
+		&v.TotalObservations,
+		&startedStr,
+		&expiresStr,
+		&completedStr,
+		&recoveredStr,
+		&lastObsAtStr,
+		&lastObsVal,
+		&v.Reason,
+		&evidenceStr,
+		&createdStr,
+		&updatedStr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	v.Status = types.VerificationStatus(statusStr)
+	v.StartedAt, _ = parseDBTime(startedStr)
+	v.ExpiresAt, _ = parseDBTime(expiresStr)
+	v.CreatedAt, _ = parseDBTime(createdStr)
+	v.UpdatedAt, _ = parseDBTime(updatedStr)
+	if completedStr.Valid && completedStr.String != "" {
+		t, err := parseDBTime(completedStr.String)
+		if err == nil {
+			v.CompletedAt = &t
+		}
+	}
+	if recoveredStr.Valid && recoveredStr.String != "" {
+		t, err := parseDBTime(recoveredStr.String)
+		if err == nil {
+			v.RecoveredAt = &t
+		}
+	}
+	if lastObsAtStr.Valid && lastObsAtStr.String != "" {
+		t, err := parseDBTime(lastObsAtStr.String)
+		if err == nil {
+			v.LastObservationAt = &t
+		}
+	}
+	if lastObsVal.Valid {
+		val := lastObsVal.Float64
+		v.LastObservedValue = &val
+	}
+	if evidenceStr != "" && evidenceStr != "{}" {
+		_ = json.Unmarshal([]byte(evidenceStr), &v.Evidence)
+	}
+
+	return &v, nil
 }
