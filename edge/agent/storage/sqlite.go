@@ -322,6 +322,54 @@ func (s *SQLiteStore) runMigrations() error {
 		}
 	}
 
+	// 9. Migration v7: escalation_records and circuit_breaker_states tables and indexes (Phase 6.7)
+	if currentVersion < 7 {
+		createEscalationTable := `
+		CREATE TABLE IF NOT EXISTS escalation_records (
+			escalation_id TEXT PRIMARY KEY,
+			incident_id TEXT NOT NULL,
+			node_id TEXT NOT NULL,
+			action_id TEXT NOT NULL,
+			policy_version TEXT NOT NULL,
+			failure_classification TEXT NOT NULL,
+			status TEXT NOT NULL,
+			attempt INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL DEFAULT 0,
+			reason TEXT NOT NULL DEFAULT '',
+			evidence TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			resolved_at TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_escalation_records_incident ON escalation_records(incident_id);
+		CREATE INDEX IF NOT EXISTS idx_escalation_records_node_incident ON escalation_records(node_id, incident_id);
+		CREATE INDEX IF NOT EXISTS idx_escalation_records_status ON escalation_records(status);
+		CREATE INDEX IF NOT EXISTS idx_escalation_records_created ON escalation_records(created_at);
+
+		CREATE TABLE IF NOT EXISTS circuit_breaker_states (
+			node_id TEXT NOT NULL,
+			incident_id TEXT NOT NULL,
+			circuit_state TEXT NOT NULL,
+			failure_count INTEGER NOT NULL DEFAULT 0,
+			tripped_at TEXT,
+			reset_at TEXT,
+			reset_by TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (node_id, incident_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_circuit_breaker_node_incident ON circuit_breaker_states(node_id, incident_id);
+		CREATE INDEX IF NOT EXISTS idx_circuit_breaker_state ON circuit_breaker_states(circuit_state);
+		`
+		if _, err := tx.ExecContext(ctx, createEscalationTable); err != nil {
+			return fmt.Errorf("migration v7 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (7, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v7: %w", err)
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -2882,4 +2930,456 @@ func scanVerification(s scanner) (*StoredVerification, error) {
 	}
 
 	return &v, nil
+}
+
+// ============================================================================
+// Phase 6.7 Escalation & Circuit Breaker Store Implementation
+// ============================================================================
+
+// RecordEscalation validates and persists a failure escalation record in SQLite.
+func (s *SQLiteStore) RecordEscalation(ctx context.Context, esc *StoredEscalation) error {
+	if esc == nil {
+		return ErrInvalidEscalation
+	}
+	if err := esc.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidEscalation, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	// Check for idempotency: if escalation_id already exists
+	var exists int
+	checkQuery := `SELECT 1 FROM escalation_records WHERE escalation_id = ? LIMIT 1;`
+	err := s.db.QueryRowContext(ctx, checkQuery, esc.EscalationID).Scan(&exists)
+	if err == nil {
+		return ErrDuplicateEscalation
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check escalation existence: %w", err)
+	}
+
+	evidenceJSON := "{}"
+	if len(esc.Evidence) > 0 {
+		data, err := json.Marshal(esc.Evidence)
+		if err == nil {
+			evidenceJSON = string(data)
+		}
+	}
+
+	var resolvedAtStr sql.NullString
+	if esc.ResolvedAt != nil {
+		resolvedAtStr = sql.NullString{String: esc.ResolvedAt.UTC().Format(time.RFC3339Nano), Valid: true}
+	}
+
+	insertQuery := `
+	INSERT INTO escalation_records (
+		escalation_id, incident_id, node_id, action_id, policy_version,
+		failure_classification, status, attempt, max_attempts,
+		reason, evidence, created_at, updated_at, resolved_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+
+	_, err = s.db.ExecContext(
+		ctx,
+		insertQuery,
+		esc.EscalationID,
+		esc.IncidentID,
+		esc.NodeID,
+		esc.ActionID,
+		esc.PolicyVersion,
+		string(esc.FailureClassification),
+		string(esc.Status),
+		esc.Attempt,
+		esc.MaxAttempts,
+		esc.Reason,
+		evidenceJSON,
+		esc.CreatedAt.UTC().Format(time.RFC3339Nano),
+		esc.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		resolvedAtStr,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return ErrDuplicateEscalation
+		}
+		return fmt.Errorf("failed to insert escalation record: %w", err)
+	}
+
+	return nil
+}
+
+// GetEscalation retrieves an escalation record by its unique EscalationID.
+func (s *SQLiteStore) GetEscalation(ctx context.Context, escalationID string) (*StoredEscalation, error) {
+	if strings.TrimSpace(escalationID) == "" {
+		return nil, ErrEscalationNotFound
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT
+		escalation_id, incident_id, node_id, action_id, policy_version,
+		failure_classification, status, attempt, max_attempts,
+		reason, evidence, created_at, updated_at, resolved_at
+	FROM escalation_records
+	WHERE escalation_id = ?
+	LIMIT 1;`
+
+	row := s.db.QueryRowContext(ctx, query, escalationID)
+	esc, err := scanEscalation(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrEscalationNotFound
+		}
+		return nil, fmt.Errorf("failed to query escalation: %w", err)
+	}
+
+	return esc, nil
+}
+
+// ListEscalations retrieves escalation records matching an optional incidentID (or all if empty), ordered by created_at ASC.
+func (s *SQLiteStore) ListEscalations(ctx context.Context, incidentID string, limit int) ([]*StoredEscalation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+
+	if strings.TrimSpace(incidentID) != "" {
+		query := `
+		SELECT
+			escalation_id, incident_id, node_id, action_id, policy_version,
+			failure_classification, status, attempt, max_attempts,
+			reason, evidence, created_at, updated_at, resolved_at
+		FROM escalation_records
+		WHERE incident_id = ?
+		ORDER BY created_at ASC
+		LIMIT ?;`
+		rows, err = s.db.QueryContext(ctx, query, incidentID, limit)
+	} else {
+		query := `
+		SELECT
+			escalation_id, incident_id, node_id, action_id, policy_version,
+			failure_classification, status, attempt, max_attempts,
+			reason, evidence, created_at, updated_at, resolved_at
+		FROM escalation_records
+		ORDER BY created_at ASC
+		LIMIT ?;`
+		rows, err = s.db.QueryContext(ctx, query, limit)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to query escalations: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*StoredEscalation
+	for rows.Next() {
+		esc, err := scanEscalation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan escalation row: %w", err)
+		}
+		records = append(records, esc)
+	}
+
+	return records, rows.Err()
+}
+
+// CountFailuresInWindow counts how many failure records occurred for a given node and incident within [since, now].
+func (s *SQLiteStore) CountFailuresInWindow(ctx context.Context, nodeID, incidentID string, since time.Time) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	query := `
+	SELECT COUNT(*)
+	FROM escalation_records
+	WHERE node_id = ? AND incident_id = ? AND created_at >= ?;`
+
+	var count int
+	err := s.db.QueryRowContext(ctx, query, nodeID, incidentID, since.UTC().Format(time.RFC3339Nano)).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count failures in window: %w", err)
+	}
+
+	return count, nil
+}
+
+// GetLatestEscalation retrieves the most recent escalation record for a given node and incident, or nil if none.
+func (s *SQLiteStore) GetLatestEscalation(ctx context.Context, nodeID, incidentID string) (*StoredEscalation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT
+		escalation_id, incident_id, node_id, action_id, policy_version,
+		failure_classification, status, attempt, max_attempts,
+		reason, evidence, created_at, updated_at, resolved_at
+	FROM escalation_records
+	WHERE node_id = ? AND incident_id = ?
+	ORDER BY created_at DESC
+	LIMIT 1;`
+
+	row := s.db.QueryRowContext(ctx, query, nodeID, incidentID)
+	esc, err := scanEscalation(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get latest escalation: %w", err)
+	}
+
+	return esc, nil
+}
+
+// UpdateEscalationStatus updates status, resolved_at, reason, and updated_at.
+func (s *SQLiteStore) UpdateEscalationStatus(ctx context.Context, escalationID string, next types.EscalationStatus, resolvedAt *time.Time, reason string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	// Query current status
+	var currentStatusStr string
+	query := `SELECT status FROM escalation_records WHERE escalation_id = ? LIMIT 1;`
+	err := s.db.QueryRowContext(ctx, query, escalationID).Scan(&currentStatusStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrEscalationNotFound
+		}
+		return fmt.Errorf("failed to query escalation status: %w", err)
+	}
+
+	currentStatus := types.EscalationStatus(currentStatusStr)
+	if !currentStatus.CanTransitionTo(next) {
+		return fmt.Errorf("cannot transition escalation from %s to %s", currentStatus, next)
+	}
+
+	var resolvedAtStr sql.NullString
+	if resolvedAt != nil {
+		resolvedAtStr = sql.NullString{String: resolvedAt.UTC().Format(time.RFC3339Nano), Valid: true}
+	}
+
+	updateQuery := `
+	UPDATE escalation_records
+	SET status = ?, reason = CASE WHEN ? != '' THEN ? ELSE reason END, resolved_at = COALESCE(?, resolved_at), updated_at = ?
+	WHERE escalation_id = ?;`
+
+	_, err = s.db.ExecContext(ctx, updateQuery, string(next), reason, reason, resolvedAtStr, now.UTC().Format(time.RFC3339Nano), escalationID)
+	if err != nil {
+		return fmt.Errorf("failed to update escalation status: %w", err)
+	}
+
+	return nil
+}
+
+// GetCircuitState retrieves the circuit breaker state for a node and incident, or nil if none.
+func (s *SQLiteStore) GetCircuitState(ctx context.Context, nodeID, incidentID string) (*StoredCircuitState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT
+		node_id, incident_id, circuit_state, failure_count,
+		tripped_at, reset_at, reset_by, updated_at
+	FROM circuit_breaker_states
+	WHERE node_id = ? AND incident_id = ?
+	LIMIT 1;`
+
+	row := s.db.QueryRowContext(ctx, query, nodeID, incidentID)
+	var (
+		c          StoredCircuitState
+		stateStr   string
+		trippedStr sql.NullString
+		resetStr   sql.NullString
+		updatedStr string
+	)
+
+	err := row.Scan(
+		&c.NodeID,
+		&c.IncidentID,
+		&stateStr,
+		&c.FailureCount,
+		&trippedStr,
+		&resetStr,
+		&c.ResetBy,
+		&updatedStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query circuit breaker state: %w", err)
+	}
+
+	c.State = types.CircuitState(stateStr)
+	c.UpdatedAt, _ = parseDBTime(updatedStr)
+	if trippedStr.Valid && trippedStr.String != "" {
+		t, err := parseDBTime(trippedStr.String)
+		if err == nil {
+			c.TrippedAt = &t
+		}
+	}
+	if resetStr.Valid && resetStr.String != "" {
+		t, err := parseDBTime(resetStr.String)
+		if err == nil {
+			c.ResetAt = &t
+		}
+	}
+
+	return &c, nil
+}
+
+// SetCircuitState persists or updates the circuit breaker state.
+func (s *SQLiteStore) SetCircuitState(ctx context.Context, state *StoredCircuitState) error {
+	if state == nil {
+		return ErrInvalidCircuitStateRecord
+	}
+	if err := state.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidCircuitStateRecord, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	var trippedStr sql.NullString
+	if state.TrippedAt != nil {
+		trippedStr = sql.NullString{String: state.TrippedAt.UTC().Format(time.RFC3339Nano), Valid: true}
+	}
+
+	var resetStr sql.NullString
+	if state.ResetAt != nil {
+		resetStr = sql.NullString{String: state.ResetAt.UTC().Format(time.RFC3339Nano), Valid: true}
+	}
+
+	upsertQuery := `
+	INSERT INTO circuit_breaker_states (
+		node_id, incident_id, circuit_state, failure_count,
+		tripped_at, reset_at, reset_by, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(node_id, incident_id) DO UPDATE SET
+		circuit_state = excluded.circuit_state,
+		failure_count = excluded.failure_count,
+		tripped_at = excluded.tripped_at,
+		reset_at = excluded.reset_at,
+		reset_by = excluded.reset_by,
+		updated_at = excluded.updated_at;`
+
+	_, err := s.db.ExecContext(
+		ctx,
+		upsertQuery,
+		state.NodeID,
+		state.IncidentID,
+		string(state.State),
+		state.FailureCount,
+		trippedStr,
+		resetStr,
+		state.ResetBy,
+		state.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upsert circuit breaker state: %w", err)
+	}
+
+	return nil
+}
+
+// CountEscalations returns total escalation records stored.
+func (s *SQLiteStore) CountEscalations(ctx context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	query := `SELECT COUNT(*) FROM escalation_records;`
+	var count int64
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count escalations: %w", err)
+	}
+	return count, nil
+}
+
+func scanEscalation(s scanner) (*StoredEscalation, error) {
+	var (
+		e           StoredEscalation
+		classStr    string
+		statusStr   string
+		evidenceStr string
+		createdStr  string
+		updatedStr  string
+		resolvedStr sql.NullString
+	)
+
+	err := s.Scan(
+		&e.EscalationID,
+		&e.IncidentID,
+		&e.NodeID,
+		&e.ActionID,
+		&e.PolicyVersion,
+		&classStr,
+		&statusStr,
+		&e.Attempt,
+		&e.MaxAttempts,
+		&e.Reason,
+		&evidenceStr,
+		&createdStr,
+		&updatedStr,
+		&resolvedStr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	e.FailureClassification = types.FailureClassification(classStr)
+	e.Status = types.EscalationStatus(statusStr)
+	e.CreatedAt, _ = parseDBTime(createdStr)
+	e.UpdatedAt, _ = parseDBTime(updatedStr)
+	if resolvedStr.Valid && resolvedStr.String != "" {
+		t, err := parseDBTime(resolvedStr.String)
+		if err == nil {
+			e.ResolvedAt = &t
+		}
+	}
+	if evidenceStr != "" && evidenceStr != "{}" {
+		_ = json.Unmarshal([]byte(evidenceStr), &e.Evidence)
+	}
+
+	return &e, nil
 }
