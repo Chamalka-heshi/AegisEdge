@@ -562,22 +562,41 @@ Verification records transition through explicit deterministic states:
 Phase 6.7 introduces the deterministic escalation and failure-handling engine (`edge/agent/escalation`) to enforce the critical safety invariant:
 $$\textbf{"NO UNBOUNDED AUTONOMOUS REMEDIATION LOOP."}$$
 
-### 1. Fundamental Principle: Bounded Autonomous Remediation
-AegisEdge must not repeatedly execute the same mitigation forever when recovery fails or conditions worsen. Autonomous remediation must be strictly bounded in retry count, rate-limited by cooldown intervals, constrained within a temporal failure window, and guarded by a fail-closed circuit breaker.
+Phase 6.7 bounds the retry decisions produced by the escalation policy and prevents the escalation engine from authorizing retries beyond the configured budget.
+
+### 1. Architectural Pipeline & Orchestration Boundary
+Phase 6.7 establishes an explicit architectural boundary between domain decision evaluation and mitigation re-execution:
+
+```
+Mitigation / Verification Failure
+        ↓
+Escalation Engine
+        ↓
+Retry Decision OR Escalation Decision
+        ↓
+[ORCHESTRATION BOUNDARY - Future / Not Implemented]
+        ↓
+Future/next orchestration layer initiates bounded retry
+        OR
+Operator escalation
+```
+
+> [!IMPORTANT]
+> **Orchestration Component Boundary**: The orchestration component that consumes retry decisions and re-triggers mitigation is future/not implemented. Phase 6.7 does NOT implement the complete autonomous closed-loop retry execution loop; it implements the deterministic escalation domain services that evaluate failures and authorize bounded retry decisions (`DecisionActionRetry`) or trigger escalation (`DecisionActionEscalate`).
 
 ### 2. Failure Classifications
 Phase 6.7 formalizes 7 deterministic failure classifications:
 - `MITIGATION_FAILED`: The simulated mitigation action failed during execution.
 - `VERIFICATION_TIMED_OUT`: The closed-loop verification observation window elapsed without satisfying recovery criteria.
 - `VERIFICATION_REJECTED`: Verification observed immediate negative regression or explicit policy rejection, requiring immediate escalation.
-- `UNKNOWN_RECONCILIATION_REQUIRED`: The actuator or execution engine reached an unknown state, requiring immediate operator investigation; autonomous retry is strictly forbidden.
-- `COOLDOWN_ACTIVE`: An autonomous retry was evaluated while the cooldown timer has not yet expired; execution is held.
-- `RETRY_BUDGET_EXHAUSTED`: The maximum number of automatic mitigation retries has been reached; autonomous retries cease.
+- `UNKNOWN_RECONCILIATION_REQUIRED`: The actuator or execution engine reached an unknown state, requiring immediate operator investigation; autonomous retry decisions are strictly forbidden.
+- `COOLDOWN_ACTIVE`: An autonomous retry decision was evaluated while the cooldown timer has not yet expired; execution is held.
+- `RETRY_BUDGET_EXHAUSTED`: The maximum number of automatic mitigation retry decisions has been reached; autonomous retry decisions cease.
 - `CIRCUIT_BREAKER_OPEN`: Repeated failures within the sliding window reached the failure threshold, tripping the circuit breaker to `OPEN`.
 
 ### 3. Circuit Breaker Semantics
 - **State Transition**: strictly `CLOSED` $\rightarrow$ `OPEN` $\rightarrow$ explicit operator reset $\rightarrow$ `CLOSED`.
-- **Fail-Closed**: Once the circuit breaker is `OPEN`, ALL autonomous remediation on the node and incident is strictly prohibited.
+- **Fail-Closed**: Once the circuit breaker is `OPEN`, ALL autonomous remediation retry decisions on the node and incident are strictly prohibited.
 - **Explicit Reset**: Resetting the breaker requires operator identity (`reset_by`). No automated timer resets `OPEN` back to `CLOSED` (no half-open state in Phase 6.7).
 - **Restart Survival**: The `OPEN` state is persisted durably in the `circuit_breaker_states` SQLite table and survives process crashes and restarts.
 
@@ -598,38 +617,158 @@ This contains zero random bytes and zero timestamps, guaranteeing identical, ide
 - If the incident is in `RECOVERED` or `NORMAL`, the handoff does not forge invalid transitions.
 
 ### 7. Retry Semantics & Scope
-- **Retry Semantics**: `MaxAutomaticRetries` defines the maximum number of automatic retries permitted AFTER the initial failed mitigation attempt. For `MaxAutomaticRetries = 3`, the engine permits at most 3 retries following the initial failure (yielding a maximum bound of 1 initial + 3 retries = 4 total mitigation executions). When attempt count reaches `MaxAutomaticRetries + 1` (attempt 4), the retry budget is exhausted and no further retries occur.
+- **Retry Semantics**: Phase 6.7 permits at most three retry decisions after the initial failed attempt. For `MaxAutomaticRetries = 3`, this defines:
+  $$\text{1 initial mitigation attempt} + \text{up to 3 automatic retry decisions} = \text{maximum 4 mitigation executions}$$
+  if the future orchestration layer honors all retry decisions. The invariant currently enforced by Phase 6.7 is that it cannot issue more than the configured retry budget; Phase 6.7 does not claim that four executions have actually been performed by Phase 6.7.
 - **Circuit Breaker Scope**: The Phase 6.7 circuit breaker is scoped to the node/incident pair `(NodeID, IncidentID)`. Opening the circuit for Incident A on Node 1 does not affect Incident B on Node 1, nor Incident A on Node 2.
-- **Integration Boundary**: Phase 6.7 provides `EvaluateFailure`, `EvaluateMitigationResult`, and `EvaluateVerificationResult` as domain services. In the current Phase 6.7 implementation, these services are exposed for invocation by upstream orchestrators and domain workflows; automatic end-to-end chaining across separate pipeline packages is designed for subsequent orchestration phases.
+- **Integration Boundary**: Phase 6.7 provides `EvaluateFailure`, `EvaluateMitigationResult`, and `EvaluateVerificationResult` as domain services. Automatic end-to-end chaining across separate pipeline packages is designed for subsequent orchestration phases.
 
-### 8. Failure Handling & Resilience Matrix (16 Conditions)
+### 8. Current vs. Future Implementation Matrix
+
+| Capability | Current Status | Description |
+| :--- | :---: | :--- |
+| **Escalation Domain Model** | **CURRENTLY IMPLEMENTED** | Typed failure classifications, decisions, and policy structures |
+| **Deterministic Failure Classification** | **CURRENTLY IMPLEMENTED** | 7 domain classifications mapping execution/verification outcomes |
+| **Retry Budget Evaluation** | **CURRENTLY IMPLEMENTED** | Bounds retry decisions to `MaxAutomaticRetries` |
+| **Cooldown Evaluation** | **CURRENTLY IMPLEMENTED** | Evaluates cooldown elapsed state; suppresses premature failure count increments |
+| **Sliding Failure Window** | **CURRENTLY IMPLEMENTED** | Tracks failures within configurable window |
+| **Circuit Breaker** | **CURRENTLY IMPLEMENTED** | Scoped to `(NodeID, IncidentID)`, trips to `OPEN`, explicit operator reset |
+| **Durable Escalation State (Migration v7)** | **CURRENTLY IMPLEMENTED** | SQLite WAL tables `escalation_records` and `circuit_breaker_states` |
+| **Deterministic Escalation Identity** | **CURRENTLY IMPLEMENTED** | SHA-256 ID over tuple; zero random bytes |
+| **Restart Reconstruction** | **CURRENTLY IMPLEMENTED** | Restores failure counts, cooldown timestamps, and `OPEN` state from DB |
+| **IncidentEngine Escalation Handoff** | **CURRENTLY IMPLEMENTED** | Invokes canonical `TransitionActiveIncident` preserving Incident FSM |
+| **Bounded Retry Decisions** | **CURRENTLY IMPLEMENTED** | Produces `DecisionActionRetry` with timestamp and budget tracking |
+| **Automatic Orchestration of RETRY Decisions** | *FUTURE / NOT IMPLEMENTED* | Chaining `DecisionActionRetry` into automatic mitigation re-execution |
+| **Full End-to-End Autonomous Retry Loop** | *FUTURE / NOT IMPLEMENTED* | Autonomous loop driving mitigation, verification, and retry orchestration |
+| **Real Host Actuation** | *FUTURE / NOT IMPLEMENTED* | Actuation remains strictly simulated (zero OS commands, processes, containers) |
+| **External Operator Notification** | *FUTURE / NOT IMPLEMENTED* | PagerDuty, Webhooks, Slack, or email operator alerting |
+| **Real Infrastructure Remediation** | *FUTURE / NOT IMPLEMENTED* | No live cloud, cluster, or host remediation |
+
+### 9. Failure Handling & Resilience Matrix (16 Conditions)
 
 | # | Failure / Edge Condition | Engine Behavior | Circuit Breaker Impact | Incident FSM Impact |
 | :---: | :--- | :--- | :--- | :--- |
-| **1** | **Mitigation Failure** | Evaluates failure; permits retry if within budget and cooldown elapsed. | Remains `CLOSED` unless threshold reached | Remains `MITIGATING` |
-| **2** | **Verification Timeout** | Evaluates failure as `VERIFICATION_TIMED_OUT`; permits retry if within budget. | Remains `CLOSED` unless threshold reached | Remains `MITIGATING` |
-| **3** | **Verification Rejection** | Terminal `NOT_RECOVERED` or regression; evaluates as `VERIFICATION_REJECTED`. | Remains `CLOSED` (isolated policy event) | Transitions to `ESCALATED` |
+| **1** | **Mitigation Failure** | **RETRY** — bounded retry decision permitted; actual re-execution is performed by the orchestration layer. | Remains `CLOSED` unless threshold reached | Remains `MITIGATING` |
+| **2** | **Verification Timeout** | **RETRY** — bounded retry decision permitted; actual re-execution is performed by the orchestration layer. | Remains `CLOSED` unless threshold reached | Remains `MITIGATING` |
+| **3** | **Verification Rejection** | **ESCALATE** — escalation decision generated and IncidentEngine handoff may occur (`VERIFICATION_REJECTED`). | Remains `CLOSED` (isolated policy event) | Transitions to `ESCALATED` |
 | **4** | **Cooldown Active** | Returns `DecisionActionNone` and `COOLDOWN_ACTIVE`; does NOT increment failure count. | Unchanged | Unchanged |
-| **5** | **Retry Budget Exhausted** | Attempt exceeds `MaxAutomaticRetries`; produces `RETRY_BUDGET_EXHAUSTED`. | Trips to `OPEN` | Transitions to `ESCALATED` |
-| **6** | **Circuit Open** | Autonomous remediation blocked; returns `CIRCUIT_BREAKER_OPEN`. | Remains `OPEN` until operator reset | Transitions to `ESCALATED` |
+| **5** | **Retry Budget Exhausted** | **ESCALATE** — escalation decision generated and IncidentEngine handoff may occur (`RETRY_BUDGET_EXHAUSTED`). | Trips to `OPEN` | Transitions to `ESCALATED` |
+| **6** | **Circuit Open** | **ESCALATE** — autonomous remediation blocked; returns `CIRCUIT_BREAKER_OPEN`. | Remains `OPEN` until operator reset | Transitions to `ESCALATED` |
 | **7** | **Duplicate Failure** | Idempotently recognized by deterministic SHA-256 `EscalationID`. | Unchanged | Unchanged |
-| **8** | **Restart During Cooldown** | Cooldown timestamp reconstructed from SQLite; holds retries until expiry. | Unchanged | Unchanged |
-| **9** | **Restart While Circuit Open** | Breaker `OPEN` state reconstructed from SQLite; blocks remediation immediately. | Remains `OPEN` | Unchanged |
+| **8** | **Restart During Cooldown** | Cooldown timestamp reconstructed from SQLite; holds retry decisions until expiry. | Unchanged | Unchanged |
+| **9** | **Restart While Circuit Open** | Breaker `OPEN` state reconstructed from SQLite; blocks remediation decisions immediately. | Remains `OPEN` | Unchanged |
 | **10** | **Stale Failure for Recovered Incident** | Handoff checks canonical FSM; `RECOVERED -> ESCALATED` is rejected. | Unchanged | FSM rejects transition; stays `RECOVERED` |
 | **11** | **Stale Failure for Normal Incident** | Handoff checks canonical FSM; `NORMAL -> ESCALATED` is rejected. | Unchanged | FSM rejects transition; stays `NORMAL` |
-| **12** | **Unknown Mitigation State** | `UNKNOWN_RECONCILIATION_REQUIRED`; immediate escalation; retry forbidden. | Remains `CLOSED` | Transitions to `ESCALATED` |
+| **12** | **Unknown Mitigation State** | **ESCALATE** — escalation decision generated (`UNKNOWN_RECONCILIATION_REQUIRED`); retry decision forbidden. | Remains `CLOSED` | Transitions to `ESCALATED` |
 | **13** | **Corrupted Escalation Record** | Store validation rejects malformed payload with `ErrInvalidEscalation`. | Unchanged | Unchanged |
 | **14** | **Concurrent Duplicate Escalation** | Mutex serializes evaluation; unique index in SQLite prevents duplicate records. | Consistently trips if threshold reached | Transitions once idempotently |
-| **15** | **SQLite Storage Unavailable** | Fail-closed: storage errors reject evaluation; no unpersisted retries permitted. | Fails closed | Holds active state |
+| **15** | **SQLite Storage Unavailable** | Fail-closed: storage errors reject evaluation; no unpersisted retry decisions permitted. | Fails closed | Holds active state |
 | **16** | **Invalid Policy Config** | `Validate()` rejects negative cooldown, negative retries, or zero window at init. | Engine initialization fails closed | Unchanged |
 
-### 9. Strict Safety Boundaries & Non-Claims
+### 10. Strict Safety Boundaries & Non-Claims
 - **Zero Real Host Actuation**: All executions remain simulated.
 - **Simulation Boundary Maintained**: No OS commands, shell processes, or container mutations.
 - **Durability Non-Claims**: Local WAL crash recovery under `synchronous=NORMAL`; no claims of zero-data-loss, hardware failure resilience, or distributed consensus.
+- **No Unbounded Loop Invariant**: Phase 6.7 bounds the retry decisions produced by the escalation policy and prevents the escalation engine from authorizing retries beyond the configured budget.
 
 ---
 
 ## 23. Verification Status
 
-As of Phase 6.7, all 19 packages across the Go workspace compile, pass static analysis (`go vet`), and pass all automated unit and integration tests (`go test -count=1 -p 1 ./...`) cleanly.
+As of Phase 6.8, all 20 packages across the Go workspace compile, pass static analysis (`go vet`), and pass all automated unit and integration tests (`go test -count=1 -p 1 ./...`) cleanly.
+
+---
+
+## 24. Phase 6.8: Controlled Incident Response Orchestrator
+
+### 1. Objective & Architectural Purpose
+Phase 6.8 implements the controlled orchestration layer (`edge/agent/orchestrator`) that connects the decoupled response pipeline components into a bounded, deterministic, fail-closed incident response workflow:
+$$\text{TELEMETRY} \longrightarrow \text{ANOMALY DETECTION} \longrightarrow \text{INCIDENT CORRELATION} \longrightarrow \text{RESPONSE POLICY} \longrightarrow \text{SAFETY VALIDATION} \longrightarrow \text{MITIGATION EXECUTION} \longrightarrow \text{VERIFICATION} \longrightarrow \text{ESCALATION} \longrightarrow \text{ORCHESTRATION DECISION}$$
+
+### 2. Orchestration State Model
+The orchestrator maintains an orchestration-specific state model completely decoupled from the canonical `IncidentStatus` FSM:
+- `PENDING`: Initial state prior to cycle execution.
+- `RUNNING`: Orchestration cycle in active progress.
+- `WAITING_APPROVAL`: Policy classified action as `APPROVAL_REQUIRED`; awaiting externally supplied operator authorization. Zero mitigation executes.
+- `EXECUTING`: Validated candidate action currently undergoing simulated execution.
+- `VERIFYING`: Action completed with status `EXECUTED`; closed-loop recovery observation is actively tracking subsequent telemetry.
+- `RETRY_AUTHORIZED`: Escalation engine evaluated a mitigation or verification failure and authorized a bounded retry (`DecisionActionRetry`).
+- `ESCALATED`: Escalation engine returned `DecisionActionEscalate` or circuit tripped; incident safely handed off to `IncidentEngine.TransitionActiveIncident(..., StatusEscalated)`.
+- `RECOVERED`: Telemetry verification satisfied recovery condition; incident safely resolved via `IncidentEngine.ResolveIncident(...)`.
+- `FAILED`: Cycle terminated due to safety rejection, persistence failure, or exhausted retry/cooldown constraints.
+- `CANCELLED`: Operation stopped due to context cancellation.
+
+### 3. Bounded Retry & Hard Ceiling Semantics
+- **Reused Budget**: The orchestrator strictly reuses the Phase 6.7 retry budget (`MaxAutomaticRetries = 3`), permitting at most 1 initial execution + up to 3 retry decisions = maximum 4 mitigation executions.
+- **No Independent Retries**: The orchestrator never independently initiates a retry. A retry occurs if and only if `EscalationEngine.Evaluate*` produces `DecisionActionRetry` and `CanRetry` confirms no cooldown or tripped circuit breaker.
+- **Defense-in-Depth Ceiling**: A hard safety ceiling (`MaxExecutionCeiling = 4`) protects against programming errors or corrupted loop counters without overriding the configured escalation policy. The hard ceiling of 4 is defense-in-depth and agrees with the configured maximum of 3 automatic retries. It cannot authorize an additional execution beyond the escalation policy.
+- **Cooldown & Breaker Respect**: If `CanRetry` returns false due to active cooldown or an `OPEN` circuit breaker, execution halts immediately without incrementing the failure count.
+
+### 4. Approval & Safety Validation Boundaries
+- **Approval Gate**: For `APPROVAL_REQUIRED` actions, the orchestrator halts in `WAITING_APPROVAL` unless a valid approval record is provided. The orchestrator never automatically approves its own requests.
+- **Execution Validation**: If an approval is provided, `ValidateApprovalForExecution` enforces the 14-point decision-binding gate (fingerprint, timestamps, action, target, incident, node). Expired, tampered, or mismatched approvals fail closed.
+- **Authoritative Pre-Execution Validation**: Every execution attempt crosses the `SafetyValidator` boundary immediately before execution. No action executes following a failed safety check.
+- **Persistence Precedes Actuation**: Durable persistence precedes simulated actuation. The orchestrator requires the mitigation record to be successfully persisted before invoking the executor. If persistence fails, the executor is not invoked, orchestration fails closed, and no retry is fabricated locally.
+
+### 5. Idempotency & Concurrency Control
+- **Per-Incident In-Flight Gate**: Internal mutex and `inFlight map[string]*inFlightOrchestration` ensure that concurrent invocations for the same `IncidentID` are serialized. Exactly one leader executes the workflow, and all concurrent callers await the leader and observe the identical logical result.
+- **Incident Stream Isolation**: Concurrent orchestrations on different incidents execute concurrently without state interference.
+- **Restart Recovery & Deduplication**: Uses durable SQLite mitigation and verification records to detect previously recorded logical attempts across supported restart-recovery paths and suppress duplicate orchestration where persisted state is available.
+
+### 6. Failure Safety Matrix (20 Conditions)
+
+| # | Failure / Edge Condition | Execution Occurs? | Persistence Changes? | Retry Permitted? | IncidentEngine Called? | Resulting Orchestration State |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **1** | Policy returns NO_ACTION | No | No | No | No | `FAILED` / Stopped (Incident state unchanged) |
+| **2** | Policy returns FORBIDDEN | No | No | No | No | `FAILED` (`ErrForbiddenAction`) |
+| **3** | Safety validation fails | No | No | No | No | `FAILED` (`ErrSafetyValidationFailed`) |
+| **4** | Approval missing | No | Yes (Pending ticket in store) | No | No | `WAITING_APPROVAL` (`ErrApprovalMissing`) |
+| **5** | Approval expired | No | Yes (Escalation failure logged) | No | No | `FAILED` (`ErrApprovalInvalid`) |
+| **6** | Approval fingerprint mismatch | No | Yes (Escalation failure logged) | No | No | `FAILED` (`ErrApprovalInvalid`) |
+| **7** | Persistence failure | No | No | No | No | `FAILED` (`ErrPersistenceFailed`) |
+| **8** | Executor failure | Yes (Simulated) | Yes (`mitigation_records` FAILED) | If budget & cooldown permit | If ESCALATE decided | `RETRY_AUTHORIZED` or `ESCALATED` |
+| **9** | Context cancellation | No | No | No | No | `CANCELLED` (`ErrOrchestrationCancelled`) |
+| **10** | Verification timeout | No | Yes (`verification_records` TIMED_OUT) | If budget & cooldown permit | If ESCALATE decided | `RETRY_AUTHORIZED` or `ESCALATED` |
+| **11** | Verification rejection | No | Yes (`verification_records` NOT_RECOVERED) | No (`VERIFICATION_REJECTED`) | Yes (`StatusEscalated`) | `ESCALATED` |
+| **12** | Escalation says NONE | No | No | No | No | `FAILED` |
+| **13** | Escalation says RETRY | Yes (Next attempt) | Yes (Next attempt logged) | Yes (Bounded attempt) | No | `RETRY_AUTHORIZED` -> `EXECUTING` |
+| **14** | Escalation says ESCALATE | No | Yes (`escalation_records` ESCALATED) | No | Yes (`StatusEscalated`) | `ESCALATED` |
+| **15** | Retry budget exhausted | No | Yes (Circuit trips to OPEN) | No | Yes (`StatusEscalated`) | `ESCALATED` |
+| **16** | Circuit breaker OPEN | No | Yes (Escalation failure logged) | No | Yes (`StatusEscalated`) | `ESCALATED` (`ErrCircuitBreakerOpen`) |
+| **17** | Duplicate orchestration request | No | No (Returns cached result) | No | No | Cached Terminal State |
+| **18** | Concurrent duplicate requests | Exactly 1 Leader | Leader persists | Leader manages | Leader hands off | All callers receive identical result |
+| **19** | Stale / NORMAL incident | No | No | No | No | `RECOVERED` (Suppressed) |
+| **20** | Unknown reconciliation state | No | No | No | No | `FAILED` (`ErrUnknownReconciliation`) |
+
+### 7. Critical Safety Invariants
+1. **INVARIANT 1**: Zero arbitrary host command execution (`os/exec`, `exec.Command`, PowerShell, shell, SSH, Docker CLI, kubectl, AWS CLI prohibited).
+2. **INVARIANT 2**: No retry occurs unless `EscalationEngine` authorizes `DecisionActionRetry`.
+3. **INVARIANT 3**: Retry count cannot exceed configured budget (`MaxAutomaticRetries = 3`).
+4. **INVARIANT 4**: Safety validation is required before every execution attempt.
+5. **INVARIANT 5**: Approval-required actions cannot bypass approval.
+6. **INVARIANT 6**: Execution success does not imply incident recovery.
+7. **INVARIANT 7**: Verification must evaluate subsequent telemetry evidence.
+8. **INVARIANT 8**: Canonical Incident FSM is owned exclusively by `IncidentEngine`.
+9. **INVARIANT 9**: Durable persistence precedes simulated actuation. The orchestrator requires the mitigation record to be successfully persisted before invoking the executor. If persistence fails: executor is not invoked, orchestration fails closed, and no retry is fabricated locally.
+10. **INVARIANT 10**: No unbounded autonomous remediation loop (`MaxExecutionCeiling = 4` defense-in-depth, strictly enforcing at most 4 total executions: 1 initial + up to 3 retries).
+11. **INVARIANT 11**: No real host, container, or cloud actuation; actuation remains strictly simulated (`SIMULATED_*`).
+
+### 8. Current vs. Future Implementation Matrix
+
+| Capability | Current Status | Description |
+| :--- | :---: | :--- |
+| **Controlled Response Orchestrator** | **CURRENTLY IMPLEMENTED** | Coordinates full cycle from policy to escalation in `edge/agent/orchestrator` |
+| **Deterministic Policy & Validator Wiring** | **CURRENTLY IMPLEMENTED** | Connects `ResponsePolicy`, `SafetyValidator`, and `SimulatedExecutor` |
+| **Approval Workflow Integration** | **CURRENTLY IMPLEMENTED** | Halts at `WAITING_APPROVAL`; validates externally provided approval records |
+| **Durable Mitigation Persistence** | **CURRENTLY IMPLEMENTED** | Persists execution lifecycle into SQLite WAL `mitigation_records` |
+| **Closed-Loop Verification Integration** | **CURRENTLY IMPLEMENTED** | Ingests subsequent telemetry; confirms recovery on $N$ healthy samples |
+| **Bounded Retry Orchestration** | **CURRENTLY IMPLEMENTED** | Re-executes attempts up to `MaxAutomaticRetries` under `DecisionActionRetry` |
+| **Fail-Closed Circuit & Cooldown Handling** | **CURRENTLY IMPLEMENTED** | Halts execution if breaker is OPEN or cooldown is active |
+| **Leader-Follower Concurrency Gate** | **CURRENTLY IMPLEMENTED** | Serializes duplicate concurrent requests into a single logical execution |
+| **Real Host Actuators** | *FUTURE / NOT IMPLEMENTED* | Shell, systemctl, reboot, iptables, process termination |
+| **Cloud / Container Remediation** | *FUTURE / NOT IMPLEMENTED* | Docker, Kubernetes, AWS, GCP, Azure actuators |
+| **External Operator Alerting** | *FUTURE / NOT IMPLEMENTED* | PagerDuty, Webhooks, Slack, email notifications |
+| **Authenticated Operator Identity** | *FUTURE / NOT IMPLEMENTED* | Cryptographic signatures, mTLS, JWT, SSO, non-repudiation |
+| **Signed Approval Tokens** | *FUTURE / NOT IMPLEMENTED* | Cryptographically signed approval manifests |
+| **Advanced Statistical / ML Verification** | *FUTURE / NOT IMPLEMENTED* | Dynamic statistical streak baselining and multivariate verification |
+| **Distributed Multi-Node Orchestration** | *FUTURE / NOT IMPLEMENTED* | Raft/Paxos consensus across distributed edge clusters |
