@@ -772,3 +772,141 @@ The orchestrator maintains an orchestration-specific state model completely deco
 | **Signed Approval Tokens** | *FUTURE / NOT IMPLEMENTED* | Cryptographically signed approval manifests |
 | **Advanced Statistical / ML Verification** | *FUTURE / NOT IMPLEMENTED* | Dynamic statistical streak baselining and multivariate verification |
 | **Distributed Multi-Node Orchestration** | *FUTURE / NOT IMPLEMENTED* | Raft/Paxos consensus across distributed edge clusters |
+
+---
+
+## 25. Phase 6.9: Incident Response Audit Trail & Observability
+
+### 1. Architectural Purpose
+Phase 6.9 introduces a durable, structured, queryable local audit trail for the complete incident response lifecycle:
+```
+ANOMALY
+  ↓
+INCIDENT
+  ↓
+POLICY DECISION
+  ↓
+SAFETY VALIDATION
+  ↓
+APPROVAL
+  ↓
+MITIGATION
+  ↓
+VERIFICATION
+  ↓
+ESCALATION / RETRY
+  ↓
+ORCHESTRATION RESULT
+```
+The audit subsystem observes the lifecycle without controlling, actuating, or altering canonical Incident FSM transitions. Every response decision is explainable post-facto from local durable records.
+
+### 2. Audit Event Domain Model
+The audit subsystem (`edge/agent/audit`) defines the discrete `AuditEvent` model:
+- **EventID**: Deterministic or unique identifier (max 128 characters).
+- **EventType**: Typed enum restricted to a controlled allowlist of 25 lifecycle event types.
+- **Timestamp**: RFC3339Nano UTC timestamp of event occurrence.
+- **NodeID**: Target node identifier.
+- **IncidentID**: Associated incident identifier.
+- **DecisionID**: Policy decision identifier (where applicable).
+- **ActionID**: Mitigation action identifier (where applicable).
+- **ApprovalID**: Operator approval identifier (where applicable).
+- **MitigationRecordID**: Durable mitigation record identifier (where applicable).
+- **VerificationID**: Verification session identifier (where applicable).
+- **EscalationID**: Failure escalation identifier (where applicable).
+- **CorrelationID**: Local workflow binding identifier (`corr-<IncidentID>`).
+- **PolicyVersion**: Active response policy version string.
+- **Actor**: Emitting subsystem or human approver.
+- **Result**: Normalized outcome status (`success`, `rejected`, `failed`, `timed_out`, `skipped`, `retry`, `escalated`, `circuit_open`).
+- **Reason**: Explanatory human-readable reason (max 1024 characters).
+- **Metadata**: Bounded key-value annotations (max 32 pairs, max 8192 bytes total JSON payload).
+
+### 3. Controlled Event Type Allowlist
+The audit domain enforces an explicit allowlist of 25 discrete lifecycle transitions:
+1. `ANOMALY_DETECTED`
+2. `INCIDENT_CREATED`
+3. `INCIDENT_STATE_CHANGED`
+4. `RESPONSE_DECISION_CREATED`
+5. `SAFETY_VALIDATED`
+6. `SAFETY_REJECTED`
+7. `APPROVAL_REQUESTED`
+8. `APPROVAL_GRANTED`
+9. `APPROVAL_REJECTED`
+10. `APPROVAL_EXPIRED`
+11. `APPROVAL_CANCELLED`
+12. `MITIGATION_RECORDED`
+13. `MITIGATION_STARTED`
+14. `MITIGATION_EXECUTED`
+15. `MITIGATION_FAILED`
+16. `VERIFICATION_STARTED`
+17. `VERIFICATION_PROGRESS`
+18. `VERIFICATION_RECOVERED`
+19. `VERIFICATION_TIMED_OUT`
+20. `VERIFICATION_REJECTED`
+21. `ESCALATION_EVALUATED`
+22. `RETRY_AUTHORIZED`
+23. `CIRCUIT_OPENED`
+24. `ORCHESTRATION_COMPLETED`
+25. `ORCHESTRATION_STOPPED`
+
+Arbitrary or unrecognized event type strings are rejected fail-closed at the validation boundary.
+
+### 4. Deterministic Identity & Local Correlation
+- **Deterministic EventID**: For reproducible lifecycle events, `ComputeEventID(nodeID, incidentID, eventType, attempt, discriminator)` produces a deterministic SHA-256 hash formatted as `evt-<hex>`. Repeated attempts with identical inputs generate identical IDs, enabling local idempotency. Successive retry attempts (`attempt > 0`) or distinct actions produce unique, non-colliding EventIDs.
+- **Workflow CorrelationID**: Derived as `corr-<IncidentID>`, binding all audit events belonging to an incident response lifecycle into a unified queryable stream.
+
+### 5. Durable SQLite Schema (Migration v8)
+Migration v8 adds the `audit_events` table and query indexes:
+```sql
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    incident_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL DEFAULT '',
+    action_id TEXT NOT NULL DEFAULT '',
+    approval_id TEXT NOT NULL DEFAULT '',
+    mitigation_record_id TEXT NOT NULL DEFAULT '',
+    verification_id TEXT NOT NULL DEFAULT '',
+    escalation_id TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    result TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_incident ON audit_events(incident_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_node ON audit_events(node_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_correlation ON audit_events(correlation_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_type ON audit_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp ON audit_events(timestamp);
+```
+
+### 6. Local Idempotency & Bounded Queries
+- **Local Durable Idempotency**: The `event_id` PRIMARY KEY enforces uniqueness at the storage layer. Attempted duplicate writes with an existing `event_id` return `ErrDuplicateAuditEvent` without creating duplicate logical records or corrupting the database.
+- **Bounded Query Execution**: All query methods enforce upper limits (`DefaultAuditQueryLimit = 100`, `MaxAuditQueryLimit = 1000`) and deterministic ordering (`ORDER BY timestamp ASC, event_id ASC`). Memory exhaustion via unbounded queries is prevented.
+- **Security & Data Bounds**: Payloads are strictly bounded (max string length 128/1024, max metadata size 8192 bytes, max 32 key-value entries). Metadata keys and values are scanned fail-closed to reject sensitive credentials (passwords, tokens, private keys) and executable commands (`/bin/sh`, `powershell`, `cmd.exe`).
+
+### 7. Failure Semantics & Operational Distinction
+- **Business vs. Observability Failure Separation**: The orchestrator strictly distinguishes between business operation failures (e.g., policy rejection, safety block, mitigation failure) and audit persistence failures.
+- **Non-Fatal Observability Writes**: A failure to persist an optional audit event does not convert a successful simulated mitigation into an operational failure. Audit recording errors are logged without corrupting the operational state machine.
+- **No Fabricated Events**: Audit events reflect actual observed domain transitions; no fabricated success events are generated.
+
+### 8. Current vs. Future Capability Matrix
+
+| Capability | Current Status | Implementation |
+| :--- | :---: | :--- |
+| **Local Structured Audit Events** | **CURRENTLY IMPLEMENTED** | Typed allowlist of 25 domain events in `edge/agent/audit` |
+| **Durable SQLite Persistence** | **CURRENTLY IMPLEMENTED** | Schema migration v8 with indexed WAL storage in `edge/agent/storage` |
+| **Local Workflow Correlation** | **CURRENTLY IMPLEMENTED** | `corr-<IncidentID>` binding complete response workflow |
+| **Bounded History Queries** | **CURRENTLY IMPLEMENTED** | Chronologically ordered queries bounded to max 1000 records |
+| **Local Idempotent Deduplication** | **CURRENTLY IMPLEMENTED** | Database PRIMARY KEY constraint on `event_id` |
+| **Restart Durability** | **CURRENTLY IMPLEMENTED** | Preserved across SQLite process and connection restarts |
+| **Prometheus / OpenMetrics** | *FUTURE / NOT IMPLEMENTED* | Prometheus metrics exporter (deferred to future observability phase) |
+| **Grafana Dashboards** | *FUTURE / NOT IMPLEMENTED* | Response visualization and operational metrics dashboards |
+| **Distributed OpenTelemetry Tracing**| *FUTURE / NOT IMPLEMENTED* | Distributed W3C trace context propagation across edge nodes |
+| **Centralized Log Forwarding** | *FUTURE / NOT IMPLEMENTED* | FluentBit / Vector log shipping to central observability stack |
+| **Cryptographic Signatures** | *FUTURE / NOT IMPLEMENTED* | Per-event Ed25519 signatures for non-repudiation |
+| **Tamper-Evident Hash Chains** | *FUTURE / NOT IMPLEMENTED* | Merkle tree / hash chain proofs of audit event immutability |
+| **Cloud Audit Replication** | *FUTURE / NOT IMPLEMENTED* | Streaming audit events to remote cloud buckets (S3 / GCS) |
