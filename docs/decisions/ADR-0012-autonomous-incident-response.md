@@ -903,10 +903,117 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp ON audit_events(timestamp)
 | **Bounded History Queries** | **CURRENTLY IMPLEMENTED** | Chronologically ordered queries bounded to max 1000 records |
 | **Local Idempotent Deduplication** | **CURRENTLY IMPLEMENTED** | Database PRIMARY KEY constraint on `event_id` |
 | **Restart Durability** | **CURRENTLY IMPLEMENTED** | Preserved across SQLite process and connection restarts |
-| **Prometheus / OpenMetrics** | *FUTURE / NOT IMPLEMENTED* | Prometheus metrics exporter (deferred to future observability phase) |
+| **Prometheus / OpenMetrics** | **CURRENTLY IMPLEMENTED** | Local Prometheus exposition at GET /metrics via `edge/agent/metrics` |
 | **Grafana Dashboards** | *FUTURE / NOT IMPLEMENTED* | Response visualization and operational metrics dashboards |
 | **Distributed OpenTelemetry Tracing**| *FUTURE / NOT IMPLEMENTED* | Distributed W3C trace context propagation across edge nodes |
 | **Centralized Log Forwarding** | *FUTURE / NOT IMPLEMENTED* | FluentBit / Vector log shipping to central observability stack |
 | **Cryptographic Signatures** | *FUTURE / NOT IMPLEMENTED* | Per-event Ed25519 signatures for non-repudiation |
 | **Tamper-Evident Hash Chains** | *FUTURE / NOT IMPLEMENTED* | Merkle tree / hash chain proofs of audit event immutability |
 | **Cloud Audit Replication** | *FUTURE / NOT IMPLEMENTED* | Streaming audit events to remote cloud buckets (S3 / GCS) |
+
+---
+
+## 26. Phase 6.10: Metrics & Operational Observability
+
+### 1. Architectural Purpose
+Phase 6.10 introduces a local, Prometheus-compatible operational metrics layer (`edge/agent/metrics`) for the AegisEdge incident response system. The metrics layer makes the incident response lifecycle quantitatively measurable and observable in real time without altering business logic, without mutating the canonical Incident FSM, and without introducing real host actuation, cloud dependencies, or distributed tracing.
+
+```
++------------------------------------------------------------------------+
+|                          AegisEdge Agent Core                          |
+|                                                                        |
+|  Telemetry -> Detection -> Incident -> Policy -> Safety -> Mitigation  |
+|                                                                        |
+|        Verification <- Escalation <- Orchestrator <- Audit Trail       |
++------------------------------------------------------------------------+
+                                   | (Non-fatal in-memory recording)
+                                   v
++------------------------------------------------------------------------+
+|               Local Metrics Collector (edge/agent/metrics)             |
+|  - In-memory thread-safe atomic counters, gauges, & histograms         |
+|  - Strict label cardinality enforcement (fail-closed sanitization)     |
+|  - Zero external dependencies (pure Go Prometheus text exposition)     |
++------------------------------------------------------------------------+
+                                   |
+                                   v
+             [GET /metrics] (Local Read-Only HTTP Server)
+                           127.0.0.1:9091
+```
+
+### 2. Zero-Dependency Prometheus-Compatible Text Exposition
+The metrics package (`edge/agent/metrics/`) provides an in-memory registry and metric collectors implementing the standard Prometheus exposition text format (`text/plain; version=0.0.4; charset=utf-8`) using only the Go standard library (`sync/atomic`, `sync.RWMutex`, `math`, `bytes`, `net/http`):
+- `SingleCounter` & `CounterVec`: Monotonically increasing 64-bit unsigned/float counters.
+- `SingleGauge` & `GaugeVec`: Real-time signed counters reflecting instantaneous active states.
+- `SingleHistogram` & `HistogramVec`: Cumulative bucket observations, observation counts, and duration sums.
+- Dedicated read-only HTTP server binding locally (`127.0.0.1:9091` by default) supporting `GET /metrics` and `GET /healthz`. Non-idempotent methods (`POST`, `PUT`, `DELETE`) return `405 Method Not Allowed`.
+
+### 3. Strict Label Cardinality Safety Invariant
+$$\textbf{"NO UNBOUNDED CARDINALITY IN OBSERVABILITY LABELS."}$$
+
+To prevent memory leaks and scraper degradation on constrained edge nodes:
+- **Strictly Forbidden Labels**: Dynamic identifiers and unbounded values are strictly forbidden from label keys or values:
+  - `IncidentID`
+  - `DecisionID`
+  - `ActionID`
+  - `ApprovalID`
+  - `VerificationID`
+  - `EscalationID`
+  - `CorrelationID`
+  - Arbitrary `NodeID`
+  - Target names, process names, or arbitrary commands
+  - Unstructured error messages or error text
+  - Timestamps, durations, or raw numerical floats
+- **Fail-Closed Label Sanitization**: All label values pass through discrete allowlist sanitizers (`SanitizeMethod`, `SanitizeAuthClass`, `SanitizeSafetyReason`, `SanitizeApprovalStatus`, `SanitizeActionType`, `SanitizeMitigationStatus`, `SanitizeVerificationStatus`, `SanitizeEscalationClassification`, `SanitizeCircuitEvent`, `SanitizeOrchestrationOutcome`, `SanitizeAuditEventType`). Any unrecognized value is mapped to `"unknown"`.
+
+### 4. Bounded 27-Metric Family Lifecycle Catalog
+The subsystem implements 27 metric families covering the 11 incident response lifecycle stages:
+
+| Subsystem | Metric Name | Type | Allowed Labels | Description |
+| :--- | :--- | :---: | :--- | :--- |
+| **Telemetry** | `aegisedge_telemetry_batches_total` | Counter | *None* | Total telemetry batches collected |
+| **Telemetry** | `aegisedge_telemetry_batches_failed_total` | Counter | *None* | Telemetry batches that failed validation or local persistence |
+| **Anomaly Detection** | `aegisedge_anomalies_detected_total` | Counter | `method` | Total anomaly signals generated by detector |
+| **Anomaly Detection** | `aegisedge_detector_errors_total` | Counter | `method` | Total evaluation errors encountered by detector |
+| **Anomaly Detection** | `aegisedge_detector_duration_seconds` | Histogram | `method` | Latency distribution of anomaly detection runs |
+| **Incident Management** | `aegisedge_incidents_created_total` | Counter | *None* | Total incidents correlated and opened |
+| **Incident Management** | `aegisedge_incidents_recovered_total` | Counter | *None* | Total incidents verified recovered |
+| **Incident Management** | `aegisedge_incidents_escalated_total` | Counter | *None* | Total incidents transitioned to ESCALATED |
+| **Incident Management** | `aegisedge_active_incidents` | Gauge | *None* | Current count of active unresolved incidents |
+| **Response Policy** | `aegisedge_response_decisions_total` | Counter | `authorization_class` | Total policy evaluations by authorization class |
+| **Response Policy** | `aegisedge_response_no_action_total` | Counter | *None* | Decisions where policy determined no action required |
+| **Response Policy** | `aegisedge_response_rejections_total` | Counter | *None* | Decisions rejected by policy constraints |
+| **Safety Validation** | `aegisedge_safety_validations_total` | Counter | `result` (`passed`, `failed`) | Pre-execution safety validation checks |
+| **Safety Validation** | `aegisedge_safety_rejections_total` | Counter | `reason` | Safety validation checks rejected by specific rule |
+| **Operator Approval** | `aegisedge_approvals_total` | Counter | `status` | Approval transitions (`requested`, `approved`, `rejected`, `expired`, `cancelled`, `consumed`) |
+| **Mitigation Execution**| `aegisedge_mitigations_total` | Counter | `action_type`, `status` | Simulated mitigation attempts and status outcomes |
+| **Mitigation Execution**| `aegisedge_mitigation_duration_seconds` | Histogram | `action_type` | Duration distribution of simulated mitigation executions |
+| **Telemetry Verification**| `aegisedge_verifications_total` | Counter | `status` | Closed-loop verification sessions by outcome |
+| **Telemetry Verification**| `aegisedge_verification_duration_seconds`| Histogram | *None* | Duration distribution of closed-loop verification sessions |
+| **Escalation & Breaker**| `aegisedge_escalations_total` | Counter | `classification` | Escalation evaluations by failure classification |
+| **Escalation & Breaker**| `aegisedge_retries_total` | Counter | *None* | Authorized mitigation retry attempts |
+| **Escalation & Breaker**| `aegisedge_circuit_breaker_events_total` | Counter | `event` (`tripped`, `reset`, `blocked`) | Circuit breaker transition events |
+| **Response Orchestrator**| `aegisedge_orchestrations_total` | Counter | `outcome` | Orchestration cycles by final result |
+| **Response Orchestrator**| `aegisedge_orchestration_duration_seconds`| Histogram | *None* | Full-cycle orchestrator duration distribution |
+| **Audit Trail** | `aegisedge_audit_events_total` | Counter | `event_type` | Audit events recorded by lifecycle event type |
+| **Audit Trail** | `aegisedge_audit_write_errors_total` | Counter | *None* | Non-fatal SQLite audit log persistence errors |
+| **Audit Trail** | `aegisedge_audit_duplicates_total` | Counter | *None* | Suppressed duplicate audit event writes |
+
+### 5. Non-Fatal Observability & Error Isolation
+- **Process-Local Memory Storage**: Metric updates are stored in memory via thread-safe atomic primitives and read-write mutexes. No SQLite database writes occur per metric increment.
+- **Error Isolation**: Metrics recording failures or invalid input do not interrupt, alter, or fail operational response actions. If a metric recording operation fails or encounters an unexpected condition, the business transaction continues unaffected.
+- **Fail-Closed Read-Only Endpoint**: The `/metrics` HTTP endpoint performs zero side-effects. Concurrent scraper access does not mutate metric state, and unhandled scraper errors cannot crash the agent.
+
+### 6. Current vs. Future Capability Matrix
+
+| Capability | Current Status | Implementation |
+| :--- | :---: | :--- |
+| **Pure-Go Metrics Registry** | **CURRENTLY IMPLEMENTED** | Thread-safe in-memory registry in `edge/agent/metrics/registry.go` |
+| **Prometheus Exposition Format** | **CURRENTLY IMPLEMENTED** | Standard text format (`text/plain; version=0.0.4`) via `FormatPrometheus()` |
+| **Local Read-Only HTTP Server** | **CURRENTLY IMPLEMENTED** | Local `GET /metrics` and `GET /healthz` server on `127.0.0.1:9091` |
+| **Strict Bounded Cardinality** | **CURRENTLY IMPLEMENTED** | High-cardinality label prohibition and fail-closed sanitizers in `recorder.go` |
+| **Full Lifecycle Metric Hooks** | **CURRENTLY IMPLEMENTED** | 27 metric families across 11 stages wired into orchestrator, audit, and agent main |
+| **Simulated Mitigation Instrumentation** | **CURRENTLY IMPLEMENTED** | Durations and outcomes recorded for `SIMULATED_*` actions |
+| **Grafana Dashboards** | *FUTURE / NOT IMPLEMENTED* | Dashboards and alert rules definitions |
+| **Distributed OpenTelemetry Tracing** | *FUTURE / NOT IMPLEMENTED* | Trace context propagation across edge nodes |
+| **Remote Metric Shipping / Pushgateway** | *FUTURE / NOT IMPLEMENTED* | Active metric streaming or push to central Prometheus/VictoriaMetrics |
+| **Real Host Actuation Metrics** | *FUTURE / NOT IMPLEMENTED* | OS/systemd/container remediation metric counters |
