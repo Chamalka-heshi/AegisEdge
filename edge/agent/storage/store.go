@@ -41,6 +41,9 @@ var (
 	ErrEscalationNotFound            = errors.New("escalation record not found")
 	ErrInvalidEscalation             = errors.New("cannot persist invalid escalation record")
 	ErrInvalidCircuitStateRecord     = errors.New("cannot persist invalid circuit breaker state")
+	ErrDuplicateAuditEvent           = errors.New("audit event with the given event_id already exists")
+	ErrAuditEventNotFound            = errors.New("audit event not found")
+	ErrInvalidAuditEvent             = errors.New("cannot persist invalid audit event")
 )
 
 // SyncStatus represents the synchronization lifecycle state of a locally stored batch.
@@ -661,4 +664,166 @@ type EscalationStore interface {
 
 	// CountEscalations returns total escalation records stored.
 	CountEscalations(ctx context.Context) (int64, error)
+}
+
+// Bounded data limits for audit events.
+const (
+	DefaultAuditQueryLimit  = 100
+	MaxAuditQueryLimit      = 1000
+	MaxAuditMetadataBytes   = 8192
+	MaxAuditMetadataEntries = 32
+	MaxAuditReasonLength    = 1024
+	MaxAuditStringLength    = 128
+)
+
+// StoredAuditEvent represents a durably recorded audit event in SQLite.
+type StoredAuditEvent struct {
+	EventID            string            `json:"event_id"`
+	EventType          string            `json:"event_type"`
+	Timestamp          time.Time         `json:"timestamp"`
+	NodeID             string            `json:"node_id"`
+	IncidentID         string            `json:"incident_id"`
+	DecisionID         string            `json:"decision_id,omitempty"`
+	ActionID           string            `json:"action_id,omitempty"`
+	ApprovalID         string            `json:"approval_id,omitempty"`
+	MitigationRecordID string            `json:"mitigation_record_id,omitempty"`
+	VerificationID     string            `json:"verification_id,omitempty"`
+	EscalationID       string            `json:"escalation_id,omitempty"`
+	CorrelationID      string            `json:"correlation_id,omitempty"`
+	PolicyVersion      string            `json:"policy_version,omitempty"`
+	Actor              string            `json:"actor,omitempty"`
+	Result             string            `json:"result,omitempty"`
+	Reason             string            `json:"reason,omitempty"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+}
+
+// Validate verifies bounds, non-empty identifiers, and security constraints on StoredAuditEvent.
+func (e *StoredAuditEvent) Validate() error {
+	if strings.TrimSpace(e.EventID) == "" {
+		return fmt.Errorf("%w: event_id cannot be empty", ErrInvalidAuditEvent)
+	}
+	if len(e.EventID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: event_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if strings.TrimSpace(e.EventType) == "" {
+		return fmt.Errorf("%w: event_type cannot be empty", ErrInvalidAuditEvent)
+	}
+	if len(e.EventType) > MaxAuditStringLength {
+		return fmt.Errorf("%w: event_type exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if e.Timestamp.IsZero() {
+		return fmt.Errorf("%w: timestamp cannot be zero", ErrInvalidAuditEvent)
+	}
+	if strings.TrimSpace(e.NodeID) == "" {
+		return fmt.Errorf("%w: node_id cannot be empty", ErrInvalidAuditEvent)
+	}
+	if len(e.NodeID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: node_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if strings.TrimSpace(e.IncidentID) == "" {
+		return fmt.Errorf("%w: incident_id cannot be empty", ErrInvalidAuditEvent)
+	}
+	if len(e.IncidentID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: incident_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.DecisionID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: decision_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.ActionID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: action_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.ApprovalID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: approval_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.MitigationRecordID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: mitigation_record_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.VerificationID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: verification_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.EscalationID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: escalation_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.CorrelationID) > MaxAuditStringLength {
+		return fmt.Errorf("%w: correlation_id exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.PolicyVersion) > MaxAuditStringLength {
+		return fmt.Errorf("%w: policy_version exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.Actor) > MaxAuditStringLength {
+		return fmt.Errorf("%w: actor exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.Result) > MaxAuditStringLength {
+		return fmt.Errorf("%w: result exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditStringLength)
+	}
+	if len(e.Reason) > MaxAuditReasonLength {
+		return fmt.Errorf("%w: reason exceeds max length of %d", ErrInvalidAuditEvent, MaxAuditReasonLength)
+	}
+	if len(e.Metadata) > MaxAuditMetadataEntries {
+		return fmt.Errorf("%w: metadata exceeds maximum entry count of %d", ErrInvalidAuditEvent, MaxAuditMetadataEntries)
+	}
+
+	totalMetaBytes := 0
+	for k, v := range e.Metadata {
+		if len(k) > MaxAuditStringLength || len(v) > MaxAuditReasonLength {
+			return fmt.Errorf("%w: metadata key/value exceeds length bounds", ErrInvalidAuditEvent)
+		}
+		totalMetaBytes += len(k) + len(v)
+		// Security check: reject potential credentials or prohibited commands
+		lowerK := strings.ToLower(k)
+		lowerV := strings.ToLower(v)
+		if strings.Contains(lowerK, "password") || strings.Contains(lowerK, "secret") ||
+			strings.Contains(lowerK, "private_key") || strings.Contains(lowerK, "token") ||
+			strings.Contains(lowerK, "credential") || strings.Contains(lowerV, "bearer ") {
+			return fmt.Errorf("%w: sensitive credential pattern rejected in audit metadata", ErrInvalidAuditEvent)
+		}
+		if strings.Contains(lowerV, "/bin/sh") || strings.Contains(lowerV, "powershell") ||
+			strings.Contains(lowerV, "cmd.exe") || strings.Contains(lowerV, "exec.command") {
+			return fmt.Errorf("%w: executable command pattern rejected in audit metadata", ErrInvalidAuditEvent)
+		}
+	}
+	if totalMetaBytes > MaxAuditMetadataBytes {
+		return fmt.Errorf("%w: metadata total size %d exceeds max allowed %d bytes", ErrInvalidAuditEvent, totalMetaBytes, MaxAuditMetadataBytes)
+	}
+	return nil
+}
+
+// AuditFilter defines optional query filter criteria for listing audit events.
+type AuditFilter struct {
+	IncidentID    string    `json:"incident_id,omitempty"`
+	NodeID        string    `json:"node_id,omitempty"`
+	CorrelationID string    `json:"correlation_id,omitempty"`
+	EventType     string    `json:"event_type,omitempty"`
+	Since         time.Time `json:"since,omitempty"`
+	Until         time.Time `json:"until,omitempty"`
+	Limit         int       `json:"limit,omitempty"`
+}
+
+// AuditStore defines the durable persistence and query contract for incident response audit events.
+type AuditStore interface {
+	// RecordAuditEvent transactionally validates and persists an audit event.
+	// Returns ErrDuplicateAuditEvent if an event with the same event_id already exists.
+	RecordAuditEvent(ctx context.Context, event *StoredAuditEvent) error
+
+	// GetAuditEvent retrieves an audit event by its unique event_id.
+	// Returns (nil, ErrAuditEventNotFound) if not found.
+	GetAuditEvent(ctx context.Context, eventID string) (*StoredAuditEvent, error)
+
+	// ListAuditEventsByIncident retrieves audit events for an incident_id,
+	// ordered chronologically (timestamp ASC, event_id ASC), bounded by limit.
+	ListAuditEventsByIncident(ctx context.Context, incidentID string, limit int) ([]*StoredAuditEvent, error)
+
+	// ListAuditEventsByCorrelation retrieves audit events sharing a correlation_id,
+	// ordered chronologically (timestamp ASC, event_id ASC), bounded by limit.
+	ListAuditEventsByCorrelation(ctx context.Context, correlationID string, limit int) ([]*StoredAuditEvent, error)
+
+	// ListAuditEventsByNode retrieves audit events for a node_id,
+	// ordered chronologically (timestamp ASC, event_id ASC), bounded by limit.
+	ListAuditEventsByNode(ctx context.Context, nodeID string, limit int) ([]*StoredAuditEvent, error)
+
+	// ListAuditEvents retrieves audit events matching an optional filter, bounded by limit.
+	ListAuditEvents(ctx context.Context, filter AuditFilter) ([]*StoredAuditEvent, error)
+
+	// CountAuditEvents returns the total count of audit events stored.
+	CountAuditEvents(ctx context.Context) (int64, error)
 }
