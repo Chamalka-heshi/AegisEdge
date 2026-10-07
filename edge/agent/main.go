@@ -13,6 +13,7 @@ import (
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/config"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/metrics"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/sync"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/telemetry"
@@ -39,6 +40,8 @@ func main() {
 		syncInterval    = flag.Duration("sync-interval", cfg.SyncInterval, "Background synchronization interval")
 		syncEnabled     = flag.Bool("sync-enabled", cfg.SyncEnabled, "Enable background synchronization")
 		runOnce         = flag.Bool("once", false, "Run single collection step and exit")
+		metricsEnabled  = flag.Bool("metrics-enabled", cfg.MetricsEnabled, "Enable local Prometheus metrics exposition")
+		metricsAddr     = flag.String("metrics-addr", cfg.MetricsAddr, "Local Prometheus metrics bind address")
 	)
 	flag.Parse()
 
@@ -54,6 +57,8 @@ func main() {
 	cfg.SyncInterval = *syncInterval
 	cfg.SyncEnabled = *syncEnabled
 	cfg.RunOnce = *runOnce
+	cfg.MetricsEnabled = *metricsEnabled
+	cfg.MetricsAddr = *metricsAddr
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -68,8 +73,37 @@ func main() {
 		slog.String("control_plane_url", cfg.ControlPlaneURL),
 		slog.Duration("sync_interval", cfg.SyncInterval),
 		slog.Bool("sync_enabled", cfg.SyncEnabled),
+		slog.Bool("metrics_enabled", cfg.MetricsEnabled),
+		slog.String("metrics_addr", cfg.MetricsAddr),
 		slog.Bool("once", cfg.RunOnce),
 	)
+
+	// Metrics recorder & exposition initialization
+	var metricRec metrics.Recorder
+	var metricsServer *metrics.Server
+	if cfg.MetricsEnabled {
+		reg := metrics.NewRegistry()
+		metricRec = metrics.NewDefaultRecorder(reg)
+		metricsServer = metrics.NewServer(cfg.MetricsAddr, reg)
+		if err := metricsServer.Start(); err != nil {
+			logger.Error("failed to start metrics exposition server", slog.Any("error", err))
+			os.Exit(1)
+		}
+		logger.Info("metrics exposition server started",
+			slog.String("addr", cfg.MetricsAddr),
+			slog.String("endpoint", "/metrics"),
+		)
+		defer func() {
+			logger.Info("stopping metrics exposition server...")
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := metricsServer.Stop(stopCtx); err != nil {
+				logger.Error("error stopping metrics exposition server", slog.Any("error", err))
+			}
+		}()
+	} else {
+		metricRec = metrics.NoopRecorder{}
+	}
 
 	// 1. Initialize SQLite WAL local store
 	logger.Info("initializing local SQLite WAL storage engine...", slog.String("db_path", cfg.DatabasePath))
@@ -109,7 +143,7 @@ func main() {
 	}
 
 	// 4. Initialize deterministic anomaly detector (process-local lifecycle)
-	det, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
+	rawDet, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
 		Version: "1.0.0",
 		Rules:   detector.DefaultRules(),
 	})
@@ -117,6 +151,7 @@ func main() {
 		logger.Error("failed to initialize anomaly detector", slog.Any("error", err))
 		os.Exit(1)
 	}
+	det := newInstrumentedDetector(rawDet, metricRec)
 	logger.Info("local anomaly detector initialized (process-local lifecycle)",
 		slog.String("detector_name", det.Name()),
 		slog.String("detector_version", det.Version()),
@@ -138,6 +173,7 @@ func main() {
 		logger.Error("failed to recover incident state from durable store", slog.Any("error", err))
 		os.Exit(1)
 	}
+	metricRec.SetActiveIncidents(recoveredIncidents)
 	logger.Info("local incident engine initialized with durable SQLite persistence",
 		slog.Int("policy_m", policyCfg.M),
 		slog.Int("policy_n", policyCfg.N),
@@ -160,6 +196,8 @@ func main() {
 			return
 		}
 		if inc != nil {
+			metricRec.RecordIncidentCreated()
+			metricRec.IncActiveIncidents()
 			// Structured logging per ADR-0009 / ADR-0010
 			logger.Warn("incident created",
 				slog.String("incident_id", inc.IncidentID),
@@ -211,6 +249,7 @@ func main() {
 	// If run-once mode was requested, execute single collection step and sync attempt
 	if cfg.RunOnce {
 		batch, _, err := runCollectionStep(ctx, gen, store, det, logger, incidentHandler)
+		metricRec.RecordTelemetryBatch(err == nil)
 		if err != nil {
 			logger.Error("single-shot collection step failed", slog.Any("error", err))
 			os.Exit(1)
@@ -257,7 +296,9 @@ func main() {
 			return
 
 		case <-collectTicker.C:
-			if _, _, err := runCollectionStep(ctx, gen, store, det, logger, incidentHandler); err != nil {
+			_, _, err := runCollectionStep(ctx, gen, store, det, logger, incidentHandler)
+			metricRec.RecordTelemetryBatch(err == nil)
+			if err != nil {
 				logger.Error("telemetry collection and persistence step failed", slog.Any("error", err))
 			} else if syncer != nil {
 				// Proactively trigger sync after new batch is persisted
@@ -368,4 +409,58 @@ func runCollectionStep(
 	}
 
 	return batch, detectedSignals, nil
+}
+
+// instrumentedDetector wraps a detector.Detector to record metrics for anomaly detection execution.
+type instrumentedDetector struct {
+	inner detector.Detector
+	rec   metrics.Recorder
+}
+
+func newInstrumentedDetector(inner detector.Detector, rec metrics.Recorder) detector.Detector {
+	if inner == nil {
+		return nil
+	}
+	if rec == nil {
+		rec = metrics.NoopRecorder{}
+	}
+	return &instrumentedDetector{inner: inner, rec: rec}
+}
+
+func (id *instrumentedDetector) Name() string {
+	return id.inner.Name()
+}
+
+func (id *instrumentedDetector) Version() string {
+	return id.inner.Version()
+}
+
+func (id *instrumentedDetector) Detect(ctx context.Context, sample types.MetricSample) (*types.AnomalySignal, error) {
+	start := time.Now()
+	sig, err := id.inner.Detect(ctx, sample)
+	duration := time.Since(start)
+	method := id.inner.Name()
+	id.rec.ObserveDetectorDuration(method, duration)
+	if err != nil {
+		id.rec.RecordDetectorError(method)
+	} else if sig != nil {
+		id.rec.RecordAnomalyDetected(sig.DetectionMethod)
+	}
+	return sig, err
+}
+
+func (id *instrumentedDetector) DetectBatch(ctx context.Context, batch *types.TelemetryBatch) ([]*types.AnomalySignal, error) {
+	start := time.Now()
+	signals, err := id.inner.DetectBatch(ctx, batch)
+	duration := time.Since(start)
+	method := id.inner.Name()
+	id.rec.ObserveDetectorDuration(method, duration)
+	if err != nil {
+		id.rec.RecordDetectorError(method)
+	} else {
+		for _, sig := range signals {
+			id.rec.RecordAnomalyDetected(sig.DetectionMethod)
+		}
+	}
+	return signals, err
 }

@@ -2,13 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/metrics"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/telemetry"
+	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
 
 func newDiscardLogger() *slog.Logger {
@@ -88,5 +94,106 @@ func TestRunCollectionStep_PersistenceFailure(t *testing.T) {
 	_, _, err = runCollectionStep(ctx, gen, store, nil, logger)
 	if err == nil {
 		t.Fatal("expected error on closed store, got nil")
+	}
+}
+
+type mockFaultyDetector struct {
+	name    string
+	version string
+	err     error
+}
+
+func (m *mockFaultyDetector) Name() string    { return m.name }
+func (m *mockFaultyDetector) Version() string { return m.version }
+func (m *mockFaultyDetector) Detect(ctx context.Context, sample types.MetricSample) (*types.AnomalySignal, error) {
+	return nil, m.err
+}
+func (m *mockFaultyDetector) DetectBatch(ctx context.Context, batch *types.TelemetryBatch) ([]*types.AnomalySignal, error) {
+	return nil, m.err
+}
+
+func TestInstrumentedDetector_MetricsRecording(t *testing.T) {
+	ctx := context.Background()
+	rec := metrics.NewDefaultRecorder(nil)
+
+	// 1. Threshold detector with normal sample (no anomaly, no error)
+	rawDet, err := detector.NewThresholdDetector(detector.ThresholdDetectorConfig{
+		Version: "1.0.0",
+		Rules:   detector.DefaultRules(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create threshold detector: %v", err)
+	}
+	instDet := newInstrumentedDetector(rawDet, rec)
+
+	normalBatch := &types.TelemetryBatch{
+		BatchID:        "b-normal",
+		NodeID:         "node-test",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics: []types.MetricSample{
+			{NodeID: "node-test", Name: "cpu_usage_percent", Value: 50.0, Timestamp: time.Now().UTC()},
+		},
+	}
+
+	sigs, err := instDet.DetectBatch(ctx, normalBatch)
+	if err != nil {
+		t.Fatalf("unexpected error on normal batch: %v", err)
+	}
+	if len(sigs) != 0 {
+		t.Fatalf("expected 0 anomalies, got %d", len(sigs))
+	}
+
+	prom := rec.Registry().FormatPrometheus()
+	if !strings.Contains(prom, `aegisedge_detector_duration_seconds_count{method="threshold"} 1`) {
+		t.Errorf("expected detector duration to be recorded for normal batch, got:\n%s", prom)
+	}
+	if strings.Contains(prom, `aegisedge_detector_errors_total{`) {
+		t.Errorf("expected NO detector errors for normal batch, got:\n%s", prom)
+	}
+	if strings.Contains(prom, `aegisedge_anomalies_detected_total{`) {
+		t.Errorf("expected NO anomalies for normal batch, got:\n%s", prom)
+	}
+
+	// 2. Anomaly batch (CPU at 99.0 > threshold 90.0)
+	anomalyBatch := &types.TelemetryBatch{
+		BatchID:        "b-anomaly",
+		NodeID:         "node-test",
+		SequenceNumber: 2,
+		CollectedAt:    time.Now().UTC(),
+		Metrics: []types.MetricSample{
+			{NodeID: "node-test", Name: "cpu_usage_percent", Value: 99.0, Timestamp: time.Now().UTC()},
+		},
+	}
+
+	sigs, err = instDet.DetectBatch(ctx, anomalyBatch)
+	if err != nil {
+		t.Fatalf("unexpected error on anomalous batch: %v", err)
+	}
+	if len(sigs) != 1 {
+		t.Fatalf("expected 1 anomaly, got %d", len(sigs))
+	}
+
+	prom = rec.Registry().FormatPrometheus()
+	if !strings.Contains(prom, `aegisedge_anomalies_detected_total{method="threshold"} 1`) {
+		t.Errorf("expected anomaly detected to be recorded, got:\n%s", prom)
+	}
+
+	// 3. Faulty detector: returns evaluation error
+	faulty := &mockFaultyDetector{
+		name:    "threshold",
+		version: "1.0.0",
+		err:     errors.New("simulated detection failure"),
+	}
+	instFaulty := newInstrumentedDetector(faulty, rec)
+
+	_, err = instFaulty.DetectBatch(ctx, normalBatch)
+	if err == nil {
+		t.Fatal("expected error from faulty detector, got nil")
+	}
+
+	prom = rec.Registry().FormatPrometheus()
+	if !strings.Contains(prom, `aegisedge_detector_errors_total{method="threshold"} 1`) {
+		t.Errorf("expected detector error to be recorded, got:\n%s", prom)
 	}
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/escalation"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/metrics"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/orchestrator"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/response"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
@@ -1427,5 +1428,52 @@ func TestOrchestrator_EventObservability(t *testing.T) {
 
 	if atomic.LoadInt64(&eventsReceived) == 0 {
 		t.Errorf("expected at least 1 auditable orchestration event, got 0")
+	}
+}
+
+// TestOrchestrator_MetricsObservability verifies that orchestrator operations emit Prometheus-compatible metrics.
+func TestOrchestrator_MetricsObservability(t *testing.T) {
+	h := setupTestHarness(t, nil)
+	ctx := context.Background()
+	now := h.clock.Now()
+
+	metricRec := metrics.NewDefaultRecorder(nil)
+	h.orch.WithMetricsRecorder(metricRec)
+
+	inc := makeIncident("node-metrics-01", "cpu_usage_percent", types.SeverityHigh, now)
+	_, _ = h.incEngine.RegisterIncident(ctx, inc)
+
+	sample1 := types.MetricSample{NodeID: "node-metrics-01", Name: "cpu_usage_percent", Value: 60.0, Timestamp: now.Add(1 * time.Second)}
+	sample2 := types.MetricSample{NodeID: "node-metrics-01", Name: "cpu_usage_percent", Value: 61.0, Timestamp: now.Add(2 * time.Second)}
+
+	res, err := h.orch.OrchestrateIncident(ctx, inc, orchestrator.WithTelemetrySamples(sample1, sample2))
+	if err != nil {
+		t.Fatalf("orchestration failed: %v", err)
+	}
+	if res.State != orchestrator.StateRecovered {
+		t.Fatalf("expected StateRecovered, got %s", res.State)
+	}
+
+	out := metricRec.Registry().FormatPrometheus()
+
+	// Verify required operational metrics are present and observed
+	expectedMetrics := []string{
+		`aegisedge_response_decisions_total{authorization_class="AUTO_EXECUTE"} 1`,
+		`aegisedge_safety_validations_total{outcome="passed"} 1`,
+		`aegisedge_mitigations_total{action_type="SIMULATED_THROTTLE",status="started"} 1`,
+		`aegisedge_mitigations_total{action_type="SIMULATED_THROTTLE",status="executed"} 1`,
+		`aegisedge_mitigation_duration_seconds_count{action_type="SIMULATED_THROTTLE"} 1`,
+		`aegisedge_verifications_total{status="started"} 1`,
+		`aegisedge_verifications_total{status="recovered"} 1`,
+		`aegisedge_orchestrations_total{outcome="completed"} 1`,
+		`aegisedge_orchestration_duration_seconds_count 1`,
+		`aegisedge_incidents_recovered_total 1`,
+		`aegisedge_audit_events_total`,
+	}
+
+	for _, em := range expectedMetrics {
+		if !strings.Contains(out, em) {
+			t.Errorf("missing expected metric in orchestrator output:\n%s\ngot:\n%s", em, out)
+		}
 	}
 }
