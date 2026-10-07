@@ -370,6 +370,44 @@ func (s *SQLiteStore) runMigrations() error {
 		}
 	}
 
+	// 10. Migration v8: audit_events table and indexes (Phase 6.9)
+	if currentVersion < 8 {
+		createAuditTable := `
+		CREATE TABLE IF NOT EXISTS audit_events (
+			event_id TEXT PRIMARY KEY,
+			event_type TEXT NOT NULL,
+			timestamp TEXT NOT NULL,
+			node_id TEXT NOT NULL,
+			incident_id TEXT NOT NULL,
+			decision_id TEXT NOT NULL DEFAULT '',
+			action_id TEXT NOT NULL DEFAULT '',
+			approval_id TEXT NOT NULL DEFAULT '',
+			mitigation_record_id TEXT NOT NULL DEFAULT '',
+			verification_id TEXT NOT NULL DEFAULT '',
+			escalation_id TEXT NOT NULL DEFAULT '',
+			correlation_id TEXT NOT NULL DEFAULT '',
+			policy_version TEXT NOT NULL DEFAULT '',
+			actor TEXT NOT NULL DEFAULT '',
+			result TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			metadata TEXT NOT NULL DEFAULT '{}'
+		);
+		CREATE INDEX IF NOT EXISTS idx_audit_events_incident ON audit_events(incident_id);
+		CREATE INDEX IF NOT EXISTS idx_audit_events_node ON audit_events(node_id);
+		CREATE INDEX IF NOT EXISTS idx_audit_events_correlation ON audit_events(correlation_id);
+		CREATE INDEX IF NOT EXISTS idx_audit_events_type ON audit_events(event_type);
+		CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp ON audit_events(timestamp);
+		`
+		if _, err := tx.ExecContext(ctx, createAuditTable); err != nil {
+			return fmt.Errorf("migration v8 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (8, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v8: %w", err)
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -3382,4 +3420,276 @@ func scanEscalation(s scanner) (*StoredEscalation, error) {
 	}
 
 	return &e, nil
+}
+
+// ============================================================================
+// AuditStore Implementation (Phase 6.9)
+// ============================================================================
+
+// RecordAuditEvent validates and persists an audit event in SQLite.
+// If an event with the same event_id already exists, ErrDuplicateAuditEvent is returned.
+func (s *SQLiteStore) RecordAuditEvent(ctx context.Context, evt *StoredAuditEvent) error {
+	if evt == nil {
+		return ErrInvalidAuditEvent
+	}
+	if err := evt.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidAuditEvent, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	// Idempotency check: if event_id already exists
+	var exists int
+	checkQuery := `SELECT 1 FROM audit_events WHERE event_id = ? LIMIT 1;`
+	err := s.db.QueryRowContext(ctx, checkQuery, evt.EventID).Scan(&exists)
+	if err == nil {
+		return ErrDuplicateAuditEvent
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check audit event existence: %w", err)
+	}
+
+	metaJSON := "{}"
+	if len(evt.Metadata) > 0 {
+		data, err := json.Marshal(evt.Metadata)
+		if err == nil {
+			metaJSON = string(data)
+		}
+	}
+
+	insertQuery := `
+	INSERT INTO audit_events (
+		event_id, event_type, timestamp, node_id, incident_id,
+		decision_id, action_id, approval_id, mitigation_record_id,
+		verification_id, escalation_id, correlation_id, policy_version,
+		actor, result, reason, metadata
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+
+	_, err = s.db.ExecContext(
+		ctx,
+		insertQuery,
+		evt.EventID,
+		evt.EventType,
+		evt.Timestamp.UTC().Format(time.RFC3339Nano),
+		evt.NodeID,
+		evt.IncidentID,
+		evt.DecisionID,
+		evt.ActionID,
+		evt.ApprovalID,
+		evt.MitigationRecordID,
+		evt.VerificationID,
+		evt.EscalationID,
+		evt.CorrelationID,
+		evt.PolicyVersion,
+		evt.Actor,
+		evt.Result,
+		evt.Reason,
+		metaJSON,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "constraint failed") {
+			return ErrDuplicateAuditEvent
+		}
+		return fmt.Errorf("failed to insert audit event: %w", err)
+	}
+
+	return nil
+}
+
+// GetAuditEvent retrieves an audit event by its unique event_id.
+func (s *SQLiteStore) GetAuditEvent(ctx context.Context, eventID string) (*StoredAuditEvent, error) {
+	if strings.TrimSpace(eventID) == "" {
+		return nil, ErrAuditEventNotFound
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT event_id, event_type, timestamp, node_id, incident_id,
+	       decision_id, action_id, approval_id, mitigation_record_id,
+	       verification_id, escalation_id, correlation_id, policy_version,
+	       actor, result, reason, metadata
+	FROM audit_events
+	WHERE event_id = ?
+	LIMIT 1;`
+
+	row := s.db.QueryRowContext(ctx, query, eventID)
+	evt, err := scanAuditEvent(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrAuditEventNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get audit event: %w", err)
+	}
+	return evt, nil
+}
+
+// ListAuditEventsByIncident retrieves audit events for a given incident_id,
+// ordered chronologically (timestamp ASC, event_id ASC), bounded by limit.
+func (s *SQLiteStore) ListAuditEventsByIncident(ctx context.Context, incidentID string, limit int) ([]*StoredAuditEvent, error) {
+	if strings.TrimSpace(incidentID) == "" {
+		return nil, nil
+	}
+	return s.ListAuditEvents(ctx, AuditFilter{IncidentID: incidentID, Limit: limit})
+}
+
+// ListAuditEventsByCorrelation retrieves audit events sharing a correlation_id,
+// ordered chronologically (timestamp ASC, event_id ASC), bounded by limit.
+func (s *SQLiteStore) ListAuditEventsByCorrelation(ctx context.Context, correlationID string, limit int) ([]*StoredAuditEvent, error) {
+	if strings.TrimSpace(correlationID) == "" {
+		return nil, nil
+	}
+	return s.ListAuditEvents(ctx, AuditFilter{CorrelationID: correlationID, Limit: limit})
+}
+
+// ListAuditEventsByNode retrieves audit events for a given node_id,
+// ordered chronologically (timestamp ASC, event_id ASC), bounded by limit.
+func (s *SQLiteStore) ListAuditEventsByNode(ctx context.Context, nodeID string, limit int) ([]*StoredAuditEvent, error) {
+	if strings.TrimSpace(nodeID) == "" {
+		return nil, nil
+	}
+	return s.ListAuditEvents(ctx, AuditFilter{NodeID: nodeID, Limit: limit})
+}
+
+// ListAuditEvents retrieves audit events matching an optional filter, bounded by limit.
+func (s *SQLiteStore) ListAuditEvents(ctx context.Context, filter AuditFilter) ([]*StoredAuditEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = DefaultAuditQueryLimit
+	} else if limit > MaxAuditQueryLimit {
+		limit = MaxAuditQueryLimit
+	}
+
+	var whereClauses []string
+	var args []any
+
+	if strings.TrimSpace(filter.IncidentID) != "" {
+		whereClauses = append(whereClauses, "incident_id = ?")
+		args = append(args, strings.TrimSpace(filter.IncidentID))
+	}
+	if strings.TrimSpace(filter.NodeID) != "" {
+		whereClauses = append(whereClauses, "node_id = ?")
+		args = append(args, strings.TrimSpace(filter.NodeID))
+	}
+	if strings.TrimSpace(filter.CorrelationID) != "" {
+		whereClauses = append(whereClauses, "correlation_id = ?")
+		args = append(args, strings.TrimSpace(filter.CorrelationID))
+	}
+	if strings.TrimSpace(filter.EventType) != "" {
+		whereClauses = append(whereClauses, "event_type = ?")
+		args = append(args, strings.TrimSpace(filter.EventType))
+	}
+	if !filter.Since.IsZero() {
+		whereClauses = append(whereClauses, "timestamp >= ?")
+		args = append(args, filter.Since.UTC().Format(time.RFC3339Nano))
+	}
+	if !filter.Until.IsZero() {
+		whereClauses = append(whereClauses, "timestamp <= ?")
+		args = append(args, filter.Until.UTC().Format(time.RFC3339Nano))
+	}
+
+	baseQuery := `
+	SELECT event_id, event_type, timestamp, node_id, incident_id,
+	       decision_id, action_id, approval_id, mitigation_record_id,
+	       verification_id, escalation_id, correlation_id, policy_version,
+	       actor, result, reason, metadata
+	FROM audit_events`
+
+	if len(whereClauses) > 0 {
+		baseQuery += " WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	baseQuery += " ORDER BY timestamp ASC, event_id ASC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, baseQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query audit events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*StoredAuditEvent
+	for rows.Next() {
+		evt, err := scanAuditEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan audit event: %w", err)
+		}
+		events = append(events, evt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	return events, nil
+}
+
+// CountAuditEvents returns total audit events stored.
+func (s *SQLiteStore) CountAuditEvents(ctx context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	var count int64
+	query := `SELECT COUNT(*) FROM audit_events;`
+	if err := s.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count audit events: %w", err)
+	}
+	return count, nil
+}
+
+func scanAuditEvent(s scanner) (*StoredAuditEvent, error) {
+	var (
+		evt          StoredAuditEvent
+		timestampStr string
+		metadataStr  string
+	)
+
+	err := s.Scan(
+		&evt.EventID,
+		&evt.EventType,
+		&timestampStr,
+		&evt.NodeID,
+		&evt.IncidentID,
+		&evt.DecisionID,
+		&evt.ActionID,
+		&evt.ApprovalID,
+		&evt.MitigationRecordID,
+		&evt.VerificationID,
+		&evt.EscalationID,
+		&evt.CorrelationID,
+		&evt.PolicyVersion,
+		&evt.Actor,
+		&evt.Result,
+		&evt.Reason,
+		&metadataStr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	evt.Timestamp, _ = parseDBTime(timestampStr)
+	if metadataStr != "" && metadataStr != "{}" {
+		_ = json.Unmarshal([]byte(metadataStr), &evt.Metadata)
+	}
+
+	return &evt, nil
 }
