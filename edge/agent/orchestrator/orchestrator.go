@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/audit"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/escalation"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/response"
@@ -289,6 +290,7 @@ type DefaultOrchestrator struct {
 	mitStore      storage.MitigationStore
 	vStore        storage.VerificationStore
 	approvalMgr   *response.ApprovalManager
+	auditRecorder audit.Recorder
 	cfg           Config
 	clock         Clock
 	inFlight      map[string]*inFlightOrchestration
@@ -342,20 +344,28 @@ func NewOrchestrator(
 		vStore = vs
 	}
 
+	var auditRec audit.Recorder
+	if as, ok := mitStore.(storage.AuditStore); ok {
+		if rec, err := audit.NewService(as, clock); err == nil {
+			auditRec = rec
+		}
+	}
+
 	return &DefaultOrchestrator{
-		policy:     policy,
-		validator:  validator,
-		executor:   executor,
-		vEngine:    vEngine,
-		escEngine:  escEngine,
-		incEngine:  incEngine,
-		mitStore:   mitStore,
-		vStore:     vStore,
-		cfg:        cfg,
-		clock:      clock,
-		inFlight:   make(map[string]*inFlightOrchestration),
-		stateCache: make(map[string]OrchestrationState),
-		history:    make(map[string]*OrchestrationResult),
+		policy:        policy,
+		validator:     validator,
+		executor:      executor,
+		vEngine:       vEngine,
+		escEngine:     escEngine,
+		incEngine:     incEngine,
+		mitStore:      mitStore,
+		vStore:        vStore,
+		auditRecorder: auditRec,
+		cfg:           cfg,
+		clock:         clock,
+		inFlight:      make(map[string]*inFlightOrchestration),
+		stateCache:    make(map[string]OrchestrationState),
+		history:       make(map[string]*OrchestrationResult),
 	}, nil
 }
 
@@ -365,6 +375,21 @@ func (o *DefaultOrchestrator) WithApprovalManager(mgr *response.ApprovalManager)
 	defer o.mu.Unlock()
 	o.approvalMgr = mgr
 	return o
+}
+
+// WithAuditRecorder associates a custom audit.Recorder.
+func (o *DefaultOrchestrator) WithAuditRecorder(recorder audit.Recorder) *DefaultOrchestrator {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.auditRecorder = recorder
+	return o
+}
+
+// GetAuditRecorder returns the configured audit.Recorder, if any.
+func (o *DefaultOrchestrator) GetAuditRecorder() audit.Recorder {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.auditRecorder
 }
 
 // RegisterEventHandler registers a listener for auditable orchestration events.
@@ -510,6 +535,14 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 		return res, err
 	}
 	if cbStatus != nil && cbStatus.State == types.CircuitOpen {
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:  audit.EventTypeCircuitOpened,
+			NodeID:     inc.NodeID,
+			IncidentID: inc.IncidentID,
+			Actor:      "escalation_engine",
+			Result:     audit.ResultCircuitOpen,
+			Reason:     "circuit breaker is OPEN; autonomous remediation prohibited",
+		})
 		evalReq := escalation.FailureEvaluationRequest{
 			IncidentID:            inc.IncidentID,
 			NodeID:                inc.NodeID,
@@ -527,6 +560,14 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 		res := o.newResult(inc, StateEscalated, len(prevMitigations), "", "", "circuit breaker is OPEN; autonomous remediation prohibited; incident escalated", ErrCircuitBreakerOpen)
 		res.EscalationDecision = escDec
 		o.emitEvent(res, len(prevMitigations), "", "", types.MitigationActionType(""), "", types.MitigationStatus(""), types.VerificationStatus(""), escalation.DecisionActionEscalate)
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:  audit.EventTypeOrchestrationCompleted,
+			NodeID:     inc.NodeID,
+			IncidentID: inc.IncidentID,
+			Actor:      "orchestrator",
+			Result:     string(StateEscalated),
+			Reason:     "circuit breaker is OPEN; incident escalated",
+		})
 		return res, ErrCircuitBreakerOpen
 	}
 
@@ -578,6 +619,14 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 				// NO_ACTION semantics: no mitigation executed, cycle stops, incident state remains unchanged
 				res := o.newResult(inc, StateFailed, attempt, "", "", "response policy determined NO_ACTION; orchestration stopped for cycle; incident state remains unchanged", nil)
 				o.emitEvent(res, attempt, "", "", types.MitigationActionType(""), "", types.MitigationStatusSkipped, types.VerificationStatus(""), escalation.DecisionActionNone)
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:  audit.EventTypeOrchestrationStopped,
+					NodeID:     inc.NodeID,
+					IncidentID: inc.IncidentID,
+					Actor:      "orchestrator",
+					Result:     audit.ResultSkipped,
+					Reason:     "response policy determined NO_ACTION; cycle stopped",
+				})
 				return res, nil
 			}
 			res := o.newResult(inc, StateFailed, attempt, "", "", "policy evaluation failed: "+err.Error(), err)
@@ -592,13 +641,43 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 		if dec.ActionType == "" || dec.ActionType == "NO_ACTION" {
 			res := o.newResult(inc, StateFailed, attempt, dec.DecisionID, "", "response policy determined NO_ACTION; orchestration stopped for cycle; incident state remains unchanged", nil)
 			o.emitEvent(res, attempt, dec.DecisionID, "", dec.ActionType, dec.Target, types.MitigationStatusSkipped, types.VerificationStatus(""), escalation.DecisionActionNone)
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:  audit.EventTypeOrchestrationStopped,
+				NodeID:     inc.NodeID,
+				IncidentID: inc.IncidentID,
+				DecisionID: dec.DecisionID,
+				Actor:      "orchestrator",
+				Result:     audit.ResultSkipped,
+				Reason:     "response policy determined NO_ACTION; cycle stopped",
+			})
 			return res, nil
 		}
+
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:     audit.EventTypeResponseDecisionCreated,
+			NodeID:        dec.NodeID,
+			IncidentID:    inc.IncidentID,
+			DecisionID:    dec.DecisionID,
+			PolicyVersion: dec.PolicyVersion,
+			Actor:         "policy_engine",
+			Result:        audit.ResultSuccess,
+			Reason:        dec.Reason,
+		})
 
 		// Fail closed on FORBIDDEN action immediately
 		if dec.AuthorizationClass == response.AuthClassForbidden {
 			res := o.newResult(inc, StateFailed, attempt, dec.DecisionID, "", "action is classified as FORBIDDEN by response policy", ErrForbiddenAction)
 			o.emitEvent(res, attempt, dec.DecisionID, "", dec.ActionType, dec.Target, types.MitigationStatus(""), types.VerificationStatus(""), escalation.DecisionActionNone)
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:     audit.EventTypeOrchestrationStopped,
+				NodeID:        dec.NodeID,
+				IncidentID:    inc.IncidentID,
+				DecisionID:    dec.DecisionID,
+				PolicyVersion: dec.PolicyVersion,
+				Actor:         "orchestrator",
+				Result:        audit.ResultRejected,
+				Reason:        "action is classified as FORBIDDEN by response policy",
+			})
 			return res, ErrForbiddenAction
 		}
 
@@ -613,6 +692,16 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 					}
 					_, _ = o.approvalMgr.RequestApproval(ctx, req)
 				}
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:     audit.EventTypeApprovalRequested,
+					NodeID:        dec.NodeID,
+					IncidentID:    inc.IncidentID,
+					DecisionID:    dec.DecisionID,
+					PolicyVersion: dec.PolicyVersion,
+					Actor:         "orchestrator",
+					Result:        audit.ResultRejected,
+					Reason:        "operator approval required; waiting for approval",
+				})
 				res := o.newResult(inc, StateWaitingApproval, attempt, dec.DecisionID, "", "operator approval required; waiting for approval", ErrApprovalMissing)
 				o.emitEvent(res, attempt, dec.DecisionID, "", dec.ActionType, dec.Target, types.MitigationStatus(""), types.VerificationStatus(""), escalation.DecisionActionNone)
 				return res, nil
@@ -620,6 +709,17 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 
 			appErr := response.ValidateApprovalForExecution(options.Approval, dec, inc, o.clock.Now())
 			if appErr != nil {
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:     audit.EventTypeApprovalRejected,
+					NodeID:        dec.NodeID,
+					IncidentID:    inc.IncidentID,
+					DecisionID:    dec.DecisionID,
+					ApprovalID:    options.Approval.ApprovalID,
+					PolicyVersion: dec.PolicyVersion,
+					Actor:         "operator",
+					Result:        audit.ResultRejected,
+					Reason:        "approval validation failed: " + appErr.Error(),
+				})
 				res := o.newResult(inc, StateFailed, attempt, dec.DecisionID, options.Approval.ActionID, "approval validation failed: "+appErr.Error(), ErrApprovalInvalid)
 				evalReq := escalation.FailureEvaluationRequest{
 					IncidentID:            inc.IncidentID,
@@ -632,6 +732,18 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 				o.emitEvent(res, attempt, dec.DecisionID, options.Approval.ActionID, dec.ActionType, dec.Target, types.MitigationStatusFailed, types.VerificationStatus(""), escalation.DecisionActionNone)
 				return res, ErrApprovalInvalid
 			}
+
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:     audit.EventTypeApprovalGranted,
+				NodeID:        dec.NodeID,
+				IncidentID:    inc.IncidentID,
+				DecisionID:    dec.DecisionID,
+				ApprovalID:    options.Approval.ApprovalID,
+				PolicyVersion: dec.PolicyVersion,
+				Actor:         options.Approval.ApprovedBy,
+				Result:        audit.ResultSuccess,
+				Reason:        "operator approval verified",
+			})
 		}
 
 		// C. Pre-Execution Safety Validation Boundary
@@ -649,10 +761,31 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 			} else if err != nil {
 				errMsg = fmt.Sprintf("safety validation error: %v", err)
 			}
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:     audit.EventTypeSafetyRejected,
+				NodeID:        dec.NodeID,
+				IncidentID:    inc.IncidentID,
+				DecisionID:    dec.DecisionID,
+				PolicyVersion: dec.PolicyVersion,
+				Actor:         "safety_validator",
+				Result:        audit.ResultRejected,
+				Reason:        errMsg,
+			})
 			res := o.newResult(inc, StateFailed, attempt, dec.DecisionID, "", errMsg, ErrSafetyValidationFailed)
 			o.emitEvent(res, attempt, dec.DecisionID, "", dec.ActionType, dec.Target, types.MitigationStatus(""), types.VerificationStatus(""), escalation.DecisionActionNone)
 			return res, ErrSafetyValidationFailed
 		}
+
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:     audit.EventTypeSafetyValidated,
+			NodeID:        dec.NodeID,
+			IncidentID:    inc.IncidentID,
+			DecisionID:    dec.DecisionID,
+			PolicyVersion: dec.PolicyVersion,
+			Actor:         "safety_validator",
+			Result:        audit.ResultSuccess,
+			Reason:        "safety validation passed",
+		})
 
 		validatedDec, err := response.NewValidatedDecision(dec, safetyRes)
 		if err != nil {
@@ -691,6 +824,31 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 			o.emitEvent(res, attempt, dec.DecisionID, actionID, dec.ActionType, dec.Target, types.MitigationStatus(""), types.VerificationStatus(""), escalation.DecisionActionNone)
 			return res, ErrPersistenceFailed
 		}
+
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:          audit.EventTypeMitigationRecorded,
+			NodeID:             dec.NodeID,
+			IncidentID:         inc.IncidentID,
+			DecisionID:         dec.DecisionID,
+			ActionID:           actionID,
+			MitigationRecordID: actionID,
+			PolicyVersion:      dec.PolicyVersion,
+			Actor:              "storage",
+			Result:             audit.ResultSuccess,
+			Reason:             "mitigation record durably persisted prior to execution",
+		})
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:          audit.EventTypeMitigationStarted,
+			NodeID:             dec.NodeID,
+			IncidentID:         inc.IncidentID,
+			DecisionID:         dec.DecisionID,
+			ActionID:           actionID,
+			MitigationRecordID: actionID,
+			PolicyVersion:      dec.PolicyVersion,
+			Actor:              "executor",
+			Result:             audit.ResultSuccess,
+			Reason:             "simulated action execution started",
+		})
 
 		// D. Incident FSM Transition to MITIGATING
 		if inc.Status == types.StatusAnomalyDetected {
@@ -736,6 +894,19 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 			// Update persisted mitigation record to failed
 			_ = o.mitStore.MarkMitigationFailed(ctx, actionID, mitAction.Message, mitAction.Error, o.clock.Now(), 0)
 
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:          audit.EventTypeMitigationFailed,
+				NodeID:             dec.NodeID,
+				IncidentID:         inc.IncidentID,
+				DecisionID:         dec.DecisionID,
+				ActionID:           actionID,
+				MitigationRecordID: actionID,
+				PolicyVersion:      dec.PolicyVersion,
+				Actor:              "executor",
+				Result:             audit.ResultFailed,
+				Reason:             mitAction.Message,
+			})
+
 			escDec, escErr := o.escEngine.EvaluateMitigationResult(ctx, inc.NodeID, &mitAction)
 			if escErr != nil {
 				res := o.newResult(inc, StateFailed, attempt, dec.DecisionID, actionID, "escalation evaluation failed: "+escErr.Error(), escErr)
@@ -748,6 +919,17 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 
 			o.emitEvent(res, attempt, dec.DecisionID, actionID, dec.ActionType, dec.Target, mitAction.Status, types.VerificationStatus(""), escDec.Action)
 
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:  audit.EventTypeEscalationEvaluated,
+				NodeID:     inc.NodeID,
+				IncidentID: inc.IncidentID,
+				DecisionID: dec.DecisionID,
+				ActionID:   actionID,
+				Actor:      "escalation_engine",
+				Result:     string(escDec.Action),
+				Reason:     escDec.Reason,
+			})
+
 			switch escDec.Action {
 			case escalation.DecisionActionNone:
 				return res, execErr
@@ -755,6 +937,14 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 				_ = o.escEngine.HandoffToIncidentEngine(ctx, o.incEngine, inc.NodeID, incidentMetric(inc), types.StatusEscalated, o.clock.Now())
 				res.State = StateEscalated
 				res.Message = "mitigation failed; incident escalated"
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:  audit.EventTypeOrchestrationCompleted,
+					NodeID:     inc.NodeID,
+					IncidentID: inc.IncidentID,
+					Actor:      "orchestrator",
+					Result:     string(StateEscalated),
+					Reason:     "mitigation failed; incident escalated",
+				})
 				return res, nil
 			case escalation.DecisionActionRetry:
 				canRetry, _, _ := o.escEngine.CanRetry(ctx, inc.NodeID, inc.IncidentID)
@@ -763,6 +953,16 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 					res.Message = "retry authorized by policy but delayed by cooldown/circuit"
 					return res, nil
 				}
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:  audit.EventTypeRetryAuthorized,
+					NodeID:     inc.NodeID,
+					IncidentID: inc.IncidentID,
+					DecisionID: dec.DecisionID,
+					ActionID:   actionID,
+					Actor:      "escalation_engine",
+					Result:     audit.ResultRetry,
+					Reason:     fmt.Sprintf("retry attempt %d authorized", attempt+1),
+				})
 				res.State = StateRetryAuthorized
 				attempt++
 				continue
@@ -771,6 +971,19 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 
 		// Update persisted mitigation record to executed
 		_ = o.mitStore.MarkMitigationExecuted(ctx, actionID, execRes.Message, execRes.CompletedAt, execRes.Duration.Milliseconds())
+
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:          audit.EventTypeMitigationExecuted,
+			NodeID:             dec.NodeID,
+			IncidentID:         inc.IncidentID,
+			DecisionID:         dec.DecisionID,
+			ActionID:           actionID,
+			MitigationRecordID: actionID,
+			PolicyVersion:      dec.PolicyVersion,
+			Actor:              "executor",
+			Result:             audit.ResultSuccess,
+			Reason:             execRes.Message,
+		})
 
 		// F. Closed-Loop Verification
 		o.setState(inc.IncidentID, StateVerifying)
@@ -802,6 +1015,18 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 			return res, vErr
 		}
 
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:      audit.EventTypeVerificationStarted,
+			NodeID:         execRes.NodeID,
+			IncidentID:     inc.IncidentID,
+			DecisionID:     execRes.DecisionID,
+			ActionID:       execRes.ExecutionID,
+			VerificationID: vRes.VerificationID,
+			Actor:          "verification_engine",
+			Result:         audit.ResultSuccess,
+			Reason:         "verification window started",
+		})
+
 		// Synchronously ingest telemetry samples if supplied
 		for _, s := range options.TelemetrySamples {
 			if updatedV, sErr := o.vEngine.ProcessSample(ctx, s); sErr == nil && updatedV != nil {
@@ -817,6 +1042,25 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 			res.ExecutionResult = execRes
 			res.VerificationResult = vRes
 			o.emitEvent(res, attempt, execRes.DecisionID, execRes.ExecutionID, execRes.ActionType, execRes.Target, execRes.Status, vRes.Status, escalation.DecisionActionNone)
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:      audit.EventTypeVerificationRecovered,
+				NodeID:         execRes.NodeID,
+				IncidentID:     inc.IncidentID,
+				DecisionID:     execRes.DecisionID,
+				ActionID:       execRes.ExecutionID,
+				VerificationID: vRes.VerificationID,
+				Actor:          "verification_engine",
+				Result:         audit.ResultSuccess,
+				Reason:         "verification confirmed recovery",
+			})
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:  audit.EventTypeOrchestrationCompleted,
+				NodeID:     inc.NodeID,
+				IncidentID: inc.IncidentID,
+				Actor:      "orchestrator",
+				Result:     string(StateRecovered),
+				Reason:     "incident resolved",
+			})
 			return res, nil
 
 		case types.VerificationStatusPending:
@@ -847,6 +1091,32 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 				Evidence:             vRes.Evidence,
 			}
 
+			if vRes.Status == types.VerificationStatusTimedOut {
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:      audit.EventTypeVerificationTimedOut,
+					NodeID:         execRes.NodeID,
+					IncidentID:     inc.IncidentID,
+					DecisionID:     execRes.DecisionID,
+					ActionID:       execRes.ExecutionID,
+					VerificationID: vRes.VerificationID,
+					Actor:          "verification_engine",
+					Result:         audit.ResultTimedOut,
+					Reason:         vRes.Reason,
+				})
+			} else {
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:      audit.EventTypeVerificationRejected,
+					NodeID:         execRes.NodeID,
+					IncidentID:     inc.IncidentID,
+					DecisionID:     execRes.DecisionID,
+					ActionID:       execRes.ExecutionID,
+					VerificationID: vRes.VerificationID,
+					Actor:          "verification_engine",
+					Result:         audit.ResultFailed,
+					Reason:         vRes.Reason,
+				})
+			}
+
 			escDec, escErr := o.escEngine.EvaluateVerificationResult(ctx, storedV)
 			if escErr != nil {
 				res := o.newResult(inc, StateFailed, attempt, execRes.DecisionID, execRes.ExecutionID, "escalation evaluation failed: "+escErr.Error(), escErr)
@@ -862,6 +1132,17 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 
 			o.emitEvent(res, attempt, execRes.DecisionID, execRes.ExecutionID, execRes.ActionType, execRes.Target, execRes.Status, vRes.Status, escDec.Action)
 
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:  audit.EventTypeEscalationEvaluated,
+				NodeID:     inc.NodeID,
+				IncidentID: inc.IncidentID,
+				DecisionID: execRes.DecisionID,
+				ActionID:   execRes.ExecutionID,
+				Actor:      "escalation_engine",
+				Result:     string(escDec.Action),
+				Reason:     escDec.Reason,
+			})
+
 			switch escDec.Action {
 			case escalation.DecisionActionNone:
 				return res, nil
@@ -869,6 +1150,14 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 				_ = o.escEngine.HandoffToIncidentEngine(ctx, o.incEngine, inc.NodeID, incidentMetric(inc), types.StatusEscalated, o.clock.Now())
 				res.State = StateEscalated
 				res.Message = "verification failed; incident escalated"
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:  audit.EventTypeOrchestrationCompleted,
+					NodeID:     inc.NodeID,
+					IncidentID: inc.IncidentID,
+					Actor:      "orchestrator",
+					Result:     string(StateEscalated),
+					Reason:     "verification failed; incident escalated",
+				})
 				return res, nil
 			case escalation.DecisionActionRetry:
 				canRetry, _, _ := o.escEngine.CanRetry(ctx, inc.NodeID, inc.IncidentID)
@@ -877,6 +1166,16 @@ func (o *DefaultOrchestrator) executeCycle(ctx context.Context, inc *types.Incid
 					res.Message = "retry authorized by policy but delayed by cooldown/circuit"
 					return res, nil
 				}
+				o.recordAudit(ctx, audit.AuditEvent{
+					EventType:  audit.EventTypeRetryAuthorized,
+					NodeID:     inc.NodeID,
+					IncidentID: inc.IncidentID,
+					DecisionID: execRes.DecisionID,
+					ActionID:   execRes.ExecutionID,
+					Actor:      "escalation_engine",
+					Result:     audit.ResultRetry,
+					Reason:     fmt.Sprintf("retry attempt %d authorized", attempt+1),
+				})
 				res.State = StateRetryAuthorized
 				attempt++
 				continue
@@ -898,6 +1197,18 @@ func (o *DefaultOrchestrator) ProcessTelemetry(ctx context.Context, sample types
 		return nil, nil
 	}
 
+	o.recordAudit(ctx, audit.AuditEvent{
+		EventType:      audit.EventTypeVerificationProgress,
+		NodeID:         vRes.NodeID,
+		IncidentID:     vRes.IncidentID,
+		DecisionID:     vRes.DecisionID,
+		ActionID:       vRes.ActionID,
+		VerificationID: vRes.VerificationID,
+		Actor:          "verification_engine",
+		Result:         string(vRes.Status),
+		Reason:         fmt.Sprintf("observations=%d consecutive_healthy=%d", vRes.Observations, vRes.ConsecutiveHealthy),
+	})
+
 	now := o.clock.Now()
 	if vRes.Status == types.VerificationStatusRecovered {
 		_, _ = o.vEngine.HandoffToIncidentEngine(ctx, vRes.VerificationID, o.incEngine)
@@ -916,7 +1227,52 @@ func (o *DefaultOrchestrator) ProcessTelemetry(ctx context.Context, sample types
 		o.history[vRes.IncidentID] = res
 		o.mu.Unlock()
 		o.emitEvent(res, 1, vRes.DecisionID, vRes.ActionID, types.MitigationActionType(""), "", types.MitigationStatusExecuted, vRes.Status, escalation.DecisionActionNone)
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:      audit.EventTypeVerificationRecovered,
+			NodeID:         vRes.NodeID,
+			IncidentID:     vRes.IncidentID,
+			DecisionID:     vRes.DecisionID,
+			ActionID:       vRes.ActionID,
+			VerificationID: vRes.VerificationID,
+			Actor:          "verification_engine",
+			Result:         audit.ResultSuccess,
+			Reason:         "verification confirmed recovery via telemetry stream",
+		})
+		o.recordAudit(ctx, audit.AuditEvent{
+			EventType:  audit.EventTypeOrchestrationCompleted,
+			NodeID:     vRes.NodeID,
+			IncidentID: vRes.IncidentID,
+			Actor:      "orchestrator",
+			Result:     string(StateRecovered),
+			Reason:     "incident resolved via telemetry stream",
+		})
 	} else if vRes.Status == types.VerificationStatusTimedOut || vRes.Status == types.VerificationStatusNotRecovered {
+		if vRes.Status == types.VerificationStatusTimedOut {
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:      audit.EventTypeVerificationTimedOut,
+				NodeID:         vRes.NodeID,
+				IncidentID:     vRes.IncidentID,
+				DecisionID:     vRes.DecisionID,
+				ActionID:       vRes.ActionID,
+				VerificationID: vRes.VerificationID,
+				Actor:          "verification_engine",
+				Result:         audit.ResultTimedOut,
+				Reason:         vRes.Reason,
+			})
+		} else {
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:      audit.EventTypeVerificationRejected,
+				NodeID:         vRes.NodeID,
+				IncidentID:     vRes.IncidentID,
+				DecisionID:     vRes.DecisionID,
+				ActionID:       vRes.ActionID,
+				VerificationID: vRes.VerificationID,
+				Actor:          "verification_engine",
+				Result:         audit.ResultFailed,
+				Reason:         vRes.Reason,
+			})
+		}
+
 		storedV := &storage.StoredVerification{
 			VerificationID:       vRes.VerificationID,
 			IncidentID:           vRes.IncidentID,
@@ -954,6 +1310,24 @@ func (o *DefaultOrchestrator) ProcessTelemetry(ctx context.Context, sample types
 			o.history[vRes.IncidentID] = res
 			o.mu.Unlock()
 			o.emitEvent(res, 1, vRes.DecisionID, vRes.ActionID, types.MitigationActionType(""), "", types.MitigationStatusExecuted, vRes.Status, escDec.Action)
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:  audit.EventTypeEscalationEvaluated,
+				NodeID:     vRes.NodeID,
+				IncidentID: vRes.IncidentID,
+				DecisionID: vRes.DecisionID,
+				ActionID:   vRes.ActionID,
+				Actor:      "escalation_engine",
+				Result:     string(escDec.Action),
+				Reason:     escDec.Reason,
+			})
+			o.recordAudit(ctx, audit.AuditEvent{
+				EventType:  audit.EventTypeOrchestrationCompleted,
+				NodeID:     vRes.NodeID,
+				IncidentID: vRes.IncidentID,
+				Actor:      "orchestrator",
+				Result:     string(StateEscalated),
+				Reason:     "verification failed via telemetry stream; incident escalated",
+			})
 		}
 	}
 
@@ -1005,6 +1379,26 @@ func (o *DefaultOrchestrator) setState(incidentID string, state OrchestrationSta
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.stateCache[incidentID] = state
+}
+
+func (o *DefaultOrchestrator) recordAudit(ctx context.Context, evt audit.AuditEvent) {
+	o.mu.RLock()
+	rec := o.auditRecorder
+	o.mu.RUnlock()
+	if rec == nil {
+		return
+	}
+	if evt.Timestamp.IsZero() {
+		evt.Timestamp = o.clock.Now()
+	}
+	if evt.CorrelationID == "" && evt.IncidentID != "" {
+		evt.CorrelationID = audit.ComputeCorrelationID(evt.IncidentID)
+	}
+	if evt.Actor == "" {
+		evt.Actor = "orchestrator"
+	}
+	// Observability failure policy: audit recording failures are non-fatal to operational mitigations
+	_ = rec.Record(ctx, evt)
 }
 
 func (o *DefaultOrchestrator) emitEvent(
