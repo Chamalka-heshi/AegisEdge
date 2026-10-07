@@ -38,6 +38,12 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	if cfg.ModelStoreDir != DefaultModelStoreDir {
 		t.Errorf("expected default ModelStoreDir %s, got %s", DefaultModelStoreDir, cfg.ModelStoreDir)
 	}
+	if cfg.MetricsEnabled != DefaultMetricsEnabled {
+		t.Errorf("expected default MetricsEnabled to be false")
+	}
+	if cfg.MetricsAddr != DefaultMetricsAddr {
+		t.Errorf("expected default MetricsAddr %s, got %s", DefaultMetricsAddr, cfg.MetricsAddr)
+	}
 }
 
 func TestLoadFromEnv_Overrides(t *testing.T) {
@@ -48,6 +54,8 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	os.Setenv("AEGISEDGE_SYNC_INTERVAL", "1s")
 	os.Setenv("AEGISEDGE_SYNC_ENABLED", "false")
 	os.Setenv("AEGISEDGE_MODEL_STORE_DIR", "/var/lib/aegisedge/models")
+	os.Setenv("METRICS_ENABLED", "true")
+	os.Setenv("METRICS_ADDR", "127.0.0.1:9999")
 	defer func() {
 		os.Unsetenv("AEGISEDGE_NODE_ID")
 		os.Unsetenv("AEGISEDGE_DATABASE_PATH")
@@ -56,6 +64,8 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 		os.Unsetenv("AEGISEDGE_SYNC_INTERVAL")
 		os.Unsetenv("AEGISEDGE_SYNC_ENABLED")
 		os.Unsetenv("AEGISEDGE_MODEL_STORE_DIR")
+		os.Unsetenv("METRICS_ENABLED")
+		os.Unsetenv("METRICS_ADDR")
 	}()
 
 	cfg := LoadFromEnv()
@@ -80,5 +90,11 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	}
 	if cfg.ModelStoreDir != "/var/lib/aegisedge/models" {
 		t.Errorf("expected custom ModelStoreDir, got %s", cfg.ModelStoreDir)
+	}
+	if !cfg.MetricsEnabled {
+		t.Errorf("expected MetricsEnabled to be true")
+	}
+	if cfg.MetricsAddr != "127.0.0.1:9999" {
+		t.Errorf("expected custom MetricsAddr 127.0.0.1:9999, got %s", cfg.MetricsAddr)
 	}
 }

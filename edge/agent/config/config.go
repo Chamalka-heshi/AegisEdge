@@ -15,6 +15,8 @@ const (
 	DefaultNATSURL            = "nats://127.0.0.1:4222"
 	DefaultNATSPublishTimeout = 5 * time.Second
 	DefaultModelStoreDir      = "data/models"
+	DefaultMetricsEnabled     = false
+	DefaultMetricsAddr        = "127.0.0.1:9091"
 )
 
 // Config represents runtime configuration parameters for the edge agent.
@@ -30,6 +32,8 @@ type Config struct {
 	NATSURL            string
 	NATSPublishTimeout time.Duration
 	ModelStoreDir      string
+	MetricsEnabled     bool
+	MetricsAddr        string
 }
 
 // LoadFromEnv loads configuration from environment variables, falling back to sensible defaults.
@@ -94,6 +98,18 @@ func LoadFromEnv() Config {
 		modelStoreDir = DefaultModelStoreDir
 	}
 
+	metricsEnabled := DefaultMetricsEnabled
+	if metricsEnabledStr := strings.TrimSpace(os.Getenv("METRICS_ENABLED")); metricsEnabledStr != "" {
+		if strings.ToLower(metricsEnabledStr) == "true" || metricsEnabledStr == "1" {
+			metricsEnabled = true
+		}
+	}
+
+	metricsAddr := strings.TrimSpace(os.Getenv("METRICS_ADDR"))
+	if metricsAddr == "" {
+		metricsAddr = DefaultMetricsAddr
+	}
+
 	return Config{
 		NodeID:             nodeID,
 		DatabasePath:       dbPath,
@@ -106,5 +122,7 @@ func LoadFromEnv() Config {
 		NATSURL:            natsURL,
 		NATSPublishTimeout: natsPublishTimeout,
 		ModelStoreDir:      modelStoreDir,
+		MetricsEnabled:     metricsEnabled,
+		MetricsAddr:        metricsAddr,
 	}
 }
