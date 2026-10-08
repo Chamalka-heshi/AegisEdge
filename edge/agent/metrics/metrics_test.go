@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/health"
 )
 
 // TestMetrics_A_Registration tests metric registration and duplicate rejection.
@@ -601,4 +603,114 @@ func TestMetrics_T_EndpointConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestMetrics_U_ServerWithHealthTracker verifies mounting health tracker on the HTTP server.
+func TestMetrics_U_ServerWithHealthTracker(t *testing.T) {
+	rec := NewDefaultRecorder(nil)
+	srv := NewServer("127.0.0.1:0", rec.Registry())
+
+	tracker := health.NewTracker()
+	_ = tracker.RegisterCheck(health.CheckStorage, true)
+	srv.SetHealthTracker(tracker)
+
+	// In INITIALIZING: /healthz 200, /readyz 503
+	reqH := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rrH := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(rrH, reqH)
+	if rrH.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /healthz during initializing, got %d", rrH.Code)
+	}
+
+	reqR := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rrR := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(rrR, reqR)
+	if rrR.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for /readyz during initializing, got %d", rrR.Code)
+	}
+
+	// Transition to READY with check OK
+	_ = tracker.SetCheckStatus(health.CheckStorage, health.StatusOk, "ok")
+	_ = tracker.Transition(health.StateReady)
+
+	reqR2 := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rrR2 := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(rrR2, reqR2)
+	if rrR2.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /readyz when ready, got %d", rrR2.Code)
+	}
+}
+
+// TestMetrics_V_ShutdownMetrics verifies recording of graceful shutdown metrics and bounded labels.
+func TestMetrics_V_ShutdownMetrics(t *testing.T) {
+	rec := NewDefaultRecorder(nil)
+
+	rec.RecordShutdown("completed")
+	rec.RecordShutdown("timed_out")
+	rec.RecordShutdown("INVALID_ARBITRARY_STATUS") // Should sanitize to unknown
+	rec.ObserveShutdownDuration(250 * time.Millisecond)
+	rec.RecordShutdownTimeout()
+
+	prom := rec.Registry().FormatPrometheus()
+
+	if !strings.Contains(prom, `aegisedge_shutdowns_total{status="completed"} 1`) {
+		t.Errorf("expected completed shutdown metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_shutdowns_total{status="timed_out"} 1`) {
+		t.Errorf("expected timed_out shutdown metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_shutdowns_total{status="unknown"} 1`) {
+		t.Errorf("expected unknown sanitized shutdown metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_shutdown_timeouts_total 1`) {
+		t.Errorf("expected shutdown timeout counter metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_shutdown_duration_seconds_count 1`) {
+		t.Errorf("expected shutdown duration count metric, got:\n%s", prom)
+	}
+}
+
+// TestMetrics_W_RecoveryMetrics verifies recording of restart recovery metrics and bounded labels.
+func TestMetrics_W_RecoveryMetrics(t *testing.T) {
+	rec := NewDefaultRecorder(nil)
+
+	rec.RecordRecovery("completed")
+	rec.RecordRecovery("not_required")
+	rec.RecordRecovery("blocked")
+	rec.RecordRecovery("failed")
+	rec.RecordRecovery("INVALID_ARBITRARY_STATUS") // Should sanitize to unknown
+	rec.ObserveRecoveryDuration(120 * time.Millisecond)
+	rec.RecordRecoveryReconciliationRequired()
+	rec.RecordRecoveryBlocked()
+	rec.RecordRecoveryFailed()
+
+	prom := rec.Registry().FormatPrometheus()
+
+	if !strings.Contains(prom, `aegisedge_recovery_total{status="completed"} 1`) {
+		t.Errorf("expected completed recovery metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_total{status="not_required"} 1`) {
+		t.Errorf("expected not_required recovery metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_total{status="blocked"} 1`) {
+		t.Errorf("expected blocked recovery metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_total{status="failed"} 1`) {
+		t.Errorf("expected failed recovery metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_total{status="unknown"} 1`) {
+		t.Errorf("expected unknown sanitized recovery metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_reconciliation_required_total 1`) {
+		t.Errorf("expected recovery reconciliation required counter metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_blocked_total 1`) {
+		t.Errorf("expected recovery blocked counter metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_failed_total 1`) {
+		t.Errorf("expected recovery failed counter metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_recovery_duration_seconds_count 1`) {
+		t.Errorf("expected recovery duration count metric, got:\n%s", prom)
+	}
 }

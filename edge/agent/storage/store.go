@@ -44,6 +44,9 @@ var (
 	ErrDuplicateAuditEvent           = errors.New("audit event with the given event_id already exists")
 	ErrAuditEventNotFound            = errors.New("audit event not found")
 	ErrInvalidAuditEvent             = errors.New("cannot persist invalid audit event")
+	ErrDuplicateCheckpoint           = errors.New("checkpoint with the given checkpoint_id already exists")
+	ErrCheckpointNotFound            = errors.New("checkpoint not found")
+	ErrInvalidCheckpoint             = errors.New("cannot persist invalid checkpoint record")
 )
 
 // SyncStatus represents the synchronization lifecycle state of a locally stored batch.
@@ -314,6 +317,9 @@ type MitigationStore interface {
 	// UNKNOWN_RECONCILIATION_REQUIRED upon startup/crash recovery.
 	// Returns the number of transitioned records.
 	RecoverInFlightMitigations(ctx context.Context) (int64, error)
+
+	// ListMitigationsByStatus retrieves mitigation records matching a specific status, ordered by started_at ASC.
+	ListMitigationsByStatus(ctx context.Context, status types.MitigationStatus, limit int) ([]*StoredMitigation, error)
 
 	// CountMitigations returns the total count of mitigation records stored.
 	CountMitigations(ctx context.Context) (int64, error)
@@ -826,4 +832,65 @@ type AuditStore interface {
 
 	// CountAuditEvents returns the total count of audit events stored.
 	CountAuditEvents(ctx context.Context) (int64, error)
+}
+
+// StoredCheckpoint represents a durably recorded runtime recovery checkpoint in SQLite.
+type StoredCheckpoint struct {
+	CheckpointID          string     `json:"checkpoint_id"`
+	NodeID                string     `json:"node_id"`
+	State                 string     `json:"state"`
+	StartedAt             time.Time  `json:"started_at"`
+	CompletedAt           *time.Time `json:"completed_at,omitempty"`
+	RecoveryReason        string     `json:"recovery_reason,omitempty"`
+	LastReconciledAttempt int        `json:"last_reconciled_attempt"`
+	SchemaVersion         int        `json:"schema_version"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
+}
+
+// Validate checks for structural and security validity of StoredCheckpoint.
+func (c *StoredCheckpoint) Validate() error {
+	if c == nil {
+		return ErrInvalidCheckpoint
+	}
+	if strings.TrimSpace(c.CheckpointID) == "" {
+		return fmt.Errorf("%w: checkpoint_id cannot be empty", ErrInvalidCheckpoint)
+	}
+	if strings.TrimSpace(c.NodeID) == "" {
+		return fmt.Errorf("%w: node_id cannot be empty", ErrInvalidCheckpoint)
+	}
+	if strings.TrimSpace(c.State) == "" {
+		return fmt.Errorf("%w: state cannot be empty", ErrInvalidCheckpoint)
+	}
+	if c.StartedAt.IsZero() {
+		return fmt.Errorf("%w: started_at timestamp cannot be zero", ErrInvalidCheckpoint)
+	}
+	if c.SchemaVersion <= 0 {
+		return fmt.Errorf("%w: schema_version must be positive", ErrInvalidCheckpoint)
+	}
+
+	// Security: reject credentials, tokens, or executable commands in recovery reason
+	lowerReason := strings.ToLower(c.RecoveryReason)
+	if strings.Contains(lowerReason, "password") || strings.Contains(lowerReason, "secret") ||
+		strings.Contains(lowerReason, "bearer ") || strings.Contains(lowerReason, "token") {
+		return fmt.Errorf("%w: sensitive credential pattern rejected in recovery reason", ErrInvalidCheckpoint)
+	}
+	if strings.Contains(lowerReason, "/bin/sh") || strings.Contains(lowerReason, "powershell") ||
+		strings.Contains(lowerReason, "cmd.exe") || strings.Contains(lowerReason, "exec.command") {
+		return fmt.Errorf("%w: executable command pattern rejected in recovery reason", ErrInvalidCheckpoint)
+	}
+	return nil
+}
+
+// CheckpointStore defines durable persistence for runtime recovery checkpoints.
+type CheckpointStore interface {
+	// SaveCheckpoint transactionally validates and persists or updates a runtime checkpoint.
+	SaveCheckpoint(ctx context.Context, cp *StoredCheckpoint) error
+
+	// GetLatestCheckpoint retrieves the most recent runtime checkpoint for a node.
+	// Returns (nil, nil) if no checkpoint exists yet.
+	GetLatestCheckpoint(ctx context.Context, nodeID string) (*StoredCheckpoint, error)
+
+	// ListCheckpoints retrieves runtime checkpoints for a node ordered chronologically (created_at DESC), bounded by limit.
+	ListCheckpoints(ctx context.Context, nodeID string, limit int) ([]*StoredCheckpoint, error)
 }

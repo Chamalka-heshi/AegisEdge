@@ -408,6 +408,34 @@ func (s *SQLiteStore) runMigrations() error {
 		}
 	}
 
+	// 11. Migration v9: runtime_checkpoints table and indexes for persistent runtime state (Phase 6.13)
+	if currentVersion < 9 {
+		createCheckpointTable := `
+		CREATE TABLE IF NOT EXISTS runtime_checkpoints (
+			checkpoint_id TEXT PRIMARY KEY,
+			node_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			recovery_reason TEXT NOT NULL DEFAULT '',
+			last_reconciled_attempt INTEGER NOT NULL DEFAULT 0,
+			schema_version INTEGER NOT NULL DEFAULT 9,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_runtime_checkpoints_node ON runtime_checkpoints(node_id);
+		CREATE INDEX IF NOT EXISTS idx_runtime_checkpoints_created ON runtime_checkpoints(created_at);
+		`
+		if _, err := tx.ExecContext(ctx, createCheckpointTable); err != nil {
+			return fmt.Errorf("migration v9 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (9, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v9: %w", err)
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -3692,4 +3720,208 @@ func scanAuditEvent(s scanner) (*StoredAuditEvent, error) {
 	}
 
 	return &evt, nil
+}
+
+// SaveCheckpoint transactionally validates and persists or updates a runtime checkpoint.
+func (s *SQLiteStore) SaveCheckpoint(ctx context.Context, cp *StoredCheckpoint) error {
+	if err := cp.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	query := `
+	INSERT INTO runtime_checkpoints (
+		checkpoint_id, node_id, state, started_at, completed_at,
+		recovery_reason, last_reconciled_attempt, schema_version, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(checkpoint_id) DO UPDATE SET
+		state = excluded.state,
+		completed_at = excluded.completed_at,
+		recovery_reason = excluded.recovery_reason,
+		last_reconciled_attempt = excluded.last_reconciled_attempt,
+		updated_at = excluded.updated_at;
+	`
+	var completedAtStr *string
+	if cp.CompletedAt != nil {
+		str := cp.CompletedAt.UTC().Format(time.RFC3339Nano)
+		completedAtStr = &str
+	}
+
+	_, err := s.db.ExecContext(
+		ctx,
+		query,
+		cp.CheckpointID,
+		cp.NodeID,
+		cp.State,
+		cp.StartedAt.UTC().Format(time.RFC3339Nano),
+		completedAtStr,
+		cp.RecoveryReason,
+		cp.LastReconciledAttempt,
+		cp.SchemaVersion,
+		cp.CreatedAt.UTC().Format(time.RFC3339Nano),
+		cp.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to save checkpoint: %w", err)
+	}
+	return nil
+}
+
+// GetLatestCheckpoint retrieves the most recent runtime checkpoint for a given node.
+// Returns (nil, nil) if no checkpoint exists.
+func (s *SQLiteStore) GetLatestCheckpoint(ctx context.Context, nodeID string) (*StoredCheckpoint, error) {
+	if strings.TrimSpace(nodeID) == "" {
+		return nil, errors.New("node_id cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	query := `
+	SELECT checkpoint_id, node_id, state, started_at, completed_at,
+	       recovery_reason, last_reconciled_attempt, schema_version, created_at, updated_at
+	FROM runtime_checkpoints
+	WHERE node_id = ?
+	ORDER BY created_at DESC, checkpoint_id DESC
+	LIMIT 1;
+	`
+
+	var cp StoredCheckpoint
+	var startedAtStr, createdAtStr, updatedAtStr string
+	var completedAtStr sql.NullString
+
+	err := s.db.QueryRowContext(ctx, query, nodeID).Scan(
+		&cp.CheckpointID,
+		&cp.NodeID,
+		&cp.State,
+		&startedAtStr,
+		&completedAtStr,
+		&cp.RecoveryReason,
+		&cp.LastReconciledAttempt,
+		&cp.SchemaVersion,
+		&createdAtStr,
+		&updatedAtStr,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest checkpoint: %w", err)
+	}
+
+	cp.StartedAt, _ = time.Parse(time.RFC3339Nano, startedAtStr)
+	cp.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAtStr)
+	cp.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAtStr)
+	if completedAtStr.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, completedAtStr.String)
+		cp.CompletedAt = &t
+	}
+	return &cp, nil
+}
+
+// ListCheckpoints retrieves runtime checkpoints for a node ordered chronologically (created_at DESC), bounded by limit.
+func (s *SQLiteStore) ListCheckpoints(ctx context.Context, nodeID string, limit int) ([]*StoredCheckpoint, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `
+	SELECT checkpoint_id, node_id, state, started_at, completed_at,
+	       recovery_reason, last_reconciled_attempt, schema_version, created_at, updated_at
+	FROM runtime_checkpoints
+	WHERE node_id = ?
+	ORDER BY created_at DESC, checkpoint_id DESC
+	LIMIT ?;
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, nodeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query checkpoints: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*StoredCheckpoint
+	for rows.Next() {
+		var cp StoredCheckpoint
+		var startedAtStr, createdAtStr, updatedAtStr string
+		var completedAtStr sql.NullString
+
+		if err := rows.Scan(
+			&cp.CheckpointID,
+			&cp.NodeID,
+			&cp.State,
+			&startedAtStr,
+			&completedAtStr,
+			&cp.RecoveryReason,
+			&cp.LastReconciledAttempt,
+			&cp.SchemaVersion,
+			&createdAtStr,
+			&updatedAtStr,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan checkpoint row: %w", err)
+		}
+
+		cp.StartedAt, _ = time.Parse(time.RFC3339Nano, startedAtStr)
+		cp.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAtStr)
+		cp.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAtStr)
+		if completedAtStr.Valid {
+			t, _ := time.Parse(time.RFC3339Nano, completedAtStr.String)
+			cp.CompletedAt = &t
+		}
+		results = append(results, &cp)
+	}
+	return results, rows.Err()
+}
+
+// ListMitigationsByStatus retrieves mitigation records matching a specific status, ordered by started_at ASC.
+func (s *SQLiteStore) ListMitigationsByStatus(ctx context.Context, status types.MitigationStatus, limit int) ([]*StoredMitigation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `
+	SELECT action_id, decision_id, incident_id, node_id, action_type,
+	       target, status, mode, message, error_code, parameters,
+	       started_at, completed_at, duration_ms, simulated, created_at, updated_at
+	FROM mitigation_records
+	WHERE status = ?
+	ORDER BY started_at ASC, action_id ASC
+	LIMIT ?;
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, string(status), limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query mitigations by status: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*StoredMitigation
+	for rows.Next() {
+		m, err := scanMitigation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan mitigation row: %w", err)
+		}
+		results = append(results, m)
+	}
+	return results, rows.Err()
 }
