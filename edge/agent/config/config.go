@@ -7,35 +7,43 @@ import (
 )
 
 const (
-	DefaultNodeID             = "edge-node-01"
-	DefaultDatabasePath       = "data/aegisedge-edge.db"
-	DefaultCollectionInterval = 5 * time.Second
-	DefaultControlPlaneURL    = "http://localhost:8080"
-	DefaultSyncInterval       = 5 * time.Second
-	DefaultNATSURL            = "nats://127.0.0.1:4222"
-	DefaultNATSPublishTimeout = 5 * time.Second
-	DefaultModelStoreDir      = "data/models"
-	DefaultMetricsEnabled     = false
-	DefaultMetricsAddr        = "127.0.0.1:9091"
-	DefaultShutdownTimeout    = 10 * time.Second
+	DefaultNodeID                   = "edge-node-01"
+	DefaultDatabasePath             = "data/aegisedge-edge.db"
+	DefaultCollectionInterval       = 5 * time.Second
+	DefaultControlPlaneURL          = "http://localhost:8080"
+	DefaultSyncInterval             = 5 * time.Second
+	DefaultNATSURL                  = "nats://127.0.0.1:4222"
+	DefaultNATSPublishTimeout       = 5 * time.Second
+	DefaultModelStoreDir            = "data/models"
+	DefaultMetricsEnabled           = false
+	DefaultMetricsAddr              = "127.0.0.1:9091"
+	DefaultShutdownTimeout          = 10 * time.Second
+	DefaultCoordinationEnabled      = true
+	DefaultHeartbeatInterval        = 10 * time.Second
+	DefaultInitialReconnectInterval = 1 * time.Second
+	DefaultMaxReconnectInterval     = 30 * time.Second
 )
 
 // Config represents runtime configuration parameters for the edge agent.
 type Config struct {
-	NodeID             string
-	DatabasePath       string
-	CollectionInterval time.Duration
-	ControlPlaneURL    string
-	SyncInterval       time.Duration
-	SyncEnabled        bool
-	RunOnce            bool
-	NATSEnabled        bool
-	NATSURL            string
-	NATSPublishTimeout time.Duration
-	ModelStoreDir      string
-	MetricsEnabled     bool
-	MetricsAddr        string
-	ShutdownTimeout    time.Duration
+	NodeID                   string
+	DatabasePath             string
+	CollectionInterval       time.Duration
+	ControlPlaneURL          string
+	SyncInterval             time.Duration
+	SyncEnabled              bool
+	RunOnce                  bool
+	NATSEnabled              bool
+	NATSURL                  string
+	NATSPublishTimeout       time.Duration
+	ModelStoreDir            string
+	MetricsEnabled           bool
+	MetricsAddr              string
+	ShutdownTimeout          time.Duration
+	CoordinationEnabled      bool
+	HeartbeatInterval        time.Duration
+	InitialReconnectInterval time.Duration
+	MaxReconnectInterval     time.Duration
 }
 
 // LoadFromEnv loads configuration from environment variables, falling back to sensible defaults.
@@ -119,20 +127,52 @@ func LoadFromEnv() Config {
 		}
 	}
 
+	coordinationEnabled := DefaultCoordinationEnabled
+	if coordStr := strings.TrimSpace(os.Getenv("AEGISEDGE_COORDINATION_ENABLED")); coordStr != "" {
+		if strings.ToLower(coordStr) == "false" || coordStr == "0" {
+			coordinationEnabled = false
+		}
+	}
+
+	heartbeatInterval := DefaultHeartbeatInterval
+	if hbStr := strings.TrimSpace(os.Getenv("AEGISEDGE_HEARTBEAT_INTERVAL")); hbStr != "" {
+		if parsed, err := time.ParseDuration(hbStr); err == nil && parsed > 0 {
+			heartbeatInterval = parsed
+		}
+	}
+
+	initialReconnectInterval := DefaultInitialReconnectInterval
+	if recStr := strings.TrimSpace(os.Getenv("AEGISEDGE_RECONNECT_INTERVAL")); recStr != "" {
+		if parsed, err := time.ParseDuration(recStr); err == nil && parsed > 0 {
+			initialReconnectInterval = parsed
+		}
+	}
+
+	maxReconnectInterval := DefaultMaxReconnectInterval
+	if maxRecStr := strings.TrimSpace(os.Getenv("AEGISEDGE_MAX_RECONNECT_INTERVAL")); maxRecStr != "" {
+		if parsed, err := time.ParseDuration(maxRecStr); err == nil && parsed > 0 {
+			maxReconnectInterval = parsed
+		}
+	}
+
 	return Config{
-		NodeID:             nodeID,
-		DatabasePath:       dbPath,
-		CollectionInterval: interval,
-		ControlPlaneURL:    controlPlaneURL,
-		SyncInterval:       syncInterval,
-		SyncEnabled:        syncEnabled,
-		RunOnce:            false,
-		NATSEnabled:        natsEnabled,
-		NATSURL:            natsURL,
-		NATSPublishTimeout: natsPublishTimeout,
-		ModelStoreDir:      modelStoreDir,
-		MetricsEnabled:     metricsEnabled,
-		MetricsAddr:        metricsAddr,
-		ShutdownTimeout:    shutdownTimeout,
+		NodeID:                   nodeID,
+		DatabasePath:             dbPath,
+		CollectionInterval:       interval,
+		ControlPlaneURL:          controlPlaneURL,
+		SyncInterval:             syncInterval,
+		SyncEnabled:              syncEnabled,
+		RunOnce:                  false,
+		NATSEnabled:              natsEnabled,
+		NATSURL:                  natsURL,
+		NATSPublishTimeout:       natsPublishTimeout,
+		ModelStoreDir:            modelStoreDir,
+		MetricsEnabled:           metricsEnabled,
+		MetricsAddr:              metricsAddr,
+		ShutdownTimeout:          shutdownTimeout,
+		CoordinationEnabled:      coordinationEnabled,
+		HeartbeatInterval:        heartbeatInterval,
+		InitialReconnectInterval: initialReconnectInterval,
+		MaxReconnectInterval:     maxReconnectInterval,
 	}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/audit"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/config"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/coordination"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/health"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
@@ -36,17 +37,19 @@ func main() {
 	cfg := config.LoadFromEnv()
 
 	var (
-		showVersion     = flag.Bool("version", false, "Print version and exit")
-		nodeID          = flag.String("node-id", cfg.NodeID, "Unique node identifier")
-		dbPath          = flag.String("db-path", cfg.DatabasePath, "Local SQLite database path")
-		interval        = flag.Duration("interval", cfg.CollectionInterval, "Telemetry collection interval")
-		controlPlaneURL = flag.String("control-plane-url", cfg.ControlPlaneURL, "Control plane HTTP endpoint")
-		syncInterval    = flag.Duration("sync-interval", cfg.SyncInterval, "Background synchronization interval")
-		syncEnabled     = flag.Bool("sync-enabled", cfg.SyncEnabled, "Enable background synchronization")
-		runOnce         = flag.Bool("once", false, "Run single collection step and exit")
-		metricsEnabled  = flag.Bool("metrics-enabled", cfg.MetricsEnabled, "Enable local Prometheus metrics exposition")
-		metricsAddr     = flag.String("metrics-addr", cfg.MetricsAddr, "Local Prometheus metrics bind address")
-		shutdownTimeout = flag.Duration("shutdown-timeout", cfg.ShutdownTimeout, "Graceful shutdown timeout")
+		showVersion         = flag.Bool("version", false, "Print version and exit")
+		nodeID              = flag.String("node-id", cfg.NodeID, "Unique node identifier")
+		dbPath              = flag.String("db-path", cfg.DatabasePath, "Local SQLite database path")
+		interval            = flag.Duration("interval", cfg.CollectionInterval, "Telemetry collection interval")
+		controlPlaneURL     = flag.String("control-plane-url", cfg.ControlPlaneURL, "Control plane HTTP endpoint")
+		syncInterval        = flag.Duration("sync-interval", cfg.SyncInterval, "Background synchronization interval")
+		syncEnabled         = flag.Bool("sync-enabled", cfg.SyncEnabled, "Enable background synchronization")
+		runOnce             = flag.Bool("once", false, "Run single collection step and exit")
+		metricsEnabled      = flag.Bool("metrics-enabled", cfg.MetricsEnabled, "Enable local Prometheus metrics exposition")
+		metricsAddr         = flag.String("metrics-addr", cfg.MetricsAddr, "Local Prometheus metrics bind address")
+		shutdownTimeout     = flag.Duration("shutdown-timeout", cfg.ShutdownTimeout, "Graceful shutdown timeout")
+		coordinationEnabled = flag.Bool("coordination-enabled", cfg.CoordinationEnabled, "Enable control plane coordination")
+		heartbeatInterval   = flag.Duration("heartbeat-interval", cfg.HeartbeatInterval, "Control plane heartbeat interval")
 	)
 	flag.Parse()
 
@@ -65,6 +68,8 @@ func main() {
 	cfg.MetricsEnabled = *metricsEnabled
 	cfg.MetricsAddr = *metricsAddr
 	cfg.ShutdownTimeout = *shutdownTimeout
+	cfg.CoordinationEnabled = *coordinationEnabled
+	cfg.HeartbeatInterval = *heartbeatInterval
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -82,6 +87,8 @@ func main() {
 		slog.Bool("metrics_enabled", cfg.MetricsEnabled),
 		slog.String("metrics_addr", cfg.MetricsAddr),
 		slog.Duration("shutdown_timeout", cfg.ShutdownTimeout),
+		slog.Bool("coordination_enabled", cfg.CoordinationEnabled),
+		slog.Duration("heartbeat_interval", cfg.HeartbeatInterval),
 		slog.Bool("once", cfg.RunOnce),
 	)
 
@@ -94,9 +101,11 @@ func main() {
 	_ = healthTracker.RegisterCheck(health.CheckResponseEngine, false)
 	_ = healthTracker.RegisterCheck(health.CheckMetrics, false)
 	_ = healthTracker.RegisterCheck(health.CheckRecovery, true)
+	_ = healthTracker.RegisterCheck(health.CheckControlPlane, false) // Non-critical optional check!
 
 	_ = healthTracker.SetCheckStatus(health.CheckConfig, health.StatusOk, "loaded")
 	_ = healthTracker.SetCheckStatus(health.CheckRecovery, health.StatusDegraded, "loading")
+	_ = healthTracker.SetCheckStatus(health.CheckControlPlane, health.StatusDegraded, "initializing")
 
 	// Metrics recorder & exposition initialization
 	var metricRec metrics.Recorder
@@ -177,6 +186,18 @@ func main() {
 	})
 
 	ctx := coord.Context()
+
+	// 1b. Resolve durable node identity from persistent storage (Phase 6.14)
+	resolvedNodeID, err := coordination.ResolveNodeIdentity(ctx, store, cfg.NodeID)
+	if err != nil {
+		logger.Warn("could not resolve persistent node identity from store, using configured",
+			slog.String("configured_node_id", cfg.NodeID),
+			slog.Any("error", err),
+		)
+	} else {
+		cfg.NodeID = resolvedNodeID
+		logger.Info("node identity confirmed", slog.String("node_id", cfg.NodeID))
+	}
 
 	// 2. Query highest existing sequence number for this node to ensure strict monotonicity across restarts
 	latestSeq, err := store.GetLatestSequenceNumber(ctx, cfg.NodeID)
@@ -355,6 +376,38 @@ func main() {
 				slog.Bool("ready", healthTracker.IsReady()),
 			)
 		}
+	}
+
+	// 8b. Control-plane coordination (Phase 6.14)
+	if cfg.CoordinationEnabled && !cfg.RunOnce {
+		coordClient := coordination.NewHTTPClient(cfg.ControlPlaneURL, 5*time.Second)
+		coordTracker := coordination.NewTracker(cfg.NodeID, metricRec, healthTracker, auditService)
+		coordCfg := coordination.DefaultConfig(cfg.NodeID)
+		coordCfg.HeartbeatInterval = cfg.HeartbeatInterval
+		coordCfg.InitialReconnectInterval = cfg.InitialReconnectInterval
+		coordCfg.MaxReconnectInterval = cfg.MaxReconnectInterval
+		coordManager := coordination.NewCoordinator(coordCfg, coordClient, coordTracker, metricRec, healthTracker, auditService)
+
+		// Register Hook Order 30: Control-plane coordinator shutdown
+		_ = coord.RegisterHook(lifecycle.Hook{
+			Name:  "coordination",
+			Order: 30,
+			Shutdown: func(ctx context.Context) error {
+				logger.Info("stopping control-plane coordinator...")
+				return coordManager.Stop(ctx)
+			},
+		})
+
+		if err := coordManager.Start(ctx); err != nil {
+			logger.Warn("failed to start control-plane coordinator", slog.Any("error", err))
+		} else {
+			logger.Info("control-plane coordination started",
+				slog.String("control_plane_url", cfg.ControlPlaneURL),
+				slog.Duration("heartbeat_interval", cfg.HeartbeatInterval),
+			)
+		}
+	} else if !cfg.CoordinationEnabled {
+		_ = healthTracker.SetCheckStatus(health.CheckControlPlane, health.StatusOk, "disabled")
 	}
 
 	if err := coord.Start(); err != nil {

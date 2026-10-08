@@ -44,6 +44,18 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	if cfg.MetricsAddr != DefaultMetricsAddr {
 		t.Errorf("expected default MetricsAddr %s, got %s", DefaultMetricsAddr, cfg.MetricsAddr)
 	}
+	if !cfg.CoordinationEnabled {
+		t.Errorf("expected default CoordinationEnabled to be true")
+	}
+	if cfg.HeartbeatInterval != DefaultHeartbeatInterval {
+		t.Errorf("expected default HeartbeatInterval %v, got %v", DefaultHeartbeatInterval, cfg.HeartbeatInterval)
+	}
+	if cfg.InitialReconnectInterval != DefaultInitialReconnectInterval {
+		t.Errorf("expected default InitialReconnectInterval %v, got %v", DefaultInitialReconnectInterval, cfg.InitialReconnectInterval)
+	}
+	if cfg.MaxReconnectInterval != DefaultMaxReconnectInterval {
+		t.Errorf("expected default MaxReconnectInterval %v, got %v", DefaultMaxReconnectInterval, cfg.MaxReconnectInterval)
+	}
 }
 
 func TestLoadFromEnv_Overrides(t *testing.T) {
@@ -56,6 +68,10 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	os.Setenv("AEGISEDGE_MODEL_STORE_DIR", "/var/lib/aegisedge/models")
 	os.Setenv("METRICS_ENABLED", "true")
 	os.Setenv("METRICS_ADDR", "127.0.0.1:9999")
+	os.Setenv("AEGISEDGE_COORDINATION_ENABLED", "false")
+	os.Setenv("AEGISEDGE_HEARTBEAT_INTERVAL", "15s")
+	os.Setenv("AEGISEDGE_RECONNECT_INTERVAL", "2s")
+	os.Setenv("AEGISEDGE_MAX_RECONNECT_INTERVAL", "45s")
 	defer func() {
 		os.Unsetenv("AEGISEDGE_NODE_ID")
 		os.Unsetenv("AEGISEDGE_DATABASE_PATH")
@@ -66,6 +82,10 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 		os.Unsetenv("AEGISEDGE_MODEL_STORE_DIR")
 		os.Unsetenv("METRICS_ENABLED")
 		os.Unsetenv("METRICS_ADDR")
+		os.Unsetenv("AEGISEDGE_COORDINATION_ENABLED")
+		os.Unsetenv("AEGISEDGE_HEARTBEAT_INTERVAL")
+		os.Unsetenv("AEGISEDGE_RECONNECT_INTERVAL")
+		os.Unsetenv("AEGISEDGE_MAX_RECONNECT_INTERVAL")
 	}()
 
 	cfg := LoadFromEnv()
@@ -96,5 +116,17 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	}
 	if cfg.MetricsAddr != "127.0.0.1:9999" {
 		t.Errorf("expected custom MetricsAddr 127.0.0.1:9999, got %s", cfg.MetricsAddr)
+	}
+	if cfg.CoordinationEnabled {
+		t.Errorf("expected CoordinationEnabled to be false")
+	}
+	if cfg.HeartbeatInterval != 15*time.Second {
+		t.Errorf("expected custom HeartbeatInterval 15s, got %v", cfg.HeartbeatInterval)
+	}
+	if cfg.InitialReconnectInterval != 2*time.Second {
+		t.Errorf("expected custom InitialReconnectInterval 2s, got %v", cfg.InitialReconnectInterval)
+	}
+	if cfg.MaxReconnectInterval != 45*time.Second {
+		t.Errorf("expected custom MaxReconnectInterval 45s, got %v", cfg.MaxReconnectInterval)
 	}
 }
