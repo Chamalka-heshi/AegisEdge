@@ -2,7 +2,9 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -433,6 +435,25 @@ func (s *SQLiteStore) runMigrations() error {
 		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (9, ?);`
 		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("failed to record migration v9: %w", err)
+		}
+	}
+
+	// 12. Migration v10: node_identity table for stable edge node identity (Phase 6.14)
+	if currentVersion < 10 {
+		createNodeIdentityTable := `
+		CREATE TABLE IF NOT EXISTS node_identity (
+			node_id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		`
+		if _, err := tx.ExecContext(ctx, createNodeIdentityTable); err != nil {
+			return fmt.Errorf("migration v10 failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (10, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v10: %w", err)
 		}
 	}
 
@@ -3924,4 +3945,97 @@ func (s *SQLiteStore) ListMitigationsByStatus(ctx context.Context, status types.
 		results = append(results, m)
 	}
 	return results, rows.Err()
+}
+
+// GetNodeIdentity retrieves the persisted node identity. Returns ("", ErrNodeIdentityNotFound) if unset.
+func (s *SQLiteStore) GetNodeIdentity(ctx context.Context) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return "", ErrStoreClosed
+	}
+
+	query := `SELECT node_id FROM node_identity LIMIT 1;`
+	row := s.db.QueryRowContext(ctx, query)
+	var nodeID string
+	if err := row.Scan(&nodeID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNodeIdentityNotFound
+		}
+		return "", fmt.Errorf("failed to query node identity: %w", err)
+	}
+	return nodeID, nil
+}
+
+// SaveNodeIdentity persists a node identity. Returns error if already set to a different ID.
+func (s *SQLiteStore) SaveNodeIdentity(ctx context.Context, nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	if err := ValidateNodeID(nodeID); err != nil {
+		return err
+	}
+
+	// Check if already set
+	var existing string
+	err := s.db.QueryRowContext(ctx, "SELECT node_id FROM node_identity LIMIT 1;").Scan(&existing)
+	if err == nil {
+		if existing == nodeID {
+			return nil // idempotent identical save
+		}
+		return fmt.Errorf("%w: cannot overwrite existing node identity %q with %q", ErrInvalidNodeIdentity, existing, nodeID)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check existing node identity: %w", err)
+	}
+
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	insertQuery := `INSERT INTO node_identity (node_id, created_at, updated_at) VALUES (?, ?, ?);`
+	if _, err := s.db.ExecContext(ctx, insertQuery, nodeID, nowStr, nowStr); err != nil {
+		return fmt.Errorf("failed to save node identity: %w", err)
+	}
+	return nil
+}
+
+// GetOrCreateNodeIdentity returns the existing identity or persists defaultID (or generates if empty).
+func (s *SQLiteStore) GetOrCreateNodeIdentity(ctx context.Context, defaultID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return "", ErrStoreClosed
+	}
+
+	// Check if already set
+	var existing string
+	err := s.db.QueryRowContext(ctx, "SELECT node_id FROM node_identity LIMIT 1;").Scan(&existing)
+	if err == nil {
+		return existing, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("failed to check existing node identity: %w", err)
+	}
+
+	// Not set yet, resolve candidate ID to save
+	candidate := strings.TrimSpace(defaultID)
+	if candidate == "" {
+		// Generate random safe node ID: node-<16 hex chars>
+		buf := make([]byte, 8)
+		if _, err := rand.Read(buf); err != nil {
+			return "", fmt.Errorf("failed to generate random node identity: %w", err)
+		}
+		candidate = fmt.Sprintf("node-%s", hex.EncodeToString(buf))
+	}
+
+	if err := ValidateNodeID(candidate); err != nil {
+		return "", err
+	}
+
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	insertQuery := `INSERT INTO node_identity (node_id, created_at, updated_at) VALUES (?, ?, ?);`
+	if _, err := s.db.ExecContext(ctx, insertQuery, candidate, nowStr, nowStr); err != nil {
+		return "", fmt.Errorf("failed to persist initial node identity: %w", err)
+	}
+
+	return candidate, nil
 }

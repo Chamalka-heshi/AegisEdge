@@ -894,3 +894,49 @@ type CheckpointStore interface {
 	// ListCheckpoints retrieves runtime checkpoints for a node ordered chronologically (created_at DESC), bounded by limit.
 	ListCheckpoints(ctx context.Context, nodeID string, limit int) ([]*StoredCheckpoint, error)
 }
+
+// Domain errors for node identity (Phase 6.14).
+var (
+	ErrInvalidNodeIdentity  = errors.New("invalid node identity")
+	ErrNodeIdentityNotFound = errors.New("node identity not found")
+)
+
+// ValidateNodeID ensures a node identity adheres to character set, length, and security bounds.
+func ValidateNodeID(nodeID string) error {
+	id := strings.TrimSpace(nodeID)
+	if id == "" {
+		return fmt.Errorf("%w: node_id cannot be empty", ErrInvalidNodeIdentity)
+	}
+	if len(id) < 3 || len(id) > 128 {
+		return fmt.Errorf("%w: node_id length must be between 3 and 128 characters (got %d)", ErrInvalidNodeIdentity, len(id))
+	}
+	for _, ch := range id {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+			return fmt.Errorf("%w: node_id contains invalid character %q (allowed: alphanumeric, '-', '_')", ErrInvalidNodeIdentity, ch)
+		}
+	}
+	lower := strings.ToLower(id)
+	if strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "token") {
+		return fmt.Errorf("%w: node_id cannot contain sensitive credential keywords", ErrInvalidNodeIdentity)
+	}
+	return nil
+}
+
+// StoredNodeIdentity represents a locally persisted edge node identity.
+type StoredNodeIdentity struct {
+	NodeID    string    `json:"node_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// NodeIdentityStore defines the persistence contract for stable edge node identity.
+type NodeIdentityStore interface {
+	// GetNodeIdentity retrieves the persisted node identity. Returns (nil, ErrNodeIdentityNotFound) if unset.
+	GetNodeIdentity(ctx context.Context) (string, error)
+
+	// SaveNodeIdentity persists a node identity. Returns error if already set to a different ID.
+	SaveNodeIdentity(ctx context.Context, nodeID string) error
+
+	// GetOrCreateNodeIdentity returns the existing identity or persists defaultID (or generates if empty).
+	GetOrCreateNodeIdentity(ctx context.Context, defaultID string) (string, error)
+}
