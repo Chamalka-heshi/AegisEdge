@@ -62,6 +62,15 @@ const (
 	// Orchestration Lifecycle
 	EventTypeOrchestrationCompleted EventType = "ORCHESTRATION_COMPLETED"
 	EventTypeOrchestrationStopped   EventType = "ORCHESTRATION_STOPPED"
+
+	// Persistent Runtime Recovery Lifecycle (Phase 6.13)
+	EventTypeRecoveryStarted                 EventType = "RECOVERY_STARTED"
+	EventTypeRecoveryStateLoaded             EventType = "RECOVERY_STATE_LOADED"
+	EventTypeRecoveryReconciliationRequired  EventType = "RECOVERY_RECONCILIATION_REQUIRED"
+	EventTypeRecoveryReconciliationCompleted EventType = "RECOVERY_RECONCILIATION_COMPLETED"
+	EventTypeRecoveryBlocked                 EventType = "RECOVERY_BLOCKED"
+	EventTypeRecoveryFailed                  EventType = "RECOVERY_FAILED"
+	EventTypeRecoveryCompleted               EventType = "RECOVERY_COMPLETED"
 )
 
 // IsValid checks whether an EventType is a member of the controlled allowlist.
@@ -91,7 +100,14 @@ func (t EventType) IsValid() bool {
 		EventTypeRetryAuthorized,
 		EventTypeCircuitOpened,
 		EventTypeOrchestrationCompleted,
-		EventTypeOrchestrationStopped:
+		EventTypeOrchestrationStopped,
+		EventTypeRecoveryStarted,
+		EventTypeRecoveryStateLoaded,
+		EventTypeRecoveryReconciliationRequired,
+		EventTypeRecoveryReconciliationCompleted,
+		EventTypeRecoveryBlocked,
+		EventTypeRecoveryFailed,
+		EventTypeRecoveryCompleted:
 		return true
 	default:
 		return false
@@ -108,6 +124,7 @@ const (
 	ResultRetry       = "retry"
 	ResultEscalated   = "escalated"
 	ResultCircuitOpen = "circuit_open"
+	ResultBlocked     = "blocked"
 )
 
 // AuditEvent represents a structured, durable domain audit record for incident response explainability.
