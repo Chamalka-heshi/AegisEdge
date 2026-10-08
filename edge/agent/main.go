@@ -10,10 +10,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/audit"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/config"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/detector"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/health"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/incident"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/lifecycle"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/metrics"
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/recovery"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/sync"
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/telemetry"
@@ -42,6 +46,7 @@ func main() {
 		runOnce         = flag.Bool("once", false, "Run single collection step and exit")
 		metricsEnabled  = flag.Bool("metrics-enabled", cfg.MetricsEnabled, "Enable local Prometheus metrics exposition")
 		metricsAddr     = flag.String("metrics-addr", cfg.MetricsAddr, "Local Prometheus metrics bind address")
+		shutdownTimeout = flag.Duration("shutdown-timeout", cfg.ShutdownTimeout, "Graceful shutdown timeout")
 	)
 	flag.Parse()
 
@@ -59,6 +64,7 @@ func main() {
 	cfg.RunOnce = *runOnce
 	cfg.MetricsEnabled = *metricsEnabled
 	cfg.MetricsAddr = *metricsAddr
+	cfg.ShutdownTimeout = *shutdownTimeout
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -75,8 +81,22 @@ func main() {
 		slog.Bool("sync_enabled", cfg.SyncEnabled),
 		slog.Bool("metrics_enabled", cfg.MetricsEnabled),
 		slog.String("metrics_addr", cfg.MetricsAddr),
+		slog.Duration("shutdown_timeout", cfg.ShutdownTimeout),
 		slog.Bool("once", cfg.RunOnce),
 	)
+
+	// Health & readiness tracker initialization
+	healthTracker := health.NewTracker()
+	_ = healthTracker.RegisterCheck(health.CheckConfig, true)
+	_ = healthTracker.RegisterCheck(health.CheckStorage, true)
+	_ = healthTracker.RegisterCheck(health.CheckTelemetry, true)
+	_ = healthTracker.RegisterCheck(health.CheckIncidentEngine, true)
+	_ = healthTracker.RegisterCheck(health.CheckResponseEngine, false)
+	_ = healthTracker.RegisterCheck(health.CheckMetrics, false)
+	_ = healthTracker.RegisterCheck(health.CheckRecovery, true)
+
+	_ = healthTracker.SetCheckStatus(health.CheckConfig, health.StatusOk, "loaded")
+	_ = healthTracker.SetCheckStatus(health.CheckRecovery, health.StatusDegraded, "loading")
 
 	// Metrics recorder & exposition initialization
 	var metricRec metrics.Recorder
@@ -85,45 +105,83 @@ func main() {
 		reg := metrics.NewRegistry()
 		metricRec = metrics.NewDefaultRecorder(reg)
 		metricsServer = metrics.NewServer(cfg.MetricsAddr, reg)
+		metricsServer.SetHealthTracker(healthTracker)
 		if err := metricsServer.Start(); err != nil {
+			_ = healthTracker.SetCheckStatus(health.CheckMetrics, health.StatusFailed, "failed")
 			logger.Error("failed to start metrics exposition server", slog.Any("error", err))
 			os.Exit(1)
 		}
+		_ = healthTracker.SetCheckStatus(health.CheckMetrics, health.StatusOk, "listening")
 		logger.Info("metrics exposition server started",
 			slog.String("addr", cfg.MetricsAddr),
 			slog.String("endpoint", "/metrics"),
 		)
-		defer func() {
-			logger.Info("stopping metrics exposition server...")
-			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := metricsServer.Stop(stopCtx); err != nil {
-				logger.Error("error stopping metrics exposition server", slog.Any("error", err))
-			}
-		}()
 	} else {
 		metricRec = metrics.NoopRecorder{}
+		_ = healthTracker.SetCheckStatus(health.CheckMetrics, health.StatusOk, "disabled")
+	}
+
+	// Runtime lifecycle coordinator initialization
+	coord := lifecycle.NewCoordinator(
+		lifecycle.WithTimeout(cfg.ShutdownTimeout),
+		lifecycle.WithMetrics(metricRec),
+	)
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		if err := coord.Shutdown(stopCtx); err != nil {
+			logger.Error("error during agent shutdown", slog.Any("error", err))
+		}
+	}()
+
+	// Register Hook Order 10: Health & Readiness (mark shutting down)
+	_ = coord.RegisterHook(lifecycle.Hook{
+		Name:  "health",
+		Order: 10,
+		Shutdown: func(ctx context.Context) error {
+			healthTracker.Shutdown()
+			return nil
+		},
+	})
+
+	// Register Hook Order 40: Metrics exposition server (if enabled)
+	if cfg.MetricsEnabled && metricsServer != nil {
+		_ = coord.RegisterHook(lifecycle.Hook{
+			Name:  "metrics_server",
+			Order: 40,
+			Shutdown: func(ctx context.Context) error {
+				logger.Info("stopping metrics exposition server...")
+				return metricsServer.Stop(ctx)
+			},
+		})
 	}
 
 	// 1. Initialize SQLite WAL local store
 	logger.Info("initializing local SQLite WAL storage engine...", slog.String("db_path", cfg.DatabasePath))
 	store, err := storage.OpenSQLite(cfg.DatabasePath)
 	if err != nil {
+		_ = healthTracker.SetCheckStatus(health.CheckStorage, health.StatusFailed, "failed")
 		logger.Error("failed to initialize local database", slog.Any("error", err))
 		os.Exit(1)
 	}
-	defer func() {
-		logger.Info("closing local storage engine...")
-		if err := store.Close(); err != nil {
-			logger.Error("error closing storage engine", slog.Any("error", err))
-		}
-	}()
+	_ = healthTracker.SetCheckStatus(health.CheckStorage, health.StatusOk, "available")
 
-	ctx := context.Background()
+	// Register Hook Order 50: Local SQLite store
+	_ = coord.RegisterHook(lifecycle.Hook{
+		Name:  "storage",
+		Order: 50,
+		Shutdown: func(ctx context.Context) error {
+			logger.Info("closing local storage engine...")
+			return store.Close()
+		},
+	})
+
+	ctx := coord.Context()
 
 	// 2. Query highest existing sequence number for this node to ensure strict monotonicity across restarts
 	latestSeq, err := store.GetLatestSequenceNumber(ctx, cfg.NodeID)
 	if err != nil {
+		_ = healthTracker.SetCheckStatus(health.CheckStorage, health.StatusDegraded, "degraded")
 		logger.Error("failed to query latest sequence number", slog.Any("error", err))
 		os.Exit(1)
 	}
@@ -138,6 +196,7 @@ func main() {
 	// 3. Initialize deterministic telemetry generator
 	gen, err := telemetry.NewSimulatedGenerator(cfg.NodeID, initialSeq)
 	if err != nil {
+		_ = healthTracker.SetCheckStatus(health.CheckTelemetry, health.StatusFailed, "failed")
 		logger.Error("failed to initialize telemetry generator", slog.Any("error", err))
 		os.Exit(1)
 	}
@@ -148,10 +207,12 @@ func main() {
 		Rules:   detector.DefaultRules(),
 	})
 	if err != nil {
+		_ = healthTracker.SetCheckStatus(health.CheckTelemetry, health.StatusFailed, "failed")
 		logger.Error("failed to initialize anomaly detector", slog.Any("error", err))
 		os.Exit(1)
 	}
 	det := newInstrumentedDetector(rawDet, metricRec)
+	_ = healthTracker.SetCheckStatus(health.CheckTelemetry, health.StatusOk, "running")
 	logger.Info("local anomaly detector initialized (process-local lifecycle)",
 		slog.String("detector_name", det.Name()),
 		slog.String("detector_version", det.Version()),
@@ -163,6 +224,7 @@ func main() {
 	policyCfg.Store = store
 	incEngine, err := incident.NewLocalEngine(policyCfg)
 	if err != nil {
+		_ = healthTracker.SetCheckStatus(health.CheckIncidentEngine, health.StatusFailed, "failed")
 		logger.Error("failed to initialize incident engine", slog.Any("error", err))
 		os.Exit(1)
 	}
@@ -170,9 +232,11 @@ func main() {
 	// 5b. Recover active incidents and recent correlation observations from durable SQLite store
 	recoveredIncidents, recoveredObs, err := incEngine.RecoverFromStore(ctx)
 	if err != nil {
+		_ = healthTracker.SetCheckStatus(health.CheckIncidentEngine, health.StatusFailed, "failed")
 		logger.Error("failed to recover incident state from durable store", slog.Any("error", err))
 		os.Exit(1)
 	}
+	_ = healthTracker.SetCheckStatus(health.CheckIncidentEngine, health.StatusOk, "ready")
 	metricRec.SetActiveIncidents(recoveredIncidents)
 	logger.Info("local incident engine initialized with durable SQLite persistence",
 		slog.Int("policy_m", policyCfg.M),
@@ -226,12 +290,15 @@ func main() {
 				logger.Error("failed to initialize NATS publisher", slog.Any("error", err))
 				os.Exit(1)
 			}
-			defer func() {
-				logger.Info("closing NATS publisher...")
-				if err := publisher.Close(); err != nil {
-					logger.Error("error closing NATS publisher", slog.Any("error", err))
-				}
-			}()
+			// Register Hook Order 45: NATS Publisher
+			_ = coord.RegisterHook(lifecycle.Hook{
+				Name:  "nats_publisher",
+				Order: 45,
+				Shutdown: func(ctx context.Context) error {
+					logger.Info("closing NATS publisher...")
+					return publisher.Close()
+				},
+			})
 			syncer = sync.NewSyncerWithPublisher(store, publisher, logger)
 			logger.Info("synchronization transport: NATS JetStream",
 				slog.String("nats_url", cfg.NATSURL),
@@ -244,6 +311,58 @@ func main() {
 				slog.String("control_plane_url", cfg.ControlPlaneURL),
 			)
 		}
+	}
+
+	// 7. Persistent runtime recovery (Phase 6.13)
+	auditService, _ := audit.NewService(store, audit.RealClock{})
+	recManager, err := recovery.NewManager(recovery.Config{
+		NodeID:          cfg.NodeID,
+		Store:           store,
+		HealthTracker:   healthTracker,
+		AuditRecorder:   auditService,
+		MetricsRecorder: metricRec,
+	})
+	if err != nil {
+		_ = healthTracker.SetCheckStatus(health.CheckRecovery, health.StatusFailed, "failed")
+		logger.Error("failed to initialize recovery manager", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	recDecision, err := recManager.RunRecovery(ctx)
+	if err != nil {
+		logger.Error("runtime recovery failed", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	if recDecision.RequiresIntervention {
+		logger.Warn("agent recovery blocked; manual intervention required",
+			slog.String("state", string(recDecision.State)),
+			slog.String("reason", recDecision.Reason),
+		)
+		// Readiness remains false (CheckRecovery degraded / not ready)
+	} else {
+		logger.Info("agent recovery completed cleanly",
+			slog.String("state", string(recDecision.State)),
+			slog.String("reason", recDecision.Reason),
+		)
+		// 8. Response engine status and transition to READY state
+		_ = healthTracker.SetCheckStatus(health.CheckResponseEngine, health.StatusOk, "available")
+		if err := healthTracker.Transition(health.StateReady); err != nil {
+			logger.Warn("failed to transition agent to READY state", slog.Any("error", err))
+		} else {
+			logger.Info("agent entered READY state",
+				slog.String("state", string(health.StateReady)),
+				slog.Bool("ready", healthTracker.IsReady()),
+			)
+		}
+	}
+
+	if err := coord.Start(); err != nil {
+		logger.Warn("failed to start lifecycle coordinator", slog.Any("error", err))
+	} else {
+		logger.Info("runtime lifecycle coordinator running",
+			slog.String("state", string(coord.State())),
+		)
 	}
 
 	// If run-once mode was requested, execute single collection step and sync attempt
@@ -274,9 +393,9 @@ func main() {
 		return
 	}
 
-	// 6. Daemon loop with graceful signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	// 8. Daemon loop with graceful signal handling
+	sigChan, sigDone := lifecycle.SetupSignalHandler(coord, cfg.ShutdownTimeout, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
 	collectTicker := time.NewTicker(cfg.CollectionInterval)
 	defer collectTicker.Stop()
@@ -291,8 +410,13 @@ func main() {
 
 	for {
 		select {
-		case <-sigChan:
-			logger.Info("shutdown signal received; terminating agent loop cleanly")
+		case <-sigDone:
+			logger.Info("shutdown signal processed; terminating agent loop cleanly")
+			return
+
+		case <-coord.Context().Done():
+			logger.Info("lifecycle context canceled; terminating agent loop cleanly")
+			<-sigDone
 			return
 
 		case <-collectTicker.C:

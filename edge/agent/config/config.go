@@ -17,6 +17,7 @@ const (
 	DefaultModelStoreDir      = "data/models"
 	DefaultMetricsEnabled     = false
 	DefaultMetricsAddr        = "127.0.0.1:9091"
+	DefaultShutdownTimeout    = 10 * time.Second
 )
 
 // Config represents runtime configuration parameters for the edge agent.
@@ -34,6 +35,7 @@ type Config struct {
 	ModelStoreDir      string
 	MetricsEnabled     bool
 	MetricsAddr        string
+	ShutdownTimeout    time.Duration
 }
 
 // LoadFromEnv loads configuration from environment variables, falling back to sensible defaults.
@@ -110,6 +112,13 @@ func LoadFromEnv() Config {
 		metricsAddr = DefaultMetricsAddr
 	}
 
+	shutdownTimeout := DefaultShutdownTimeout
+	if shutdownTimeoutStr := strings.TrimSpace(os.Getenv("AEGISEDGE_SHUTDOWN_TIMEOUT")); shutdownTimeoutStr != "" {
+		if parsed, err := time.ParseDuration(shutdownTimeoutStr); err == nil && parsed > 0 {
+			shutdownTimeout = parsed
+		}
+	}
+
 	return Config{
 		NodeID:             nodeID,
 		DatabasePath:       dbPath,
@@ -124,5 +133,6 @@ func LoadFromEnv() Config {
 		ModelStoreDir:      modelStoreDir,
 		MetricsEnabled:     metricsEnabled,
 		MetricsAddr:        metricsAddr,
+		ShutdownTimeout:    shutdownTimeout,
 	}
 }
