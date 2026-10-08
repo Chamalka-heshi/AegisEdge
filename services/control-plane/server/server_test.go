@@ -314,3 +314,239 @@ func TestServer_IngestBatch_ConcurrentDuplicates(t *testing.T) {
 		t.Errorf("expected exactly 1 stored batch, got %d", srv.Count())
 	}
 }
+
+func TestServer_NodeRegister_SuccessAndIdempotency(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	reg := types.NodeRegistration{
+		NodeID:       "node-edge-01",
+		Hostname:     "edge-box-1",
+		OS:           "linux",
+		Architecture: "amd64",
+		AgentVersion: "1.0.0",
+		Capabilities: []string{"simulated_actuation"},
+		RegisteredAt: time.Now().UTC(),
+	}
+	body, _ := json.Marshal(reg)
+
+	// First registration: 201 Created
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/v1/nodes/register failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d", res.StatusCode)
+	}
+	var resp RegistrationResponse
+	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response failed: %v", err)
+	}
+	if resp.Status != "registered" || resp.NodeID != "node-edge-01" {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+
+	// Second registration with same ID: 200 OK (idempotent duplicate)
+	res2, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("second POST /api/v1/nodes/register failed: %v", err)
+	}
+	defer res2.Body.Close()
+
+	if res2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on duplicate registration, got %d", res2.StatusCode)
+	}
+	var resp2 RegistrationResponse
+	if err := json.NewDecoder(res2.Body).Decode(&resp2); err != nil {
+		t.Fatalf("decoding second response failed: %v", err)
+	}
+	if resp2.Status != "already_registered" || resp2.NodeID != "node-edge-01" {
+		t.Errorf("unexpected second response: %+v", resp2)
+	}
+
+	// Verify in-memory state: exactly 1 node registered
+	nodes := srv.GetNodes()
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 registered node, got %d", len(nodes))
+	}
+	if nodes[0].NodeID != "node-edge-01" {
+		t.Errorf("expected node-edge-01, got %s", nodes[0].NodeID)
+	}
+}
+
+func TestServer_NodeRegister_ValidationFailures(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Empty NodeID
+	reg1 := types.NodeRegistration{
+		NodeID:       "",
+		Hostname:     "edge-box-1",
+		RegisteredAt: time.Now().UTC(),
+	}
+	b1, _ := json.Marshal(reg1)
+	r1, _ := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b1))
+	if r1.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty NodeID, got %d", r1.StatusCode)
+	}
+
+	// 2. Malformed / invalid NodeID (slash character)
+	reg2 := types.NodeRegistration{
+		NodeID:       "node/with/slash",
+		Hostname:     "edge-box-1",
+		RegisteredAt: time.Now().UTC(),
+	}
+	b2, _ := json.Marshal(reg2)
+	r2, _ := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b2))
+	if r2.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid NodeID, got %d", r2.StatusCode)
+	}
+
+	// 3. Malformed JSON
+	r3, _ := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", strings.NewReader("{invalid-json"))
+	if r3.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for malformed JSON, got %d", r3.StatusCode)
+	}
+}
+
+func TestServer_NodeHeartbeat_SuccessAndUnknownNode(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Heartbeat for unregistered node must return 404 Not Found
+	hbUnknown := types.Heartbeat{
+		NodeID:         "node-unknown-99",
+		SequenceNumber: 1,
+		Timestamp:      time.Now().UTC(),
+		Status:         types.NodeStatusHealthy,
+	}
+	bodyUnk, _ := json.Marshal(hbUnknown)
+	resUnk, err := http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bodyUnk))
+	if err != nil {
+		t.Fatalf("POST heartbeat failed: %v", err)
+	}
+	defer resUnk.Body.Close()
+	if resUnk.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for unknown node, got %d", resUnk.StatusCode)
+	}
+
+	// 2. Register node
+	reg := types.NodeRegistration{
+		NodeID:       "node-known-01",
+		Hostname:     "host-01",
+		RegisteredAt: time.Now().UTC(),
+	}
+	bodyReg, _ := json.Marshal(reg)
+	_, _ = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bodyReg))
+
+	// 3. Heartbeat for registered node must return 200 OK
+	hbKnown := types.Heartbeat{
+		NodeID:         "node-known-01",
+		SequenceNumber: 5,
+		Timestamp:      time.Now().UTC(),
+		Status:         types.NodeStatusHealthy,
+	}
+	bodyKnown, _ := json.Marshal(hbKnown)
+	resKnown, err := http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bodyKnown))
+	if err != nil {
+		t.Fatalf("POST heartbeat for known node failed: %v", err)
+	}
+	defer resKnown.Body.Close()
+	if resKnown.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for known node heartbeat, got %d", resKnown.StatusCode)
+	}
+
+	var hbResp HeartbeatResponse
+	_ = json.NewDecoder(resKnown.Body).Decode(&hbResp)
+	if hbResp.Status != "acknowledged" || hbResp.NodeID != "node-known-01" {
+		t.Errorf("unexpected heartbeat response: %+v", hbResp)
+	}
+
+	// Verify last_seen and sequence_number updated on node
+	node, ok := srv.GetNode("node-known-01")
+	if !ok {
+		t.Fatal("expected node to exist")
+	}
+	if node.SequenceNumber != 5 {
+		t.Errorf("expected sequence number 5, got %d", node.SequenceNumber)
+	}
+}
+
+func TestServer_NodeQuery_ListAndSingle(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Register 2 nodes
+	reg1 := types.NodeRegistration{NodeID: "node-query-1", Hostname: "h1", RegisteredAt: time.Now().UTC()}
+	reg2 := types.NodeRegistration{NodeID: "node-query-2", Hostname: "h2", RegisteredAt: time.Now().UTC()}
+	b1, _ := json.Marshal(reg1)
+	b2, _ := json.Marshal(reg2)
+	_, _ = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b1))
+	_, _ = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b2))
+
+	// Query list: GET /api/v1/nodes
+	resList, err := http.Get(ts.URL + "/api/v1/nodes")
+	if err != nil {
+		t.Fatalf("GET /api/v1/nodes failed: %v", err)
+	}
+	defer resList.Body.Close()
+	if resList.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for list nodes, got %d", resList.StatusCode)
+	}
+	var list []*NodeRecord
+	_ = json.NewDecoder(resList.Body).Decode(&list)
+	if len(list) != 2 {
+		t.Fatalf("expected 2 nodes in list, got %d", len(list))
+	}
+
+	// Query single existing node: GET /api/v1/nodes/node-query-1
+	resSingle, err := http.Get(ts.URL + "/api/v1/nodes/node-query-1")
+	if err != nil {
+		t.Fatalf("GET single node failed: %v", err)
+	}
+	defer resSingle.Body.Close()
+	if resSingle.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for single node query, got %d", resSingle.StatusCode)
+	}
+	var single NodeRecord
+	_ = json.NewDecoder(resSingle.Body).Decode(&single)
+	if single.NodeID != "node-query-1" {
+		t.Errorf("expected node-query-1, got %s", single.NodeID)
+	}
+
+	// Query single non-existing node: GET /api/v1/nodes/non-existent
+	resNotFound, _ := http.Get(ts.URL + "/api/v1/nodes/non-existent")
+	if resNotFound.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for non-existent node query, got %d", resNotFound.StatusCode)
+	}
+}
+
+func TestServer_NodeEndpoints_MethodNotAllowed(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// GET on /api/v1/nodes/register
+	r1, _ := http.Get(ts.URL + "/api/v1/nodes/register")
+	if r1.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for GET register, got %d", r1.StatusCode)
+	}
+
+	// GET on /api/v1/nodes/heartbeat
+	r2, _ := http.Get(ts.URL + "/api/v1/nodes/heartbeat")
+	if r2.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for GET heartbeat, got %d", r2.StatusCode)
+	}
+
+	// POST on /api/v1/nodes/node-1
+	r3, _ := http.Post(ts.URL+"/api/v1/nodes/node-1", "application/json", strings.NewReader("{}"))
+	if r3.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for POST node query, got %d", r3.StatusCode)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,8 @@ type Server struct {
 	mu             sync.RWMutex
 	ingested       map[string]*IngestedBatch
 	ingestedList   []*IngestedBatch
+	nodes          map[string]*NodeRecord
+	nodesList      []*NodeRecord
 	logger         *slog.Logger
 	maxPayloadSize int64
 }
@@ -63,6 +66,8 @@ func NewServer(logger *slog.Logger) *Server {
 	return &Server{
 		ingested:       make(map[string]*IngestedBatch),
 		ingestedList:   make([]*IngestedBatch, 0),
+		nodes:          make(map[string]*NodeRecord),
+		nodesList:      make([]*NodeRecord, 0),
 		logger:         logger,
 		maxPayloadSize: 1024 * 1024, // 1MB payload limit
 	}
@@ -73,6 +78,10 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/v1/telemetry/batches", s.handleTelemetryBatches)
+	mux.HandleFunc("/api/v1/nodes/register", s.handleNodeRegister)
+	mux.HandleFunc("/api/v1/nodes/heartbeat", s.handleNodeHeartbeat)
+	mux.HandleFunc("/api/v1/nodes/", s.handleNodes)
+	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
 	return mux
 }
 
@@ -265,4 +274,287 @@ func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, data any) {
 	if err := json.NewEncoder(w).Encode(data); err != nil {
 		s.logger.Error("failed to write JSON response", slog.Any("error", err))
 	}
+}
+
+// NodeRecord represents an edge node registered in the control plane.
+type NodeRecord struct {
+	NodeID          string            `json:"node_id"`
+	Status          types.NodeStatus  `json:"status"`
+	LastSeen        time.Time         `json:"last_seen"`
+	RegisteredAt    time.Time         `json:"registered_at"`
+	AgentVersion    string            `json:"agent_version,omitempty"`
+	ProtocolVersion string            `json:"protocol_version,omitempty"`
+	Hostname        string            `json:"hostname,omitempty"`
+	OS              string            `json:"os,omitempty"`
+	Architecture    string            `json:"architecture,omitempty"`
+	Capabilities    []string          `json:"capabilities,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	SequenceNumber  int64             `json:"sequence_number,omitempty"`
+}
+
+// RegistrationResponse represents the JSON response for node enrollment.
+type RegistrationResponse struct {
+	Status       string    `json:"status"` // "registered" or "already_registered"
+	NodeID       string    `json:"node_id"`
+	RegisteredAt time.Time `json:"registered_at"`
+}
+
+// HeartbeatResponse represents the JSON response for node heartbeat.
+type HeartbeatResponse struct {
+	Status    string    `json:"status"` // "acknowledged"
+	NodeID    string    `json:"node_id"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+func isValidNodeID(id string) bool {
+	id = strings.TrimSpace(id)
+	if len(id) < 3 || len(id) > 128 {
+		return false
+	}
+	for _, ch := range id {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+			return false
+		}
+	}
+	lower := strings.ToLower(id)
+	if strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "password") {
+		return false
+	}
+	return true
+}
+
+func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Error:   "method_not_allowed",
+			Message: "node registration endpoint accepts POST only",
+		})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxPayloadSize)
+	defer r.Body.Close()
+
+	var reg types.NodeRegistration
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&reg); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
+				Error:   "payload_too_large",
+				Message: fmt.Sprintf("request payload exceeds %d byte limit", s.maxPayloadSize),
+			})
+			return
+		}
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "malformed_json",
+			Message: fmt.Sprintf("failed to parse registration payload: %v", err),
+		})
+		return
+	}
+
+	if err := reg.Validate(); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_registration",
+			Message: fmt.Sprintf("registration domain validation failed: %v", err),
+		})
+		return
+	}
+
+	if !isValidNodeID(reg.NodeID) {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_node_id",
+			Message: fmt.Sprintf("node_id %q does not conform to character and length constraints", reg.NodeID),
+		})
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	if existing, exists := s.nodes[reg.NodeID]; exists {
+		// Idempotent duplicate registration: update last seen & metadata
+		existing.LastSeen = now
+		if reg.Hostname != "" {
+			existing.Hostname = reg.Hostname
+		}
+		if reg.AgentVersion != "" {
+			existing.AgentVersion = reg.AgentVersion
+		}
+		if len(reg.Capabilities) > 0 {
+			existing.Capabilities = reg.Capabilities
+		}
+		if len(reg.Labels) > 0 {
+			existing.Labels = reg.Labels
+		}
+
+		s.logger.Info("duplicate node registration received (idempotent update)",
+			slog.String("node_id", reg.NodeID),
+		)
+		s.writeJSON(w, http.StatusOK, RegistrationResponse{
+			Status:       "already_registered",
+			NodeID:       reg.NodeID,
+			RegisteredAt: existing.RegisteredAt,
+		})
+		return
+	}
+
+	record := &NodeRecord{
+		NodeID:       reg.NodeID,
+		Status:       types.NodeStatusHealthy,
+		LastSeen:     now,
+		RegisteredAt: now,
+		AgentVersion: reg.AgentVersion,
+		Hostname:     reg.Hostname,
+		OS:           reg.OS,
+		Architecture: reg.Architecture,
+		Capabilities: reg.Capabilities,
+		Labels:       reg.Labels,
+	}
+
+	s.nodes[reg.NodeID] = record
+	s.nodesList = append(s.nodesList, record)
+
+	s.logger.Info("edge node successfully registered",
+		slog.String("node_id", reg.NodeID),
+		slog.Time("registered_at", now),
+	)
+
+	s.writeJSON(w, http.StatusCreated, RegistrationResponse{
+		Status:       "registered",
+		NodeID:       reg.NodeID,
+		RegisteredAt: now,
+	})
+}
+
+func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Error:   "method_not_allowed",
+			Message: "node heartbeat endpoint accepts POST only",
+		})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxPayloadSize)
+	defer r.Body.Close()
+
+	var hb types.Heartbeat
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&hb); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
+				Error:   "payload_too_large",
+				Message: fmt.Sprintf("request payload exceeds %d byte limit", s.maxPayloadSize),
+			})
+			return
+		}
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "malformed_json",
+			Message: fmt.Sprintf("failed to parse heartbeat payload: %v", err),
+		})
+		return
+	}
+
+	if err := hb.Validate(); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_heartbeat",
+			Message: fmt.Sprintf("heartbeat domain validation failed: %v", err),
+		})
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record, exists := s.nodes[hb.NodeID]
+	if !exists {
+		s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+			Error:   "node_not_found",
+			Message: fmt.Sprintf("node %q is not registered with control plane", hb.NodeID),
+		})
+		return
+	}
+
+	now := time.Now().UTC()
+	record.LastSeen = now
+	record.Status = hb.Status
+	record.SequenceNumber = hb.SequenceNumber
+
+	s.logger.Debug("node heartbeat acknowledged",
+		slog.String("node_id", hb.NodeID),
+		slog.String("status", string(hb.Status)),
+		slog.Int64("sequence_number", hb.SequenceNumber),
+	)
+
+	s.writeJSON(w, http.StatusOK, HeartbeatResponse{
+		Status:    "acknowledged",
+		NodeID:    hb.NodeID,
+		Timestamp: now,
+	})
+}
+
+func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Error:   "method_not_allowed",
+			Message: "node query endpoint accepts GET only",
+		})
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/nodes")
+	path = strings.TrimPrefix(path, "/")
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if path == "" {
+		// List all nodes
+		s.writeJSON(w, http.StatusOK, s.nodesList)
+		return
+	}
+
+	// Single node query: path is node_id
+	record, exists := s.nodes[path]
+	if !exists {
+		s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+			Error:   "node_not_found",
+			Message: fmt.Sprintf("node %q not found in registry", path),
+		})
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, record)
+}
+
+// GetNode retrieves a registered node from memory.
+func (s *Server) GetNode(nodeID string) (*NodeRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.nodes[nodeID]
+	if !ok {
+		return nil, false
+	}
+	cp := *rec
+	return &cp, true
+}
+
+// GetNodes returns all registered nodes from memory.
+func (s *Server) GetNodes() []*NodeRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*NodeRecord, len(s.nodesList))
+	for i, n := range s.nodesList {
+		cp := *n
+		out[i] = &cp
+	}
+	return out
 }
