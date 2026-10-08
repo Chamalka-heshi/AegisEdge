@@ -7,18 +7,21 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/Chamalka-heshi/AegisEdge/edge/agent/health"
 )
 
 // DefaultServerAddr is the default local loopback bind address for metrics exposition.
 const DefaultServerAddr = "127.0.0.1:9091"
 
-// Server provides a dedicated, read-only HTTP exposition server for Prometheus scrapers.
+// Server provides a dedicated, read-only HTTP exposition server for Prometheus scrapers and health checks.
 type Server struct {
-	mu     sync.Mutex
-	server *http.Server
-	ln     net.Listener
-	addr   string
-	reg    *Registry
+	mu            sync.Mutex
+	server        *http.Server
+	ln            net.Listener
+	addr          string
+	reg           *Registry
+	healthHandler *health.Handler
 }
 
 // NewServer constructs a Server exposing the given Registry.
@@ -31,6 +34,11 @@ func NewServer(addr string, reg *Registry) *Server {
 		reg = NewRegistry()
 	}
 
+	s := &Server{
+		addr: addr,
+		reg:  reg,
+	}
+
 	mux := http.NewServeMux()
 
 	// 1. Prometheus metrics exposition endpoint
@@ -38,6 +46,13 @@ func NewServer(addr string, reg *Registry) *Server {
 
 	// 2. Local health check endpoint
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		hh := s.healthHandler
+		s.mu.Unlock()
+		if hh != nil {
+			hh.Healthz(w, r)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -48,7 +63,26 @@ func NewServer(addr string, reg *Registry) *Server {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	srv := &http.Server{
+	// 3. Local readiness check endpoint
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		hh := s.healthHandler
+		s.mu.Unlock()
+		if hh != nil {
+			hh.Readyz(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	s.server = &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -57,10 +91,17 @@ func NewServer(addr string, reg *Registry) *Server {
 		IdleTimeout:       30 * time.Second,
 	}
 
-	return &Server{
-		server: srv,
-		addr:   addr,
-		reg:    reg,
+	return s
+}
+
+// SetHealthTracker attaches a health.Tracker to provide /healthz and /readyz endpoints.
+func (s *Server) SetHealthTracker(tracker health.Tracker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if tracker != nil {
+		s.healthHandler = health.NewHandler(tracker)
+	} else {
+		s.healthHandler = nil
 	}
 }
 

@@ -55,6 +55,18 @@ const (
 	MetricAuditEventsTotal      = "aegisedge_audit_events_total"
 	MetricAuditWriteErrorsTotal = "aegisedge_audit_write_errors_total"
 	MetricAuditDuplicatesTotal  = "aegisedge_audit_duplicates_total"
+
+	// Shutdown & Lifecycle
+	MetricShutdownsTotal        = "aegisedge_shutdowns_total"
+	MetricShutdownDurationSec   = "aegisedge_shutdown_duration_seconds"
+	MetricShutdownTimeoutsTotal = "aegisedge_shutdown_timeouts_total"
+
+	// Persistent Runtime Recovery (Phase 6.13)
+	MetricRecoveryTotal                       = "aegisedge_recovery_total"
+	MetricRecoveryDurationSec                 = "aegisedge_recovery_duration_seconds"
+	MetricRecoveryReconciliationRequiredTotal = "aegisedge_recovery_reconciliation_required_total"
+	MetricRecoveryBlockedTotal                = "aegisedge_recovery_blocked_total"
+	MetricRecoveryFailedTotal                 = "aegisedge_recovery_failed_total"
 )
 
 // Recorder defines the domain contract for recording lifecycle metrics.
@@ -108,6 +120,18 @@ type Recorder interface {
 	RecordAuditEvent(eventType string)
 	RecordAuditWriteError()
 	RecordAuditDuplicate()
+
+	// Shutdown & Lifecycle
+	RecordShutdown(status string)
+	ObserveShutdownDuration(d time.Duration)
+	RecordShutdownTimeout()
+
+	// Persistent Runtime Recovery (Phase 6.13)
+	RecordRecovery(status string)
+	ObserveRecoveryDuration(d time.Duration)
+	RecordRecoveryReconciliationRequired()
+	RecordRecoveryBlocked()
+	RecordRecoveryFailed()
 
 	// Registry access
 	Registry() *Registry
@@ -165,6 +189,18 @@ type DefaultRecorder struct {
 	auditEvents      *CounterVec
 	auditWriteErrors *SingleCounter
 	auditDuplicates  *SingleCounter
+
+	// Shutdown & Lifecycle
+	shutdowns        *CounterVec
+	shutdownDuration *SingleHistogram
+	shutdownTimeouts *SingleCounter
+
+	// Persistent Runtime Recovery (Phase 6.13)
+	recovery                       *CounterVec
+	recoveryDuration               *SingleHistogram
+	recoveryReconciliationRequired *SingleCounter
+	recoveryBlocked                *SingleCounter
+	recoveryFailed                 *SingleCounter
 }
 
 // NewDefaultRecorder constructs and initializes all domain metrics in the provided Registry.
@@ -225,6 +261,18 @@ func NewDefaultRecorder(reg *Registry) *DefaultRecorder {
 		auditEvents:      NewCounterVec(MetricAuditEventsTotal, "Total audit events successfully recorded by allowlisted event type.", []string{"event_type"}),
 		auditWriteErrors: NewSingleCounter(MetricAuditWriteErrorsTotal, "Total audit event persistence failures."),
 		auditDuplicates:  NewSingleCounter(MetricAuditDuplicatesTotal, "Total duplicate audit events idempotently ignored."),
+
+		// Shutdown & Lifecycle
+		shutdowns:        NewCounterVec(MetricShutdownsTotal, "Total agent shutdown sequences initiated by terminal status.", []string{"status"}),
+		shutdownDuration: NewSingleHistogram(MetricShutdownDurationSec, "Duration of graceful agent shutdown sequences in seconds.", DefaultDurationBuckets),
+		shutdownTimeouts: NewSingleCounter(MetricShutdownTimeoutsTotal, "Total number of graceful shutdown attempts that exceeded the configured timeout."),
+
+		// Persistent Runtime Recovery (Phase 6.13)
+		recovery:                       NewCounterVec(MetricRecoveryTotal, "Total runtime recovery attempts by terminal status.", []string{"status"}),
+		recoveryDuration:               NewSingleHistogram(MetricRecoveryDurationSec, "Duration of runtime recovery evaluation in seconds.", DefaultDurationBuckets),
+		recoveryReconciliationRequired: NewSingleCounter(MetricRecoveryReconciliationRequiredTotal, "Total runtime recovery attempts discovering records requiring reconciliation."),
+		recoveryBlocked:                NewSingleCounter(MetricRecoveryBlockedTotal, "Total runtime recovery attempts resulting in blocked readiness."),
+		recoveryFailed:                 NewSingleCounter(MetricRecoveryFailedTotal, "Total runtime recovery attempts that encountered unrecoverable errors."),
 	}
 
 	// Register all metrics into registry
@@ -255,6 +303,14 @@ func NewDefaultRecorder(reg *Registry) *DefaultRecorder {
 	_ = reg.Register(rec.auditEvents)
 	_ = reg.Register(rec.auditWriteErrors)
 	_ = reg.Register(rec.auditDuplicates)
+	_ = reg.Register(rec.shutdowns)
+	_ = reg.Register(rec.shutdownDuration)
+	_ = reg.Register(rec.shutdownTimeouts)
+	_ = reg.Register(rec.recovery)
+	_ = reg.Register(rec.recoveryDuration)
+	_ = reg.Register(rec.recoveryReconciliationRequired)
+	_ = reg.Register(rec.recoveryBlocked)
+	_ = reg.Register(rec.recoveryFailed)
 
 	return rec
 }
@@ -404,6 +460,40 @@ func (r *DefaultRecorder) RecordAuditWriteError() {
 
 func (r *DefaultRecorder) RecordAuditDuplicate() {
 	r.auditDuplicates.Inc()
+}
+
+func (r *DefaultRecorder) RecordShutdown(status string) {
+	st := SanitizeShutdownStatus(status)
+	r.shutdowns.WithLabelValues(st).Inc()
+}
+
+func (r *DefaultRecorder) ObserveShutdownDuration(d time.Duration) {
+	r.shutdownDuration.Observe(d.Seconds())
+}
+
+func (r *DefaultRecorder) RecordShutdownTimeout() {
+	r.shutdownTimeouts.Inc()
+}
+
+func (r *DefaultRecorder) RecordRecovery(status string) {
+	st := SanitizeRecoveryStatus(status)
+	r.recovery.WithLabelValues(st).Inc()
+}
+
+func (r *DefaultRecorder) ObserveRecoveryDuration(d time.Duration) {
+	r.recoveryDuration.Observe(d.Seconds())
+}
+
+func (r *DefaultRecorder) RecordRecoveryReconciliationRequired() {
+	r.recoveryReconciliationRequired.Inc()
+}
+
+func (r *DefaultRecorder) RecordRecoveryBlocked() {
+	r.recoveryBlocked.Inc()
+}
+
+func (r *DefaultRecorder) RecordRecoveryFailed() {
+	r.recoveryFailed.Inc()
 }
 
 // ============================================================================
@@ -579,40 +669,69 @@ func SanitizeOrchestrationOutcome(outcome string) string {
 
 // validAuditTypes allowlist containing all 25 discrete event types from Phase 6.9.
 var validAuditTypes = map[string]bool{
-	"RESPONSE_DECISION_CREATED":   true,
-	"RESPONSE_DECISION_NO_ACTION": true,
-	"APPROVAL_REQUESTED":          true,
-	"APPROVAL_GRANTED":            true,
-	"APPROVAL_REJECTED":           true,
-	"APPROVAL_CANCELLED":          true,
-	"APPROVAL_CONSUMED":           true,
-	"SAFETY_VALIDATED":            true,
-	"SAFETY_REJECTED":             true,
-	"MITIGATION_RECORDED":         true,
-	"MITIGATION_STARTED":          true,
-	"MITIGATION_EXECUTED":         true,
-	"MITIGATION_FAILED":           true,
-	"MITIGATION_UNKNOWN":          true,
-	"VERIFICATION_STARTED":        true,
-	"VERIFICATION_PROGRESS":       true,
-	"VERIFICATION_RECOVERED":      true,
-	"VERIFICATION_TIMED_OUT":      true,
-	"VERIFICATION_REJECTED":       true,
-	"ESCALATION_EVALUATED":        true,
-	"RETRY_AUTHORIZED":            true,
-	"CIRCUIT_OPENED":              true,
-	"CIRCUIT_RESET":               true,
-	"ORCHESTRATION_COMPLETED":     true,
-	"ORCHESTRATION_STOPPED":       true,
+	"RESPONSE_DECISION_CREATED":         true,
+	"RESPONSE_DECISION_NO_ACTION":       true,
+	"APPROVAL_REQUESTED":                true,
+	"APPROVAL_GRANTED":                  true,
+	"APPROVAL_REJECTED":                 true,
+	"APPROVAL_CANCELLED":                true,
+	"APPROVAL_CONSUMED":                 true,
+	"SAFETY_VALIDATED":                  true,
+	"SAFETY_REJECTED":                   true,
+	"MITIGATION_RECORDED":               true,
+	"MITIGATION_STARTED":                true,
+	"MITIGATION_EXECUTED":               true,
+	"MITIGATION_FAILED":                 true,
+	"MITIGATION_UNKNOWN":                true,
+	"VERIFICATION_STARTED":              true,
+	"VERIFICATION_PROGRESS":             true,
+	"VERIFICATION_RECOVERED":            true,
+	"VERIFICATION_TIMED_OUT":            true,
+	"VERIFICATION_REJECTED":             true,
+	"ESCALATION_EVALUATED":              true,
+	"RETRY_AUTHORIZED":                  true,
+	"CIRCUIT_OPENED":                    true,
+	"CIRCUIT_RESET":                     true,
+	"ORCHESTRATION_COMPLETED":           true,
+	"ORCHESTRATION_STOPPED":             true,
+	"RECOVERY_STARTED":                  true,
+	"RECOVERY_STATE_LOADED":             true,
+	"RECOVERY_RECONCILIATION_REQUIRED":  true,
+	"RECOVERY_RECONCILIATION_COMPLETED": true,
+	"RECOVERY_BLOCKED":                  true,
+	"RECOVERY_FAILED":                   true,
+	"RECOVERY_COMPLETED":                true,
 }
 
-// SanitizeAuditEventType maps audit event types strictly against the 25 allowlisted constants.
+// SanitizeAuditEventType maps audit event types strictly against allowlisted constants.
 func SanitizeAuditEventType(eventType string) string {
 	clean := strings.TrimPrefix(strings.TrimSpace(eventType), "EVENT_")
 	if validAuditTypes[clean] {
 		return clean
 	}
 	return "unknown"
+}
+
+// SanitizeShutdownStatus maps shutdown outcomes to bounded discrete enums.
+func SanitizeShutdownStatus(status string) string {
+	s := strings.ToLower(strings.TrimSpace(status))
+	switch s {
+	case "completed", "timed_out", "failed":
+		return s
+	default:
+		return "unknown"
+	}
+}
+
+// SanitizeRecoveryStatus maps recovery outcomes to bounded discrete enums.
+func SanitizeRecoveryStatus(status string) string {
+	s := strings.ToLower(strings.TrimSpace(status))
+	switch s {
+	case "completed", "not_required", "blocked", "failed":
+		return s
+	default:
+		return "unknown"
+	}
 }
 
 // ============================================================================
@@ -650,4 +769,12 @@ func (NoopRecorder) ObserveOrchestrationDuration(time.Duration)      {}
 func (NoopRecorder) RecordAuditEvent(string)                         {}
 func (NoopRecorder) RecordAuditWriteError()                          {}
 func (NoopRecorder) RecordAuditDuplicate()                           {}
+func (NoopRecorder) RecordShutdown(string)                           {}
+func (NoopRecorder) ObserveShutdownDuration(time.Duration)           {}
+func (NoopRecorder) RecordShutdownTimeout()                          {}
+func (NoopRecorder) RecordRecovery(string)                           {}
+func (NoopRecorder) ObserveRecoveryDuration(time.Duration)           {}
+func (NoopRecorder) RecordRecoveryReconciliationRequired()           {}
+func (NoopRecorder) RecordRecoveryBlocked()                          {}
+func (NoopRecorder) RecordRecoveryFailed()                           {}
 func (NoopRecorder) Registry() *Registry                             { return nil }
