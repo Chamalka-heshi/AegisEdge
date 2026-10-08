@@ -37,6 +37,7 @@ const (
 	CheckResponseEngine CheckName = "response_engine"
 	CheckMetrics        CheckName = "metrics"
 	CheckRecovery       CheckName = "recovery"
+	CheckControlPlane   CheckName = "control_plane"
 )
 
 // AllowedCheckNames contains all valid check names permitted in the health model.
@@ -48,6 +49,7 @@ var AllowedCheckNames = map[CheckName]struct{}{
 	CheckResponseEngine: {},
 	CheckMetrics:        {},
 	CheckRecovery:       {},
+	CheckControlPlane:   {},
 }
 
 // Bounded diagnostic messages.

@@ -67,6 +67,14 @@ const (
 	MetricRecoveryReconciliationRequiredTotal = "aegisedge_recovery_reconciliation_required_total"
 	MetricRecoveryBlockedTotal                = "aegisedge_recovery_blocked_total"
 	MetricRecoveryFailedTotal                 = "aegisedge_recovery_failed_total"
+
+	// Control-Plane Coordination (Phase 6.14)
+	MetricControlPlaneConnectionsTotal  = "aegisedge_control_plane_connections_total"
+	MetricControlPlaneHeartbeatsTotal   = "aegisedge_control_plane_heartbeats_total"
+	MetricControlPlaneRegistrationTotal = "aegisedge_control_plane_registration_total"
+	MetricControlPlaneReconnectsTotal   = "aegisedge_control_plane_reconnects_total"
+	MetricControlPlaneConnectionState   = "aegisedge_control_plane_connection_state"
+	MetricControlPlaneHeartbeatDuration = "aegisedge_control_plane_heartbeat_duration_seconds"
 )
 
 // Recorder defines the domain contract for recording lifecycle metrics.
@@ -132,6 +140,14 @@ type Recorder interface {
 	RecordRecoveryReconciliationRequired()
 	RecordRecoveryBlocked()
 	RecordRecoveryFailed()
+
+	// Control-Plane Coordination (Phase 6.14)
+	RecordControlPlaneConnection(status string)
+	RecordControlPlaneHeartbeat(status string)
+	RecordControlPlaneRegistration(status string)
+	RecordControlPlaneReconnect()
+	SetControlPlaneConnectionState(state int)
+	ObserveControlPlaneHeartbeatDuration(d time.Duration)
 
 	// Registry access
 	Registry() *Registry
@@ -201,6 +217,14 @@ type DefaultRecorder struct {
 	recoveryReconciliationRequired *SingleCounter
 	recoveryBlocked                *SingleCounter
 	recoveryFailed                 *SingleCounter
+
+	// Control-Plane Coordination (Phase 6.14)
+	cpConnections       *CounterVec
+	cpHeartbeats        *CounterVec
+	cpRegistration      *CounterVec
+	cpReconnects        *SingleCounter
+	cpConnectionState   *SingleGauge
+	cpHeartbeatDuration *SingleHistogram
 }
 
 // NewDefaultRecorder constructs and initializes all domain metrics in the provided Registry.
@@ -273,6 +297,14 @@ func NewDefaultRecorder(reg *Registry) *DefaultRecorder {
 		recoveryReconciliationRequired: NewSingleCounter(MetricRecoveryReconciliationRequiredTotal, "Total runtime recovery attempts discovering records requiring reconciliation."),
 		recoveryBlocked:                NewSingleCounter(MetricRecoveryBlockedTotal, "Total runtime recovery attempts resulting in blocked readiness."),
 		recoveryFailed:                 NewSingleCounter(MetricRecoveryFailedTotal, "Total runtime recovery attempts that encountered unrecoverable errors."),
+
+		// Control-Plane Coordination (Phase 6.14)
+		cpConnections:       NewCounterVec(MetricControlPlaneConnectionsTotal, "Total control plane connection attempts and outcomes.", []string{"status"}),
+		cpHeartbeats:        NewCounterVec(MetricControlPlaneHeartbeatsTotal, "Total control plane heartbeat attempts by status.", []string{"status"}),
+		cpRegistration:      NewCounterVec(MetricControlPlaneRegistrationTotal, "Total control plane node registration attempts by status.", []string{"status"}),
+		cpReconnects:        NewSingleCounter(MetricControlPlaneReconnectsTotal, "Total control plane reconnection attempts scheduled."),
+		cpConnectionState:   NewSingleGauge(MetricControlPlaneConnectionState, "Current control plane connection state (0=DISCONNECTED, 1=CONNECTING, 2=CONNECTED, 3=DEGRADED, 4=STOPPING)."),
+		cpHeartbeatDuration: NewSingleHistogram(MetricControlPlaneHeartbeatDuration, "Duration of control plane heartbeat round trips in seconds.", DefaultDurationBuckets),
 	}
 
 	// Register all metrics into registry
@@ -311,6 +343,12 @@ func NewDefaultRecorder(reg *Registry) *DefaultRecorder {
 	_ = reg.Register(rec.recoveryReconciliationRequired)
 	_ = reg.Register(rec.recoveryBlocked)
 	_ = reg.Register(rec.recoveryFailed)
+	_ = reg.Register(rec.cpConnections)
+	_ = reg.Register(rec.cpHeartbeats)
+	_ = reg.Register(rec.cpRegistration)
+	_ = reg.Register(rec.cpReconnects)
+	_ = reg.Register(rec.cpConnectionState)
+	_ = reg.Register(rec.cpHeartbeatDuration)
 
 	return rec
 }
@@ -496,6 +534,33 @@ func (r *DefaultRecorder) RecordRecoveryFailed() {
 	r.recoveryFailed.Inc()
 }
 
+func (r *DefaultRecorder) RecordControlPlaneConnection(status string) {
+	st := SanitizeConnectionStatus(status)
+	r.cpConnections.WithLabelValues(st).Inc()
+}
+
+func (r *DefaultRecorder) RecordControlPlaneHeartbeat(status string) {
+	st := SanitizeHeartbeatStatus(status)
+	r.cpHeartbeats.WithLabelValues(st).Inc()
+}
+
+func (r *DefaultRecorder) RecordControlPlaneRegistration(status string) {
+	st := SanitizeRegistrationStatus(status)
+	r.cpRegistration.WithLabelValues(st).Inc()
+}
+
+func (r *DefaultRecorder) RecordControlPlaneReconnect() {
+	r.cpReconnects.Inc()
+}
+
+func (r *DefaultRecorder) SetControlPlaneConnectionState(state int) {
+	r.cpConnectionState.Set(float64(state))
+}
+
+func (r *DefaultRecorder) ObserveControlPlaneHeartbeatDuration(d time.Duration) {
+	r.cpHeartbeatDuration.Observe(d.Seconds())
+}
+
 // ============================================================================
 // Label Cardinality Sanitization Policy
 // ============================================================================
@@ -669,38 +734,46 @@ func SanitizeOrchestrationOutcome(outcome string) string {
 
 // validAuditTypes allowlist containing all 25 discrete event types from Phase 6.9.
 var validAuditTypes = map[string]bool{
-	"RESPONSE_DECISION_CREATED":         true,
-	"RESPONSE_DECISION_NO_ACTION":       true,
-	"APPROVAL_REQUESTED":                true,
-	"APPROVAL_GRANTED":                  true,
-	"APPROVAL_REJECTED":                 true,
-	"APPROVAL_CANCELLED":                true,
-	"APPROVAL_CONSUMED":                 true,
-	"SAFETY_VALIDATED":                  true,
-	"SAFETY_REJECTED":                   true,
-	"MITIGATION_RECORDED":               true,
-	"MITIGATION_STARTED":                true,
-	"MITIGATION_EXECUTED":               true,
-	"MITIGATION_FAILED":                 true,
-	"MITIGATION_UNKNOWN":                true,
-	"VERIFICATION_STARTED":              true,
-	"VERIFICATION_PROGRESS":             true,
-	"VERIFICATION_RECOVERED":            true,
-	"VERIFICATION_TIMED_OUT":            true,
-	"VERIFICATION_REJECTED":             true,
-	"ESCALATION_EVALUATED":              true,
-	"RETRY_AUTHORIZED":                  true,
-	"CIRCUIT_OPENED":                    true,
-	"CIRCUIT_RESET":                     true,
-	"ORCHESTRATION_COMPLETED":           true,
-	"ORCHESTRATION_STOPPED":             true,
-	"RECOVERY_STARTED":                  true,
-	"RECOVERY_STATE_LOADED":             true,
-	"RECOVERY_RECONCILIATION_REQUIRED":  true,
-	"RECOVERY_RECONCILIATION_COMPLETED": true,
-	"RECOVERY_BLOCKED":                  true,
-	"RECOVERY_FAILED":                   true,
-	"RECOVERY_COMPLETED":                true,
+	"RESPONSE_DECISION_CREATED":            true,
+	"RESPONSE_DECISION_NO_ACTION":          true,
+	"APPROVAL_REQUESTED":                   true,
+	"APPROVAL_GRANTED":                     true,
+	"APPROVAL_REJECTED":                    true,
+	"APPROVAL_CANCELLED":                   true,
+	"APPROVAL_CONSUMED":                    true,
+	"SAFETY_VALIDATED":                     true,
+	"SAFETY_REJECTED":                      true,
+	"MITIGATION_RECORDED":                  true,
+	"MITIGATION_STARTED":                   true,
+	"MITIGATION_EXECUTED":                  true,
+	"MITIGATION_FAILED":                    true,
+	"MITIGATION_UNKNOWN":                   true,
+	"VERIFICATION_STARTED":                 true,
+	"VERIFICATION_PROGRESS":                true,
+	"VERIFICATION_RECOVERED":               true,
+	"VERIFICATION_TIMED_OUT":               true,
+	"VERIFICATION_REJECTED":                true,
+	"ESCALATION_EVALUATED":                 true,
+	"RETRY_AUTHORIZED":                     true,
+	"CIRCUIT_OPENED":                       true,
+	"CIRCUIT_RESET":                        true,
+	"ORCHESTRATION_COMPLETED":              true,
+	"ORCHESTRATION_STOPPED":                true,
+	"RECOVERY_STARTED":                     true,
+	"RECOVERY_STATE_LOADED":                true,
+	"RECOVERY_RECONCILIATION_REQUIRED":     true,
+	"RECOVERY_RECONCILIATION_COMPLETED":    true,
+	"RECOVERY_BLOCKED":                     true,
+	"RECOVERY_FAILED":                      true,
+	"RECOVERY_COMPLETED":                   true,
+	"CONTROL_PLANE_REGISTRATION_STARTED":   true,
+	"CONTROL_PLANE_REGISTRATION_SUCCEEDED": true,
+	"CONTROL_PLANE_REGISTRATION_FAILED":    true,
+	"CONTROL_PLANE_CONNECTED":              true,
+	"CONTROL_PLANE_DISCONNECTED":           true,
+	"CONTROL_PLANE_HEARTBEAT_SUCCEEDED":    true,
+	"CONTROL_PLANE_HEARTBEAT_FAILED":       true,
+	"CONTROL_PLANE_RECONNECT_SCHEDULED":    true,
 }
 
 // SanitizeAuditEventType maps audit event types strictly against allowlisted constants.
@@ -734,6 +807,36 @@ func SanitizeRecoveryStatus(status string) string {
 	}
 }
 
+// SanitizeConnectionStatus maps control-plane connection statuses to bounded enums.
+func SanitizeConnectionStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "connected", "disconnected", "failed":
+		return strings.ToLower(strings.TrimSpace(status))
+	default:
+		return "unknown"
+	}
+}
+
+// SanitizeHeartbeatStatus maps control-plane heartbeat statuses to bounded enums.
+func SanitizeHeartbeatStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "success", "failed":
+		return strings.ToLower(strings.TrimSpace(status))
+	default:
+		return "unknown"
+	}
+}
+
+// SanitizeRegistrationStatus maps control-plane registration statuses to bounded enums.
+func SanitizeRegistrationStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "success", "already_registered", "failed":
+		return strings.ToLower(strings.TrimSpace(status))
+	default:
+		return "unknown"
+	}
+}
+
 // ============================================================================
 // No-Op Recorder Implementation
 // ============================================================================
@@ -741,40 +844,46 @@ func SanitizeRecoveryStatus(status string) string {
 // NoopRecorder implements Recorder with no-op operations.
 type NoopRecorder struct{}
 
-func (NoopRecorder) RecordTelemetryBatch(bool)                       {}
-func (NoopRecorder) RecordAnomalyDetected(string)                    {}
-func (NoopRecorder) RecordDetectorError(string)                      {}
-func (NoopRecorder) ObserveDetectorDuration(string, time.Duration)   {}
-func (NoopRecorder) RecordIncidentCreated()                          {}
-func (NoopRecorder) RecordIncidentRecovered()                        {}
-func (NoopRecorder) RecordIncidentEscalated()                        {}
-func (NoopRecorder) SetActiveIncidents(int)                          {}
-func (NoopRecorder) IncActiveIncidents()                             {}
-func (NoopRecorder) DecActiveIncidents()                             {}
-func (NoopRecorder) RecordResponseDecision(string)                   {}
-func (NoopRecorder) RecordResponseNoAction()                         {}
-func (NoopRecorder) RecordResponseRejection()                        {}
-func (NoopRecorder) RecordSafetyValidation(bool)                     {}
-func (NoopRecorder) RecordSafetyRejection(string)                    {}
-func (NoopRecorder) RecordApproval(string)                           {}
-func (NoopRecorder) RecordMitigation(string, string)                 {}
-func (NoopRecorder) ObserveMitigationDuration(string, time.Duration) {}
-func (NoopRecorder) RecordVerification(string)                       {}
-func (NoopRecorder) ObserveVerificationDuration(time.Duration)       {}
-func (NoopRecorder) RecordEscalation(string)                         {}
-func (NoopRecorder) RecordRetry()                                    {}
-func (NoopRecorder) RecordCircuitBreakerEvent(string)                {}
-func (NoopRecorder) RecordOrchestration(string)                      {}
-func (NoopRecorder) ObserveOrchestrationDuration(time.Duration)      {}
-func (NoopRecorder) RecordAuditEvent(string)                         {}
-func (NoopRecorder) RecordAuditWriteError()                          {}
-func (NoopRecorder) RecordAuditDuplicate()                           {}
-func (NoopRecorder) RecordShutdown(string)                           {}
-func (NoopRecorder) ObserveShutdownDuration(time.Duration)           {}
-func (NoopRecorder) RecordShutdownTimeout()                          {}
-func (NoopRecorder) RecordRecovery(string)                           {}
-func (NoopRecorder) ObserveRecoveryDuration(time.Duration)           {}
-func (NoopRecorder) RecordRecoveryReconciliationRequired()           {}
-func (NoopRecorder) RecordRecoveryBlocked()                          {}
-func (NoopRecorder) RecordRecoveryFailed()                           {}
-func (NoopRecorder) Registry() *Registry                             { return nil }
+func (NoopRecorder) RecordTelemetryBatch(bool)                          {}
+func (NoopRecorder) RecordAnomalyDetected(string)                       {}
+func (NoopRecorder) RecordDetectorError(string)                         {}
+func (NoopRecorder) ObserveDetectorDuration(string, time.Duration)      {}
+func (NoopRecorder) RecordIncidentCreated()                             {}
+func (NoopRecorder) RecordIncidentRecovered()                           {}
+func (NoopRecorder) RecordIncidentEscalated()                           {}
+func (NoopRecorder) SetActiveIncidents(int)                             {}
+func (NoopRecorder) IncActiveIncidents()                                {}
+func (NoopRecorder) DecActiveIncidents()                                {}
+func (NoopRecorder) RecordResponseDecision(string)                      {}
+func (NoopRecorder) RecordResponseNoAction()                            {}
+func (NoopRecorder) RecordResponseRejection()                           {}
+func (NoopRecorder) RecordSafetyValidation(bool)                        {}
+func (NoopRecorder) RecordSafetyRejection(string)                       {}
+func (NoopRecorder) RecordApproval(string)                              {}
+func (NoopRecorder) RecordMitigation(string, string)                    {}
+func (NoopRecorder) ObserveMitigationDuration(string, time.Duration)    {}
+func (NoopRecorder) RecordVerification(string)                          {}
+func (NoopRecorder) ObserveVerificationDuration(time.Duration)          {}
+func (NoopRecorder) RecordEscalation(string)                            {}
+func (NoopRecorder) RecordRetry()                                       {}
+func (NoopRecorder) RecordCircuitBreakerEvent(string)                   {}
+func (NoopRecorder) RecordOrchestration(string)                         {}
+func (NoopRecorder) ObserveOrchestrationDuration(time.Duration)         {}
+func (NoopRecorder) RecordAuditEvent(string)                            {}
+func (NoopRecorder) RecordAuditWriteError()                             {}
+func (NoopRecorder) RecordAuditDuplicate()                              {}
+func (NoopRecorder) RecordShutdown(string)                              {}
+func (NoopRecorder) ObserveShutdownDuration(time.Duration)              {}
+func (NoopRecorder) RecordShutdownTimeout()                             {}
+func (NoopRecorder) RecordRecovery(string)                              {}
+func (NoopRecorder) ObserveRecoveryDuration(time.Duration)              {}
+func (NoopRecorder) RecordRecoveryReconciliationRequired()              {}
+func (NoopRecorder) RecordRecoveryBlocked()                             {}
+func (NoopRecorder) RecordRecoveryFailed()                              {}
+func (NoopRecorder) RecordControlPlaneConnection(string)                {}
+func (NoopRecorder) RecordControlPlaneHeartbeat(string)                 {}
+func (NoopRecorder) RecordControlPlaneRegistration(string)              {}
+func (NoopRecorder) RecordControlPlaneReconnect()                       {}
+func (NoopRecorder) SetControlPlaneConnectionState(int)                 {}
+func (NoopRecorder) ObserveControlPlaneHeartbeatDuration(time.Duration) {}
+func (NoopRecorder) Registry() *Registry                                { return nil }

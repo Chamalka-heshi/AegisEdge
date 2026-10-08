@@ -714,3 +714,97 @@ func TestMetrics_W_RecoveryMetrics(t *testing.T) {
 		t.Errorf("expected recovery duration count metric, got:\n%s", prom)
 	}
 }
+
+// TestMetrics_X_ControlPlaneMetrics verifies recording of control-plane coordination metrics and bounded labels.
+func TestMetrics_X_ControlPlaneMetrics(t *testing.T) {
+	rec := NewDefaultRecorder(nil)
+
+	// Connections
+	rec.RecordControlPlaneConnection("connected")
+	rec.RecordControlPlaneConnection("disconnected")
+	rec.RecordControlPlaneConnection("failed")
+	rec.RecordControlPlaneConnection("INVALID_STATUS") // Should sanitize to unknown
+
+	// Heartbeats
+	rec.RecordControlPlaneHeartbeat("success")
+	rec.RecordControlPlaneHeartbeat("failed")
+	rec.RecordControlPlaneHeartbeat("INVALID_STATUS") // Should sanitize to unknown
+	rec.ObserveControlPlaneHeartbeatDuration(45 * time.Millisecond)
+
+	// Registration
+	rec.RecordControlPlaneRegistration("success")
+	rec.RecordControlPlaneRegistration("already_registered")
+	rec.RecordControlPlaneRegistration("failed")
+	rec.RecordControlPlaneRegistration("INVALID_STATUS") // Should sanitize to unknown
+
+	// Reconnects
+	rec.RecordControlPlaneReconnect()
+	rec.RecordControlPlaneReconnect()
+
+	// State
+	rec.SetControlPlaneConnectionState(2) // 2 = CONNECTED
+
+	// Audit integration
+	rec.RecordAuditEvent("CONTROL_PLANE_CONNECTED")
+	rec.RecordAuditEvent("CONTROL_PLANE_HEARTBEAT_SUCCEEDED")
+
+	prom := rec.Registry().FormatPrometheus()
+
+	// Verify connections
+	if !strings.Contains(prom, `aegisedge_control_plane_connections_total{status="connected"} 1`) {
+		t.Errorf("expected connected connection metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_connections_total{status="disconnected"} 1`) {
+		t.Errorf("expected disconnected connection metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_connections_total{status="failed"} 1`) {
+		t.Errorf("expected failed connection metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_connections_total{status="unknown"} 1`) {
+		t.Errorf("expected unknown connection metric, got:\n%s", prom)
+	}
+
+	// Verify heartbeats
+	if !strings.Contains(prom, `aegisedge_control_plane_heartbeats_total{status="success"} 1`) {
+		t.Errorf("expected success heartbeat metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_heartbeats_total{status="failed"} 1`) {
+		t.Errorf("expected failed heartbeat metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_heartbeats_total{status="unknown"} 1`) {
+		t.Errorf("expected unknown heartbeat metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_heartbeat_duration_seconds_count 1`) {
+		t.Errorf("expected heartbeat duration count metric, got:\n%s", prom)
+	}
+
+	// Verify registration
+	if !strings.Contains(prom, `aegisedge_control_plane_registration_total{status="success"} 1`) {
+		t.Errorf("expected success registration metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_registration_total{status="already_registered"} 1`) {
+		t.Errorf("expected already_registered registration metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_registration_total{status="failed"} 1`) {
+		t.Errorf("expected failed registration metric, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_registration_total{status="unknown"} 1`) {
+		t.Errorf("expected unknown registration metric, got:\n%s", prom)
+	}
+
+	// Verify reconnects & state
+	if !strings.Contains(prom, `aegisedge_control_plane_reconnects_total 2`) {
+		t.Errorf("expected 2 reconnects, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_control_plane_connection_state 2`) {
+		t.Errorf("expected connection state 2, got:\n%s", prom)
+	}
+
+	// Verify audit events
+	if !strings.Contains(prom, `aegisedge_audit_events_total{event_type="CONTROL_PLANE_CONNECTED"} 1`) {
+		t.Errorf("expected audit event CONTROL_PLANE_CONNECTED, got:\n%s", prom)
+	}
+	if !strings.Contains(prom, `aegisedge_audit_events_total{event_type="CONTROL_PLANE_HEARTBEAT_SUCCEEDED"} 1`) {
+		t.Errorf("expected audit event CONTROL_PLANE_HEARTBEAT_SUCCEEDED, got:\n%s", prom)
+	}
+}

@@ -71,6 +71,16 @@ const (
 	EventTypeRecoveryBlocked                 EventType = "RECOVERY_BLOCKED"
 	EventTypeRecoveryFailed                  EventType = "RECOVERY_FAILED"
 	EventTypeRecoveryCompleted               EventType = "RECOVERY_COMPLETED"
+
+	// Edge ↔ Control-Plane Coordination (Phase 6.14)
+	EventTypeControlPlaneRegStarted       EventType = "CONTROL_PLANE_REGISTRATION_STARTED"
+	EventTypeControlPlaneRegSuccess       EventType = "CONTROL_PLANE_REGISTRATION_SUCCEEDED"
+	EventTypeControlPlaneRegFailed        EventType = "CONTROL_PLANE_REGISTRATION_FAILED"
+	EventTypeControlPlaneConnected        EventType = "CONTROL_PLANE_CONNECTED"
+	EventTypeControlPlaneDisconnected     EventType = "CONTROL_PLANE_DISCONNECTED"
+	EventTypeControlPlaneHeartbeatSuccess EventType = "CONTROL_PLANE_HEARTBEAT_SUCCEEDED"
+	EventTypeControlPlaneHeartbeatFailed  EventType = "CONTROL_PLANE_HEARTBEAT_FAILED"
+	EventTypeControlPlaneReconnectSched   EventType = "CONTROL_PLANE_RECONNECT_SCHEDULED"
 )
 
 // IsValid checks whether an EventType is a member of the controlled allowlist.
@@ -107,7 +117,15 @@ func (t EventType) IsValid() bool {
 		EventTypeRecoveryReconciliationCompleted,
 		EventTypeRecoveryBlocked,
 		EventTypeRecoveryFailed,
-		EventTypeRecoveryCompleted:
+		EventTypeRecoveryCompleted,
+		EventTypeControlPlaneRegStarted,
+		EventTypeControlPlaneRegSuccess,
+		EventTypeControlPlaneRegFailed,
+		EventTypeControlPlaneConnected,
+		EventTypeControlPlaneDisconnected,
+		EventTypeControlPlaneHeartbeatSuccess,
+		EventTypeControlPlaneHeartbeatFailed,
+		EventTypeControlPlaneReconnectSched:
 		return true
 	default:
 		return false
