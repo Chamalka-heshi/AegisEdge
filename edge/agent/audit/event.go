@@ -81,6 +81,9 @@ const (
 	EventTypeControlPlaneHeartbeatSuccess EventType = "CONTROL_PLANE_HEARTBEAT_SUCCEEDED"
 	EventTypeControlPlaneHeartbeatFailed  EventType = "CONTROL_PLANE_HEARTBEAT_FAILED"
 	EventTypeControlPlaneReconnectSched   EventType = "CONTROL_PLANE_RECONNECT_SCHEDULED"
+
+	// Secure Edge ↔ Control-Plane Communication (Phase 6.15)
+	EventTypeControlPlaneAuthFailed EventType = "CONTROL_PLANE_AUTH_FAILED"
 )
 
 // IsValid checks whether an EventType is a member of the controlled allowlist.
@@ -125,7 +128,8 @@ func (t EventType) IsValid() bool {
 		EventTypeControlPlaneDisconnected,
 		EventTypeControlPlaneHeartbeatSuccess,
 		EventTypeControlPlaneHeartbeatFailed,
-		EventTypeControlPlaneReconnectSched:
+		EventTypeControlPlaneReconnectSched,
+		EventTypeControlPlaneAuthFailed:
 		return true
 	default:
 		return false
