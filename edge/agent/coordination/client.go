@@ -21,6 +21,8 @@ var (
 	ErrServerUnavailable = errors.New("control plane server is unavailable")
 	// ErrValidationFailed indicates the control plane rejected the payload with 4xx.
 	ErrValidationFailed = errors.New("control plane rejected payload validation")
+	// ErrAuthFailed indicates the control plane rejected authentication (401/403).
+	ErrAuthFailed = errors.New("control plane authentication failed")
 )
 
 const (
@@ -51,8 +53,10 @@ type Client interface {
 
 // HTTPClient implements Client backed by standard library http.Client.
 type HTTPClient struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL      string
+	httpClient   *http.Client
+	nodeID       string
+	sharedSecret string
 }
 
 // NewHTTPClient creates an HTTPClient for the given control plane base URL.
@@ -67,6 +71,12 @@ func NewHTTPClient(baseURL string, timeout time.Duration) *HTTPClient {
 			Timeout: timeout,
 		},
 	}
+}
+
+// SetAuth sets the credentials for request signing against the control plane.
+func (c *HTTPClient) SetAuth(nodeID, sharedSecret string) {
+	c.nodeID = nodeID
+	c.sharedSecret = sharedSecret
 }
 
 // RegisterNode sends a node registration request to POST /api/v1/nodes/register.
@@ -117,12 +127,32 @@ func (c *HTTPClient) GetNode(ctx context.Context, nodeID string) (*types.NodeReg
 	}
 	req.Header.Set("Accept", "application/json")
 
+	if c.sharedSecret != "" {
+		effectiveNodeID := c.nodeID
+		if effectiveNodeID == "" {
+			effectiveNodeID = cleanID
+		}
+		target := req.URL.RequestURI()
+		if target == "" {
+			target = req.URL.Path
+		}
+		headers, err := types.CreateAuthHeaders([]byte(c.sharedSecret), http.MethodGet, target, effectiveNodeID, nil)
+		if err == nil {
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+		}
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrServerUnavailable, err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: status %d", ErrAuthFailed, resp.StatusCode)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrNodeNotFound
 	}
@@ -155,12 +185,36 @@ func (c *HTTPClient) doPost(ctx context.Context, url string, payload interface{}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
+	if c.sharedSecret != "" {
+		effectiveNodeID := c.nodeID
+		if effectiveNodeID == "" {
+			if reg, ok := payload.(*types.NodeRegistration); ok {
+				effectiveNodeID = reg.NodeID
+			} else if hb, ok := payload.(*types.Heartbeat); ok {
+				effectiveNodeID = hb.NodeID
+			}
+		}
+		reqTarget := req.URL.RequestURI()
+		if reqTarget == "" {
+			reqTarget = req.URL.Path
+		}
+		headers, err := types.CreateAuthHeaders([]byte(c.sharedSecret), http.MethodPost, reqTarget, effectiveNodeID, data)
+		if err == nil {
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+		}
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrServerUnavailable, err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%w: status %d", ErrAuthFailed, resp.StatusCode)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrNodeNotFound
 	}
