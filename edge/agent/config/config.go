@@ -44,6 +44,8 @@ type Config struct {
 	HeartbeatInterval        time.Duration
 	InitialReconnectInterval time.Duration
 	MaxReconnectInterval     time.Duration
+	AuthEnabled              bool
+	SharedSecret             string
 }
 
 // LoadFromEnv loads configuration from environment variables, falling back to sensible defaults.
@@ -155,6 +157,16 @@ func LoadFromEnv() Config {
 		}
 	}
 
+	authEnabled := false
+	sharedSecret := strings.TrimSpace(os.Getenv("AEGISEDGE_SHARED_SECRET"))
+	if authStr := strings.TrimSpace(os.Getenv("AEGISEDGE_AUTH_ENABLED")); authStr != "" {
+		if strings.ToLower(authStr) == "true" || authStr == "1" {
+			authEnabled = true
+		}
+	} else if sharedSecret != "" {
+		authEnabled = true
+	}
+
 	return Config{
 		NodeID:                   nodeID,
 		DatabasePath:             dbPath,
@@ -174,5 +186,7 @@ func LoadFromEnv() Config {
 		HeartbeatInterval:        heartbeatInterval,
 		InitialReconnectInterval: initialReconnectInterval,
 		MaxReconnectInterval:     maxReconnectInterval,
+		AuthEnabled:              authEnabled,
+		SharedSecret:             sharedSecret,
 	}
 }
