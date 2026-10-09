@@ -326,7 +326,11 @@ func main() {
 			)
 		} else {
 			// HTTP transport (existing Phase 3)
-			client := sync.NewHTTPClient(cfg.ControlPlaneURL, sync.WithLogger(logger))
+			opts := []sync.HTTPClientOption{sync.WithLogger(logger)}
+			if cfg.AuthEnabled || cfg.SharedSecret != "" {
+				opts = append(opts, sync.WithSharedSecret(cfg.SharedSecret))
+			}
+			client := sync.NewHTTPClient(cfg.ControlPlaneURL, opts...)
 			syncer = sync.NewSyncer(store, client, logger)
 			logger.Info("synchronization transport: HTTP",
 				slog.String("control_plane_url", cfg.ControlPlaneURL),
@@ -381,6 +385,9 @@ func main() {
 	// 8b. Control-plane coordination (Phase 6.14)
 	if cfg.CoordinationEnabled && !cfg.RunOnce {
 		coordClient := coordination.NewHTTPClient(cfg.ControlPlaneURL, 5*time.Second)
+		if cfg.AuthEnabled || cfg.SharedSecret != "" {
+			coordClient.SetAuth(cfg.NodeID, cfg.SharedSecret)
+		}
 		coordTracker := coordination.NewTracker(cfg.NodeID, metricRec, healthTracker, auditService)
 		coordCfg := coordination.DefaultConfig(cfg.NodeID)
 		coordCfg.HeartbeatInterval = cfg.HeartbeatInterval
