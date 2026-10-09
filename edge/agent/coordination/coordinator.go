@@ -239,7 +239,19 @@ func (c *Coordinator) attemptRegistration(ctx context.Context) {
 
 	if err != nil {
 		c.metrics.RecordControlPlaneRegistration("failed")
-		if c.auditRec != nil {
+		if errors.Is(err, ErrAuthFailed) {
+			c.metrics.RecordControlPlaneAuthFailure(err.Error())
+			if c.auditRec != nil {
+				_ = c.auditRec.Record(ctx, audit.AuditEvent{
+					EventType:  audit.EventTypeControlPlaneAuthFailed,
+					NodeID:     c.cfg.NodeID,
+					IncidentID: "system-coordination",
+					Result:     audit.ResultFailed,
+					Reason:     err.Error(),
+					Timestamp:  time.Now().UTC(),
+				})
+			}
+		} else if c.auditRec != nil {
 			_ = c.auditRec.Record(ctx, audit.AuditEvent{
 				EventType:  audit.EventTypeControlPlaneRegFailed,
 				NodeID:     c.cfg.NodeID,
@@ -302,6 +314,20 @@ func (c *Coordinator) sendHeartbeat(ctx context.Context) {
 
 	if err != nil {
 		c.tracker.RecordHeartbeat(ctx, false, duration, err.Error())
+
+		if errors.Is(err, ErrAuthFailed) {
+			c.metrics.RecordControlPlaneAuthFailure(err.Error())
+			if c.auditRec != nil {
+				_ = c.auditRec.Record(ctx, audit.AuditEvent{
+					EventType:  audit.EventTypeControlPlaneAuthFailed,
+					NodeID:     c.cfg.NodeID,
+					IncidentID: "system-coordination",
+					Result:     audit.ResultFailed,
+					Reason:     err.Error(),
+					Timestamp:  time.Now().UTC(),
+				})
+			}
+		}
 
 		if errors.Is(err, ErrNodeNotFound) {
 			slog.Warn("control plane reported node not found, re-registering", "node_id", c.cfg.NodeID)

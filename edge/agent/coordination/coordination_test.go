@@ -3,6 +3,8 @@ package coordination
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -416,7 +418,10 @@ func TestCoordination_F_OfflineOnStartupDoesNotBlock(t *testing.T) {
 		t.Fatalf("failed to start coordinator: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && tracker.State() != StateDegraded {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// INVARIANT: When control plane is unavailable, agent stays autonomous and READY!
 	if tracker.State() != StateDegraded {
@@ -651,4 +656,210 @@ func TestCoordination_J_ConcurrencySafety(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestCoordination_SecureClientEndToEnd(t *testing.T) {
+	const secret = "coordination-test-secret-key-32c"
+	const nodeID = "secure-node-01"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		ts := r.Header.Get(types.HeaderTimestamp)
+		nonce := r.Header.Get(types.HeaderNonce)
+		sig := r.Header.Get(types.HeaderSignature)
+		headerNode := r.Header.Get(types.HeaderNodeID)
+
+		if headerNode != nodeID {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		target := r.URL.RequestURI()
+		if target == "" {
+			target = r.URL.Path
+		}
+		if !types.VerifySignature([]byte(secret), r.Method, target, headerNode, ts, nonce, sig, body) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		switch r.URL.Path {
+		case "/api/v1/nodes/register":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(RegistrationResponse{Status: "registered"})
+		case "/api/v1/nodes/heartbeat":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(HeartbeatResponse{Status: "acknowledged"})
+		case "/api/v1/nodes/" + nodeID:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(types.NodeRegistration{NodeID: nodeID})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, 1*time.Second)
+	client.SetAuth(nodeID, secret)
+
+	ctx := context.Background()
+
+	// 1. Register
+	reg := &types.NodeRegistration{
+		NodeID:       nodeID,
+		Hostname:     "secure-host",
+		RegisteredAt: time.Now().UTC(),
+	}
+	regResp, err := client.RegisterNode(ctx, reg)
+	if err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+	if regResp.Status != "registered" {
+		t.Errorf("expected registered, got %s", regResp.Status)
+	}
+
+	// 2. Heartbeat
+	hb := &types.Heartbeat{
+		NodeID:         nodeID,
+		SequenceNumber: 1,
+		Timestamp:      time.Now().UTC(),
+		Status:         types.NodeStatusHealthy,
+	}
+	hbResp, err := client.SendHeartbeat(ctx, hb)
+	if err != nil {
+		t.Fatalf("SendHeartbeat failed: %v", err)
+	}
+	if hbResp.Status != "acknowledged" {
+		t.Errorf("expected acknowledged, got %s", hbResp.Status)
+	}
+
+	// 3. GetNode
+	node, err := client.GetNode(ctx, nodeID)
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if node.NodeID != nodeID {
+		t.Errorf("expected %s, got %s", nodeID, node.NodeID)
+	}
+}
+
+func TestCoordination_SecureClientRejectsBadSecret(t *testing.T) {
+	const secret = "coordination-test-secret-key-32c"
+	const nodeID = "secure-node-01"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		ts := r.Header.Get(types.HeaderTimestamp)
+		nonce := r.Header.Get(types.HeaderNonce)
+		sig := r.Header.Get(types.HeaderSignature)
+		headerNode := r.Header.Get(types.HeaderNodeID)
+		target := r.URL.RequestURI()
+		if target == "" {
+			target = r.URL.Path
+		}
+		if !types.VerifySignature([]byte(secret), r.Method, target, headerNode, ts, nonce, sig, body) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Configure client with bad secret
+	client := NewHTTPClient(server.URL, 1*time.Second)
+	client.SetAuth(nodeID, "wrong-secret-key-attacker")
+
+	ctx := context.Background()
+
+	reg := &types.NodeRegistration{
+		NodeID:       nodeID,
+		Hostname:     "secure-host",
+		RegisteredAt: time.Now().UTC(),
+	}
+	_, err := client.RegisterNode(ctx, reg)
+	if err == nil {
+		t.Fatalf("expected error for bad secret, got nil")
+	}
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("expected error wrapping ErrAuthFailed, got %v", err)
+	}
+
+	hb := &types.Heartbeat{
+		NodeID:         nodeID,
+		SequenceNumber: 1,
+		Timestamp:      time.Now().UTC(),
+		Status:         types.NodeStatusHealthy,
+	}
+	_, err = client.SendHeartbeat(ctx, hb)
+	if err == nil {
+		t.Fatalf("expected error for bad secret on heartbeat, got nil")
+	}
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("expected error wrapping ErrAuthFailed, got %v", err)
+	}
+}
+
+func TestCoordination_AuthFailureDegradesSafelyWithoutBlocking(t *testing.T) {
+	// Server returns 401 Unauthorized for all incoming requests
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "unauthorized",
+			"message": "invalid signature",
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, 100*time.Millisecond)
+	client.SetAuth("auth-node-01", "some-secret")
+
+	ht := health.NewTracker()
+	_ = ht.RegisterCheck(health.CheckStorage, true)
+	_ = ht.RegisterCheck(health.CheckControlPlane, false)
+	_ = ht.SetCheckStatus(health.CheckStorage, health.StatusOk, "storage ready")
+	_ = ht.Transition(health.StateReady)
+
+	metricRec := metrics.NewDefaultRecorder(nil)
+	auditRec := &fakeAuditRecorder{}
+	tracker := NewTracker("auth-node-01", metricRec, ht, auditRec)
+
+	cfg := DefaultConfig("auth-node-01")
+	cfg.HeartbeatInterval = 50 * time.Millisecond
+	cfg.InitialReconnectInterval = 20 * time.Millisecond
+	cfg.RequestTimeout = 50 * time.Millisecond
+
+	coordinator := NewCoordinator(cfg, client, tracker, metricRec, ht, auditRec)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := coordinator.Start(ctx); err != nil {
+		t.Fatalf("failed to start coordinator: %v", err)
+	}
+
+	// Poll until degraded
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && tracker.State() != StateDegraded {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// INVARIANT: When auth fails, coordinator enters StateDegraded, but edge agent MUST remain READY offline!
+	if tracker.State() != StateDegraded {
+		t.Errorf("expected StateDegraded after auth rejection, got %v", tracker.State())
+	}
+	if !ht.IsReady() {
+		t.Errorf("CRITICAL: edge agent MUST remain READY offline even when control plane auth fails")
+	}
+
+	// Verify CONTROL_PLANE_AUTH_FAILED audit event was emitted
+	if auditRec.countEvents(audit.EventTypeControlPlaneAuthFailed) == 0 {
+		t.Errorf("expected at least 1 CONTROL_PLANE_AUTH_FAILED audit event, got %d", auditRec.countEvents(audit.EventTypeControlPlaneAuthFailed))
+	}
+
+	// Clean stop
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer stopCancel()
+	if err := coordinator.Stop(stopCtx); err != nil {
+		t.Fatalf("failed to stop coordinator: %v", err)
+	}
 }
