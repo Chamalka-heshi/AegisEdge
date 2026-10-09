@@ -75,6 +75,9 @@ const (
 	MetricControlPlaneReconnectsTotal   = "aegisedge_control_plane_reconnects_total"
 	MetricControlPlaneConnectionState   = "aegisedge_control_plane_connection_state"
 	MetricControlPlaneHeartbeatDuration = "aegisedge_control_plane_heartbeat_duration_seconds"
+
+	// Secure Control-Plane Communication (Phase 6.15)
+	MetricControlPlaneAuthFailuresTotal = "aegisedge_control_plane_auth_failures_total"
 )
 
 // Recorder defines the domain contract for recording lifecycle metrics.
@@ -148,6 +151,9 @@ type Recorder interface {
 	RecordControlPlaneReconnect()
 	SetControlPlaneConnectionState(state int)
 	ObserveControlPlaneHeartbeatDuration(d time.Duration)
+
+	// Secure Control-Plane Communication (Phase 6.15)
+	RecordControlPlaneAuthFailure(reason string)
 
 	// Registry access
 	Registry() *Registry
@@ -225,6 +231,9 @@ type DefaultRecorder struct {
 	cpReconnects        *SingleCounter
 	cpConnectionState   *SingleGauge
 	cpHeartbeatDuration *SingleHistogram
+
+	// Secure Control-Plane Communication (Phase 6.15)
+	cpAuthFailures *CounterVec
 }
 
 // NewDefaultRecorder constructs and initializes all domain metrics in the provided Registry.
@@ -305,6 +314,7 @@ func NewDefaultRecorder(reg *Registry) *DefaultRecorder {
 		cpReconnects:        NewSingleCounter(MetricControlPlaneReconnectsTotal, "Total control plane reconnection attempts scheduled."),
 		cpConnectionState:   NewSingleGauge(MetricControlPlaneConnectionState, "Current control plane connection state (0=DISCONNECTED, 1=CONNECTING, 2=CONNECTED, 3=DEGRADED, 4=STOPPING)."),
 		cpHeartbeatDuration: NewSingleHistogram(MetricControlPlaneHeartbeatDuration, "Duration of control plane heartbeat round trips in seconds.", DefaultDurationBuckets),
+		cpAuthFailures:      NewCounterVec(MetricControlPlaneAuthFailuresTotal, "Total number of control plane authentication failures by reason.", []string{"reason"}),
 	}
 
 	// Register all metrics into registry
@@ -349,6 +359,7 @@ func NewDefaultRecorder(reg *Registry) *DefaultRecorder {
 	_ = reg.Register(rec.cpReconnects)
 	_ = reg.Register(rec.cpConnectionState)
 	_ = reg.Register(rec.cpHeartbeatDuration)
+	_ = reg.Register(rec.cpAuthFailures)
 
 	return rec
 }
@@ -559,6 +570,11 @@ func (r *DefaultRecorder) SetControlPlaneConnectionState(state int) {
 
 func (r *DefaultRecorder) ObserveControlPlaneHeartbeatDuration(d time.Duration) {
 	r.cpHeartbeatDuration.Observe(d.Seconds())
+}
+
+func (r *DefaultRecorder) RecordControlPlaneAuthFailure(reason string) {
+	st := SanitizeAuthFailureReason(reason)
+	r.cpAuthFailures.WithLabelValues(st).Inc()
 }
 
 // ============================================================================
@@ -837,6 +853,29 @@ func SanitizeRegistrationStatus(status string) string {
 	}
 }
 
+// SanitizeAuthFailureReason maps control-plane authentication failure reasons to bounded enums.
+func SanitizeAuthFailureReason(reason string) string {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case strings.Contains(r, "signature"):
+		return "invalid_signature"
+	case strings.Contains(r, "expired"):
+		return "expired_timestamp"
+	case strings.Contains(r, "future"):
+		return "future_timestamp"
+	case strings.Contains(r, "replay"):
+		return "replay_detected"
+	case strings.Contains(r, "impersonat") || strings.Contains(r, "forbidden"):
+		return "forbidden"
+	case strings.Contains(r, "missing") || strings.Contains(r, "header"):
+		return "missing_auth"
+	case strings.Contains(r, "unauthorized") || strings.Contains(r, "auth"):
+		return "unauthorized"
+	default:
+		return "unknown"
+	}
+}
+
 // ============================================================================
 // No-Op Recorder Implementation
 // ============================================================================
@@ -886,4 +925,5 @@ func (NoopRecorder) RecordControlPlaneRegistration(string)              {}
 func (NoopRecorder) RecordControlPlaneReconnect()                       {}
 func (NoopRecorder) SetControlPlaneConnectionState(int)                 {}
 func (NoopRecorder) ObserveControlPlaneHeartbeatDuration(time.Duration) {}
+func (NoopRecorder) RecordControlPlaneAuthFailure(string)               {}
 func (NoopRecorder) Registry() *Registry                                { return nil }
