@@ -67,13 +67,21 @@ func WithLogger(logger *slog.Logger) HTTPClientOption {
 	}
 }
 
+// WithSharedSecret sets the shared secret for request signing.
+func WithSharedSecret(secret string) HTTPClientOption {
+	return func(c *HTTPClient) {
+		c.sharedSecret = secret
+	}
+}
+
 // HTTPClient implements Client using standard net/http with bounded transient retries.
 type HTTPClient struct {
-	endpointURL string
-	httpClient  *http.Client
-	maxRetries  int
-	baseBackoff time.Duration
-	logger      *slog.Logger
+	endpointURL  string
+	httpClient   *http.Client
+	maxRetries   int
+	baseBackoff  time.Duration
+	logger       *slog.Logger
+	sharedSecret string
 }
 
 // NewHTTPClient creates a new HTTPClient pointing to the specified control plane URL.
@@ -125,6 +133,19 @@ func (c *HTTPClient) SyncBatch(ctx context.Context, batch *types.TelemetryBatch)
 			return nil, fmt.Errorf("failed to create http request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
+
+		if c.sharedSecret != "" {
+			reqTarget := req.URL.RequestURI()
+			if reqTarget == "" {
+				reqTarget = req.URL.Path
+			}
+			headers, err := types.CreateAuthHeaders([]byte(c.sharedSecret), http.MethodPost, reqTarget, batch.NodeID, payloadBytes)
+			if err == nil {
+				for k, v := range headers {
+					req.Header.Set(k, v)
+				}
+			}
+		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
