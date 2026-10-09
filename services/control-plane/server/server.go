@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -54,6 +56,8 @@ type Server struct {
 	nodesList      []*NodeRecord
 	logger         *slog.Logger
 	maxPayloadSize int64
+	authConfig     AuthConfig
+	replayCache    *ReplayCache
 }
 
 // NewServer initializes an in-memory control-plane HTTP ingestion server.
@@ -70,7 +74,34 @@ func NewServer(logger *slog.Logger) *Server {
 		nodesList:      make([]*NodeRecord, 0),
 		logger:         logger,
 		maxPayloadSize: 1024 * 1024, // 1MB payload limit
+		authConfig:     DefaultAuthConfig(),
+		replayCache:    NewReplayCache(DefaultMaxReplayKeys),
 	}
+}
+
+// SetAuthConfig sets the authentication configuration for the control plane.
+func (s *Server) SetAuthConfig(cfg AuthConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authConfig = cfg
+	if s.replayCache == nil {
+		s.replayCache = NewReplayCache(DefaultMaxReplayKeys)
+	}
+	if !cfg.Enabled {
+		s.logger.Warn("control plane authentication is disabled (development mode)")
+	} else {
+		s.logger.Info("control plane authentication is enabled",
+			slog.Bool("replay_protection", cfg.ReplayProtection),
+			slog.Duration("max_clock_skew", cfg.MaxClockSkew),
+		)
+	}
+}
+
+// AuthConfig returns a copy of current authentication configuration.
+func (s *Server) AuthConfig() AuthConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.authConfig
 }
 
 // Routes constructs and returns the HTTP request multiplexer.
@@ -119,15 +150,8 @@ func (s *Server) handleTelemetryBatches(w http.ResponseWriter, r *http.Request) 
 // handleIngestBatch validates, idempotently accepts, and stores an incoming batch.
 func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	// 1. Enforce payload size limit (1MB)
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxPayloadSize)
-	defer r.Body.Close()
-
-	// 2. Decode JSON body
-	var batch types.TelemetryBatch
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&batch); err != nil {
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxPayloadSize))
+	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
@@ -137,13 +161,34 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "malformed_body",
+			Message: fmt.Sprintf("failed to read request body: %v", err),
+		})
+		return
+	}
+	defer r.Body.Close()
+
+	// 2. Authenticate Request
+	authCtx, err := s.AuthenticateRequest(r, bodyBytes)
+	if err != nil {
+		s.writeAuthError(w, err)
+		return
+	}
+
+	// 3. Decode JSON body
+	var batch types.TelemetryBatch
+	decoder := json.NewDecoder(bytes.NewReader(bodyBytes))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&batch); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "malformed_json",
 			Message: fmt.Sprintf("failed to parse JSON payload: %v", err),
 		})
 		return
 	}
 
-	// 3. Domain validation
+	// 4. Domain validation
 	if err := batch.Validate(); err != nil {
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_batch",
@@ -152,7 +197,19 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Idempotency Check & Ingestion
+	// 5. Node impersonation protection (if authenticated and not admin)
+	s.mu.RLock()
+	authEnabled := s.authConfig.Enabled
+	s.mu.RUnlock()
+	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != batch.NodeID {
+		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+			Error:   "forbidden",
+			Message: fmt.Sprintf("authenticated node %q cannot submit telemetry for node %q", authCtx.NodeID, batch.NodeID),
+		})
+		return
+	}
+
+	// 6. Idempotency Check & Ingestion
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -197,8 +254,26 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleListBatches returns all ingested batches in memory.
+// handleListBatches returns all ingested batches in memory (admin only when auth enabled).
 func (s *Server) handleListBatches(w http.ResponseWriter, r *http.Request) {
+	authCtx, err := s.AuthenticateRequest(r, nil)
+	if err != nil {
+		s.writeAuthError(w, err)
+		return
+	}
+
+	s.mu.RLock()
+	authEnabled := s.authConfig.Enabled
+	s.mu.RUnlock()
+
+	if authEnabled && !authCtx.IsAdmin {
+		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+			Error:   "forbidden",
+			Message: "administrative authorization required to list telemetry batches",
+		})
+		return
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -323,6 +398,26 @@ func isValidNodeID(id string) bool {
 	return true
 }
 
+func (s *Server) writeAuthError(w http.ResponseWriter, err error) {
+	errType := "unauthorized"
+	if errors.Is(err, types.ErrInvalidSignature) {
+		errType = "invalid_signature"
+	} else if errors.Is(err, types.ErrExpiredTimestamp) {
+		errType = "expired_timestamp"
+	} else if errors.Is(err, types.ErrFutureTimestamp) {
+		errType = "future_timestamp"
+	} else if errors.Is(err, types.ErrReplayDetected) {
+		errType = "replay_detected"
+	} else if errors.Is(err, types.ErrMissingAuthHeaders) {
+		errType = "missing_auth_headers"
+	}
+
+	s.writeJSON(w, http.StatusUnauthorized, ErrorResponse{
+		Error:   errType,
+		Message: err.Error(),
+	})
+}
+
 func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -333,13 +428,8 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxPayloadSize)
-	defer r.Body.Close()
-
-	var reg types.NodeRegistration
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&reg); err != nil {
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxPayloadSize))
+	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
@@ -348,6 +438,24 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "malformed_body",
+			Message: fmt.Sprintf("failed to read request body: %v", err),
+		})
+		return
+	}
+	defer r.Body.Close()
+
+	authCtx, err := s.AuthenticateRequest(r, bodyBytes)
+	if err != nil {
+		s.writeAuthError(w, err)
+		return
+	}
+
+	var reg types.NodeRegistration
+	decoder := json.NewDecoder(bytes.NewReader(bodyBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&reg); err != nil {
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "malformed_json",
 			Message: fmt.Sprintf("failed to parse registration payload: %v", err),
@@ -367,6 +475,18 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_node_id",
 			Message: fmt.Sprintf("node_id %q does not conform to character and length constraints", reg.NodeID),
+		})
+		return
+	}
+
+	s.mu.RLock()
+	authEnabled := s.authConfig.Enabled
+	s.mu.RUnlock()
+
+	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != reg.NodeID {
+		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+			Error:   "forbidden",
+			Message: fmt.Sprintf("authenticated node %q cannot register as node %q", authCtx.NodeID, reg.NodeID),
 		})
 		return
 	}
@@ -440,13 +560,8 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxPayloadSize)
-	defer r.Body.Close()
-
-	var hb types.Heartbeat
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&hb); err != nil {
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxPayloadSize))
+	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
@@ -455,6 +570,24 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "malformed_body",
+			Message: fmt.Sprintf("failed to read heartbeat body: %v", err),
+		})
+		return
+	}
+	defer r.Body.Close()
+
+	authCtx, err := s.AuthenticateRequest(r, bodyBytes)
+	if err != nil {
+		s.writeAuthError(w, err)
+		return
+	}
+
+	var hb types.Heartbeat
+	decoder := json.NewDecoder(bytes.NewReader(bodyBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&hb); err != nil {
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "malformed_json",
 			Message: fmt.Sprintf("failed to parse heartbeat payload: %v", err),
@@ -466,6 +599,18 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_heartbeat",
 			Message: fmt.Sprintf("heartbeat domain validation failed: %v", err),
+		})
+		return
+	}
+
+	s.mu.RLock()
+	authEnabled := s.authConfig.Enabled
+	s.mu.RUnlock()
+
+	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != hb.NodeID {
+		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+			Error:   "forbidden",
+			Message: fmt.Sprintf("authenticated node %q cannot send heartbeat for node %q", authCtx.NodeID, hb.NodeID),
 		})
 		return
 	}
@@ -510,19 +655,47 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	authCtx, err := s.AuthenticateRequest(r, nil)
+	if err != nil {
+		s.writeAuthError(w, err)
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/nodes")
 	path = strings.TrimPrefix(path, "/")
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	authEnabled := s.authConfig.Enabled
+	s.mu.RUnlock()
 
 	if path == "" {
-		// List all nodes
+		// List all nodes: admin only
+		if authEnabled && !authCtx.IsAdmin {
+			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+				Error:   "forbidden",
+				Message: "administrative authorization required to list all nodes",
+			})
+			return
+		}
+
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 		s.writeJSON(w, http.StatusOK, s.nodesList)
 		return
 	}
 
 	// Single node query: path is node_id
+	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != path {
+		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+			Error:   "forbidden",
+			Message: fmt.Sprintf("authenticated node %q cannot inspect record for node %q", authCtx.NodeID, path),
+		})
+		return
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	record, exists := s.nodes[path]
 	if !exists {
 		s.writeJSON(w, http.StatusNotFound, ErrorResponse{
