@@ -1395,3 +1395,492 @@ func TestAuth_Finding2_UnknownNodeCannotRegisterSelfWithArbitraryID_InPerNodeMod
 		t.Errorf("expected 401 Unauthorized for unknown node self-registration attempt, got %d", resp.StatusCode)
 	}
 }
+
+// 32. Tests for LoadNodeSecretsFile: valid JSON loading with multiple distinct nodes
+func TestLoadNodeSecretsFile_Valid(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "node-secrets.json")
+
+	content := `{
+		"edge-node-01": "secret-key-alpha-16chars",
+		"edge-node-02": "secret-key-bravo-16chars",
+		"edge-node-03": "secret-key-charlie-32bytes-secure"
+	}`
+	if err := os.WriteFile(secretsFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write secrets file: %v", err)
+	}
+
+	secrets, err := LoadNodeSecretsFile(secretsFile)
+	if err != nil {
+		t.Fatalf("LoadNodeSecretsFile failed: %v", err)
+	}
+
+	if len(secrets) != 3 {
+		t.Fatalf("expected 3 node secrets, got %d", len(secrets))
+	}
+	if secrets["edge-node-01"] != "secret-key-alpha-16chars" {
+		t.Errorf("unexpected secret for edge-node-01: %s", secrets["edge-node-01"])
+	}
+	if secrets["edge-node-02"] != "secret-key-bravo-16chars" {
+		t.Errorf("unexpected secret for edge-node-02: %s", secrets["edge-node-02"])
+	}
+	if secrets["edge-node-03"] != "secret-key-charlie-32bytes-secure" {
+		t.Errorf("unexpected secret for edge-node-03: %s", secrets["edge-node-03"])
+	}
+}
+
+// 33. Tests for LoadNodeSecretsFile: missing / inaccessible file path
+func TestLoadNodeSecretsFile_MissingFile(t *testing.T) {
+	_, err := LoadNodeSecretsFile("")
+	if err == nil {
+		t.Errorf("expected error for empty file path, got nil")
+	}
+
+	_, err = LoadNodeSecretsFile("nonexistent/path/secrets.json")
+	if err == nil {
+		t.Errorf("expected error for nonexistent file path, got nil")
+	}
+}
+
+// 34. Tests for LoadNodeSecretsFile: empty file
+func TestLoadNodeSecretsFile_EmptyFile(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "empty.json")
+	if err := os.WriteFile(secretsFile, []byte("   \n  "), 0600); err != nil {
+		t.Fatalf("failed to write empty file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error for empty file, got nil")
+	}
+}
+
+// 35. Tests for LoadNodeSecretsFile: malformed JSON syntax
+func TestLoadNodeSecretsFile_MalformedJSON(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "malformed.json")
+	if err := os.WriteFile(secretsFile, []byte(`{"edge-node-01": "secret-key-16chars", `), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error for malformed JSON, got nil")
+	}
+}
+
+// 36. Tests for LoadNodeSecretsFile: root is not a JSON object
+func TestLoadNodeSecretsFile_NotAnObject(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "array.json")
+	if err := os.WriteFile(secretsFile, []byte(`["secret1", "secret2"]`), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error when root is a JSON array, got nil")
+	}
+}
+
+// 37. Tests for LoadNodeSecretsFile: duplicate JSON keys rejected fail-closed
+func TestLoadNodeSecretsFile_DuplicateKeysRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "duplicate.json")
+	content := `{
+		"edge-node-01": "first-secret-key-16chars",
+		"edge-node-01": "second-secret-key-16chars"
+	}`
+	if err := os.WriteFile(secretsFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error for duplicate JSON keys, got nil")
+	}
+}
+
+// 38. Tests for LoadNodeSecretsFile: empty JSON object `{}` rejected
+func TestLoadNodeSecretsFile_EmptyMapRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "empty_map.json")
+	if err := os.WriteFile(secretsFile, []byte(`{}`), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error for empty map `{}`, got nil")
+	}
+}
+
+// 39. Tests for LoadNodeSecretsFile: blank node ID rejected
+func TestLoadNodeSecretsFile_BlankNodeIDRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "blank_node.json")
+	content := `{"   ": "valid-secret-key-at-least-16chars"}`
+	if err := os.WriteFile(secretsFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error for blank node ID, got nil")
+	}
+}
+
+// 40. Tests for LoadNodeSecretsFile: invalid node ID format rejected
+func TestLoadNodeSecretsFile_InvalidNodeIDFormatRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "invalid_node.json")
+	content := `{"invalid/node*id": "valid-secret-key-at-least-16chars"}`
+	if err := os.WriteFile(secretsFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error for invalid node ID format, got nil")
+	}
+}
+
+// 41. Tests for LoadNodeSecretsFile: short secret (<16 chars) rejected and secret value NEVER leaked
+func TestLoadNodeSecretsFile_ShortSecretRejected_NoSecretInError(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "short_secret.json")
+	shortSecretVal := "short-1234"
+	content := fmt.Sprintf(`{"edge-node-01": "%s"}`, shortSecretVal)
+	if err := os.WriteFile(secretsFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Fatalf("expected error for short secret, got nil")
+	}
+
+	// Confidentiality requirement: secret values must NEVER appear in error messages
+	errMsg := err.Error()
+	if bytes.Contains([]byte(errMsg), []byte(shortSecretVal)) {
+		t.Errorf("SECURITY DEFECT: secret value %q leaked in error message: %s", shortSecretVal, errMsg)
+	}
+}
+
+// 42. Tests for LoadNodeSecretsFile: non-string value rejected
+func TestLoadNodeSecretsFile_NonStringValueRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "non_string.json")
+	content := `{"edge-node-01": 1234567890123456}`
+	if err := os.WriteFile(secretsFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	_, err := LoadNodeSecretsFile(secretsFile)
+	if err == nil {
+		t.Errorf("expected error for non-string secret value, got nil")
+	}
+}
+
+// 43. Production startup wiring: validates that AuthConfig populated from LoadNodeSecretsFile passes production validation
+func TestProductionStartup_NodeSecretsWiring(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsFile := filepath.Join(tempDir, "prod-secrets.json")
+	certFile, keyFile := generateTestCertificate(t, tempDir)
+
+	content := `{
+		"prod-node-alpha": "prod-alpha-secret-key-32chars",
+		"prod-node-bravo": "prod-bravo-secret-key-32chars"
+	}`
+	if err := os.WriteFile(secretsFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write secrets file: %v", err)
+	}
+
+	// 1. Load secrets from file
+	nodeSecrets, err := LoadNodeSecretsFile(secretsFile)
+	if err != nil {
+		t.Fatalf("LoadNodeSecretsFile failed: %v", err)
+	}
+
+	// 2. Construct production AuthConfig exactly as in main.go
+	authCfg := AuthConfig{
+		Enabled:          true,
+		NodeSecrets:      nodeSecrets,
+		AdminToken:       testAdminToken,
+		MaxClockSkew:     5 * time.Minute,
+		ReplayProtection: true,
+		TLSCertFile:      certFile,
+		TLSKeyFile:       keyFile,
+	}
+
+	// 3. Must pass production validation on non-loopback listen address
+	listenAddr := "0.0.0.0:8443"
+	if err := authCfg.Validate(listenAddr, true); err != nil {
+		t.Fatalf("authCfg.Validate failed for valid production configuration: %v", err)
+	}
+
+	// 4. Missing NodeSecrets in production MUST fail validation
+	authCfgNoSecrets := authCfg
+	authCfgNoSecrets.NodeSecrets = nil
+	if err := authCfgNoSecrets.Validate(listenAddr, true); err == nil {
+		t.Fatalf("expected authCfg.Validate to fail closed when NodeSecrets is missing in production")
+	}
+
+	// 5. Non-empty SharedSecret in production MUST fail validation
+	authCfgWithShared := authCfg
+	authCfgWithShared.SharedSecret = "fleet-wide-shared-secret-16chars"
+	if err := authCfgWithShared.Validate(listenAddr, true); err == nil {
+		t.Fatalf("expected authCfg.Validate to fail closed when SharedSecret is provided in production")
+	}
+}
+
+// 44. Section 1 Scenarios 1-7: Rigorous verification of credential isolation, fallback prevention, and impersonation rejection
+func TestCredentialIsolation_Scenarios(t *testing.T) {
+	tempDir := t.TempDir()
+	certFile, keyFile := generateTestCertificate(t, tempDir)
+
+	// Scenario 1: Production with valid NodeSecrets and no SharedSecret -> Valid
+	t.Run("Scenario1_ProdWithNodeSecretsNoSharedSecret", func(t *testing.T) {
+		cfg := AuthConfig{
+			Enabled:          true,
+			NodeSecrets:      map[string]string{"node-01": "secret-key-node01-16chars"},
+			AdminToken:       testAdminToken,
+			TLSCertFile:      certFile,
+			TLSKeyFile:       keyFile,
+			ReplayProtection: true,
+		}
+		if err := cfg.Validate("0.0.0.0:8443", true); err != nil {
+			t.Fatalf("expected Scenario 1 to pass validation, got: %v", err)
+		}
+	})
+
+	// Scenario 2: Production with valid NodeSecrets and non-empty SharedSecret -> FAILS validation
+	t.Run("Scenario2_ProdWithNodeSecretsAndSharedSecret_Fails", func(t *testing.T) {
+		cfg := AuthConfig{
+			Enabled:          true,
+			NodeSecrets:      map[string]string{"node-01": "secret-key-node01-16chars"},
+			SharedSecret:     "fleet-shared-secret-key-16chars",
+			AdminToken:       testAdminToken,
+			TLSCertFile:      certFile,
+			TLSKeyFile:       keyFile,
+			ReplayProtection: true,
+		}
+		if err := cfg.Validate("0.0.0.0:8443", true); err == nil {
+			t.Fatalf("expected Scenario 2 to fail validation due to non-empty SharedSecret in production, got nil")
+		}
+	})
+
+	// Scenario 3: Known node signing with its own per-node secret succeeds
+	t.Run("Scenario3_KnownNodeSignsWithOwnSecret_Succeeds", func(t *testing.T) {
+		srv := NewServer(newDiscardLogger())
+		srv.SetAuthConfig(AuthConfig{
+			Enabled: true,
+			NodeSecrets: map[string]string{
+				"node-alpha": "alpha-secret-key-16chars",
+				"node-beta":  "beta-secret-key-16chars",
+			},
+			AdminToken: testAdminToken,
+		})
+		ts := httptest.NewServer(srv.Routes())
+		defer ts.Close()
+
+		reg := types.NodeRegistration{
+			NodeID:       "node-alpha",
+			Hostname:     "alpha-host",
+			RegisteredAt: time.Now().UTC(),
+		}
+		body, _ := json.Marshal(reg)
+		headers, _ := types.CreateAuthHeaders([]byte("alpha-secret-key-16chars"), http.MethodPost, "/api/v1/nodes/register", "node-alpha", body)
+
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/register", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("expected 201 Created for known node with own secret, got %v (err: %v)", resp.StatusCode, err)
+		}
+		resp.Body.Close()
+	})
+
+	// Scenario 4: Unknown node signing with the fleet-wide shared secret when NodeSecrets is configured -> 401 Unauthorized
+	// Proves that when NodeSecrets is populated, lookup NEVER falls through to SharedSecret.
+	t.Run("Scenario4_UnknownNodeSignsWithSharedSecretWhenNodeSecretsConfigured_Fails", func(t *testing.T) {
+		srv := NewServer(newDiscardLogger())
+		srv.SetAuthConfig(AuthConfig{
+			Enabled: true,
+			NodeSecrets: map[string]string{
+				"node-alpha": "alpha-secret-key-16chars",
+			},
+			SharedSecret: "fleet-shared-secret-key-16chars", // dev mode config
+			AdminToken:   testAdminToken,
+		})
+		ts := httptest.NewServer(srv.Routes())
+		defer ts.Close()
+
+		// Unknown node claims "node-unknown" and signs with fleet SharedSecret
+		reg := types.NodeRegistration{
+			NodeID:       "node-unknown",
+			Hostname:     "unknown-host",
+			RegisteredAt: time.Now().UTC(),
+		}
+		body, _ := json.Marshal(reg)
+		headers, _ := types.CreateAuthHeaders([]byte("fleet-shared-secret-key-16chars"), http.MethodPost, "/api/v1/nodes/register", "node-unknown", body)
+
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/register", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized for unknown node signing with shared secret (no fall-through), got %d", resp.StatusCode)
+		}
+	})
+
+	// Scenario 5: Known node attempting to authenticate as another node -> 401 (signature fails against target node's key) or 403 (body mismatch)
+	t.Run("Scenario5_KnownNodeAuthenticatesAsAnotherNode_Fails", func(t *testing.T) {
+		srv := NewServer(newDiscardLogger())
+		srv.SetAuthConfig(AuthConfig{
+			Enabled: true,
+			NodeSecrets: map[string]string{
+				"node-alpha": "alpha-secret-key-16chars",
+				"node-beta":  "beta-secret-key-16chars",
+			},
+			AdminToken: testAdminToken,
+		})
+		ts := httptest.NewServer(srv.Routes())
+		defer ts.Close()
+
+		reg := types.NodeRegistration{
+			NodeID:       "node-beta",
+			Hostname:     "beta-host",
+			RegisteredAt: time.Now().UTC(),
+		}
+		body, _ := json.Marshal(reg)
+
+		// Alpha attempts to claim node-beta using alpha's secret key
+		headers, _ := types.CreateAuthHeaders([]byte("alpha-secret-key-16chars"), http.MethodPost, "/api/v1/nodes/register", "node-beta", body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/register", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized when signing for node-beta with alpha's key, got %d", resp.StatusCode)
+		}
+
+		// Alpha signs with alpha's key as node-alpha, but sends body for node-beta -> 403 Forbidden (identity mismatch)
+		headersMismatch, _ := types.CreateAuthHeaders([]byte("alpha-secret-key-16chars"), http.MethodPost, "/api/v1/nodes/register", "node-alpha", body)
+		reqMismatch, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/register", bytes.NewReader(body))
+		reqMismatch.Header.Set("Content-Type", "application/json")
+		for k, v := range headersMismatch {
+			reqMismatch.Header.Set(k, v)
+		}
+		respMismatch, err := http.DefaultClient.Do(reqMismatch)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer respMismatch.Body.Close()
+
+		if respMismatch.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for node ID header vs payload mismatch, got %d", respMismatch.StatusCode)
+		}
+	})
+
+	// Scenario 6: Configured SecretResolver returning error for unknown node -> 401 Unauthorized (no fall-through)
+	t.Run("Scenario6_SecretResolverReturnsErrorForUnknownNode_Fails", func(t *testing.T) {
+		srv := NewServer(newDiscardLogger())
+		srv.SetAuthConfig(AuthConfig{
+			Enabled: true,
+			SecretResolver: func(nodeID string) ([]byte, error) {
+				if nodeID == "node-alpha" {
+					return []byte("alpha-secret-key-16chars"), nil
+				}
+				return nil, errors.New("unknown node id in resolver")
+			},
+			SharedSecret: "fleet-shared-secret-key-16chars", // must NOT fall through to this!
+			AdminToken:   testAdminToken,
+		})
+		ts := httptest.NewServer(srv.Routes())
+		defer ts.Close()
+
+		reg := types.NodeRegistration{
+			NodeID:       "node-unknown",
+			Hostname:     "unknown-host",
+			RegisteredAt: time.Now().UTC(),
+		}
+		body, _ := json.Marshal(reg)
+		headers, _ := types.CreateAuthHeaders([]byte("fleet-shared-secret-key-16chars"), http.MethodPost, "/api/v1/nodes/register", "node-unknown", body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/register", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized when SecretResolver fails, got %d", resp.StatusCode)
+		}
+	})
+
+	// Scenario 7: Configuration containing both SecretResolver and SharedSecret
+	t.Run("Scenario7_BothSecretResolverAndSharedSecret", func(t *testing.T) {
+		// In production, having SharedSecret MUST fail validation even with SecretResolver
+		cfgProd := AuthConfig{
+			Enabled:          true,
+			SecretResolver:   func(nodeID string) ([]byte, error) { return []byte("dummy-key-16chars"), nil },
+			SharedSecret:     "fleet-shared-secret-key-16chars",
+			AdminToken:       testAdminToken,
+			TLSCertFile:      certFile,
+			TLSKeyFile:       keyFile,
+			ReplayProtection: true,
+		}
+		if err := cfgProd.Validate("0.0.0.0:8443", true); err == nil {
+			t.Fatalf("expected production Validate to reject non-empty SharedSecret even with SecretResolver")
+		}
+
+		// In development (loopback), SecretResolver takes precedence and resolveNodeSecret never falls through
+		cfgDev := AuthConfig{
+			Enabled: true,
+			SecretResolver: func(nodeID string) ([]byte, error) {
+				if nodeID == "node-alpha" {
+					return []byte("alpha-secret-key-16chars"), nil
+				}
+				return nil, errors.New("unrecognized node")
+			},
+			SharedSecret: "fleet-shared-secret-key-16chars",
+			AdminToken:   testAdminToken,
+		}
+		srv := NewServer(newDiscardLogger())
+		srv.SetAuthConfig(cfgDev)
+
+		// Check resolveNodeSecret directly
+		secretAlpha, err := srv.resolveNodeSecret("node-alpha", cfgDev)
+		if err != nil || string(secretAlpha) != "alpha-secret-key-16chars" {
+			t.Fatalf("expected SecretResolver to resolve node-alpha, got %v (err: %v)", string(secretAlpha), err)
+		}
+
+		_, errUnk := srv.resolveNodeSecret("node-unknown", cfgDev)
+		if errUnk == nil {
+			t.Fatalf("expected resolveNodeSecret to fail for unknown node and NOT fall through to SharedSecret")
+		}
+	})
+}
