@@ -81,9 +81,28 @@ Authenticated edge requests supply four standardized HTTP headers:
 - `X-AegisEdge-Signature`: Hex-encoded HMAC-SHA256 digest computed using the provisioned symmetric key.
 
 #### Credential Isolation Models
-1. **Per-Node Credentials (Recommended)**: The control plane supports static per-node secret mappings (`NodeSecrets map[string]string`) or dynamic lookup callbacks (`SecretResolver func(nodeID string) ([]byte, error)`). Each node holds an independent key ($\ge 16$ characters). A compromised node cannot forge signatures for any other node.
-2. **Fleet Shared Secret (Legacy / Flat Fleet)**: If a single fleet-wide secret is configured (`SharedSecret`), all nodes share one symmetric key. 
-   - *Threat Model Limitation*: A compromised node possessing the fleet secret can forge signatures claiming other node identities unless per-node keys are provisioned. For production environments with multi-tenant or untrusted edge hardware, per-node secrets MUST be used.
+1. **Per-Node Credentials (Required in Production)**: The control plane supports static per-node secret mappings (`NodeSecrets map[string]string`) or dynamic lookup callbacks (`SecretResolver func(nodeID string) ([]byte, error)`). Each node holds an independent key ($\ge 16$ characters). A compromised node cannot forge signatures for any other node.
+   - **Production Credential Injection**: Operators supply per-node secrets via a secure JSON file using the `-node-secrets-file` CLI flag or `NODE_SECRETS_FILE` environment variable.
+   - **File Schema**:
+     ```json
+     {
+       "edge-node-01": "secret-key-alpha-at-least-16chars",
+       "edge-node-02": "secret-key-bravo-at-least-16chars"
+     }
+     ```
+   - **Strict Parser Validation**:
+     - Duplicate keys are strictly rejected fail-closed to prevent ambiguous credential configuration.
+     - Root must be a non-empty JSON object; blank node IDs, blank secrets, non-string values, and keys shorter than 16 characters are rejected.
+     - Error messages are strictly sanitized: secret values are **NEVER** logged or included in error messages.
+     - **File Permission Requirements (Documented vs Enforced)**:
+       - File permission modes are **documented operational requirements**, not runtime-enforced OS-level ACL checks.
+       - *POSIX / Linux*: Operators MUST restrict read access to the service user (`chmod 0600 /path/to/secrets.json`). Standard POSIX permission bits are honored by the operating system kernel.
+       - *Windows*: Standard Unix permission bits (`0600`) do **NOT** provide equivalent isolation on NTFS. On Windows, file access is governed by NTFS Access Control Lists (ACLs) rather than POSIX octal modes. Operators MUST restrict permissions using `icacls` (e.g. `icacls "secrets.json" /inheritance:r /grant:r "SYSTEM:(R)" /grant:r "%USERNAME%:(R)"`) to prevent unauthorized local user read access.
+   - **Production Gate**: In production environments (`ENV=production` / `ENVIRONMENT=production`), per-node credentials (`NodeSecrets` or `SecretResolver`) are strictly required. Missing node secrets or supplying a fleet-wide shared secret causes the control plane to abort startup immediately prior to opening listeners.
+2. **Fleet Shared Secret (Development / Flat Fleet Only)**: If a single fleet-wide secret is configured (`SharedSecret`), all nodes share one symmetric key.
+   - *Threat Model Limitation*: A compromised node possessing the fleet secret can forge signatures claiming other node identities unless per-node keys are provisioned. For production environments with multi-tenant or untrusted edge hardware, per-node secrets MUST be used. Fleet-wide shared secrets are prohibited in production and rejected at startup.
+   - *No Fall-Through Invariant*: When per-node credentials (`NodeSecrets` or `SecretResolver`) are configured, failed lookups for unknown nodes or lookup errors **NEVER** fall through to `SharedSecret`.
+   - *In-Memory Replay Limitation*: Nonce tracking operates in-memory (`ReplayCache`); in multi-replica control-plane deployments, a shared distributed cache (e.g. Redis) is required to guarantee replay protection across distinct instances.
 
 ---
 
