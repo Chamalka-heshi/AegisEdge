@@ -24,31 +24,107 @@ const (
 
 // ServerConfig holds runtime configuration for the control plane.
 type ServerConfig struct {
-	Host         string
-	Port         int
-	LogLevel     string
-	NATSEnabled  bool
-	NATSURL      string
-	AuthEnabled  bool
-	SharedSecret string
-	AdminToken   string
-	MaxClockSkew time.Duration
-	TLSCertFile  string
-	TLSKeyFile   string
+	Host            string
+	Port            int
+	LogLevel        string
+	NATSEnabled     bool
+	NATSURL         string
+	AuthEnabled     bool
+	SharedSecret    string
+	NodeSecretsFile string
+	AdminToken      string
+	MaxClockSkew    time.Duration
+	TLSCertFile     string
+	TLSKeyFile      string
+}
+
+// BuildServerConfig constructs and validates ServerConfig and AuthConfig from CLI flags and environment variables.
+func BuildServerConfig(flags ServerConfig, isProduction bool) (ServerConfig, server.AuthConfig, error) {
+	cfg := flags
+
+	// Environment variable defaults (CLI flags take precedence if specified)
+	if cfg.Host == "" || cfg.Host == "127.0.0.1" {
+		if hostStr := strings.TrimSpace(os.Getenv("HOST")); hostStr != "" {
+			cfg.Host = hostStr
+		}
+	}
+	if !cfg.AuthEnabled {
+		if authStr := strings.TrimSpace(os.Getenv("AUTH_ENABLED")); authStr != "" {
+			if strings.ToLower(authStr) == "true" || authStr == "1" {
+				cfg.AuthEnabled = true
+			}
+		}
+	}
+	if cfg.SharedSecret == "" {
+		if sec := strings.TrimSpace(os.Getenv("SHARED_SECRET")); sec != "" {
+			cfg.SharedSecret = sec
+			cfg.AuthEnabled = true
+		}
+	}
+	if cfg.NodeSecretsFile == "" {
+		if nsf := strings.TrimSpace(os.Getenv("NODE_SECRETS_FILE")); nsf != "" {
+			cfg.NodeSecretsFile = nsf
+			cfg.AuthEnabled = true
+		}
+	}
+	if cfg.AdminToken == "" {
+		if tok := strings.TrimSpace(os.Getenv("ADMIN_TOKEN")); tok != "" {
+			cfg.AdminToken = tok
+		}
+	}
+	if cfg.TLSCertFile == "" {
+		if cert := strings.TrimSpace(os.Getenv("TLS_CERT_FILE")); cert != "" {
+			cfg.TLSCertFile = cert
+		}
+	}
+	if cfg.TLSKeyFile == "" {
+		if key := strings.TrimSpace(os.Getenv("TLS_KEY_FILE")); key != "" {
+			cfg.TLSKeyFile = key
+		}
+	}
+
+	listenAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+
+	var nodeSecrets map[string]string
+	if cfg.NodeSecretsFile != "" {
+		var err error
+		nodeSecrets, err = server.LoadNodeSecretsFile(cfg.NodeSecretsFile)
+		if err != nil {
+			return cfg, server.AuthConfig{}, fmt.Errorf("failed to load node secrets file: %w", err)
+		}
+	}
+
+	authConfig := server.AuthConfig{
+		Enabled:          cfg.AuthEnabled,
+		SharedSecret:     cfg.SharedSecret,
+		NodeSecrets:      nodeSecrets,
+		AdminToken:       cfg.AdminToken,
+		MaxClockSkew:     cfg.MaxClockSkew,
+		ReplayProtection: true,
+		TLSCertFile:      cfg.TLSCertFile,
+		TLSKeyFile:       cfg.TLSKeyFile,
+	}
+
+	if err := authConfig.Validate(listenAddr, isProduction); err != nil {
+		return cfg, authConfig, fmt.Errorf("invalid security configuration: %w", err)
+	}
+
+	return cfg, authConfig, nil
 }
 
 func main() {
 	var (
-		showVersion  = flag.Bool("version", false, "Print version and exit")
-		host         = flag.String("host", "127.0.0.1", "HTTP server listening host interface")
-		port         = flag.Int("port", 8080, "HTTP server listening port")
-		logLevel     = flag.String("log-level", "info", "Logging level (debug, info, warn, error)")
-		authEnabled  = flag.Bool("auth-enabled", false, "Enable HMAC and Bearer authentication")
-		sharedSecret = flag.String("shared-secret", "", "Shared secret for edge node HMAC authentication")
-		adminToken   = flag.String("admin-token", "", "Admin Bearer token for privileged control-plane endpoints")
-		maxClockSkew = flag.Duration("max-clock-skew", 5*time.Minute, "Maximum allowed clock skew for requests")
-		tlsCertFile  = flag.String("tls-cert", "", "Path to TLS certificate file")
-		tlsKeyFile   = flag.String("tls-key", "", "Path to TLS private key file")
+		showVersion     = flag.Bool("version", false, "Print version and exit")
+		host            = flag.String("host", "127.0.0.1", "HTTP server listening host interface")
+		port            = flag.Int("port", 8080, "HTTP server listening port")
+		logLevel        = flag.String("log-level", "info", "Logging level (debug, info, warn, error)")
+		authEnabled     = flag.Bool("auth-enabled", false, "Enable HMAC and Bearer authentication")
+		sharedSecret    = flag.String("shared-secret", "", "Shared secret for edge node HMAC authentication")
+		nodeSecretsFile = flag.String("node-secrets-file", "", "Path to JSON file containing per-node secrets mapping")
+		adminToken      = flag.String("admin-token", "", "Admin Bearer token for privileged control-plane endpoints")
+		maxClockSkew    = flag.Duration("max-clock-skew", 5*time.Minute, "Maximum allowed clock skew for requests")
+		tlsCertFile     = flag.String("tls-cert", "", "Path to TLS certificate file")
+		tlsKeyFile      = flag.String("tls-key", "", "Path to TLS private key file")
 	)
 	flag.Parse()
 
@@ -57,42 +133,18 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg := ServerConfig{
-		Host:         *host,
-		Port:         *port,
-		LogLevel:     *logLevel,
-		AuthEnabled:  *authEnabled,
-		SharedSecret: *sharedSecret,
-		AdminToken:   *adminToken,
-		MaxClockSkew: *maxClockSkew,
-		TLSCertFile:  *tlsCertFile,
-		TLSKeyFile:   *tlsKeyFile,
+	rawFlags := ServerConfig{
+		Host:            *host,
+		Port:            *port,
+		LogLevel:        *logLevel,
+		AuthEnabled:     *authEnabled,
+		SharedSecret:    *sharedSecret,
+		NodeSecretsFile: *nodeSecretsFile,
+		AdminToken:      *adminToken,
+		MaxClockSkew:    *maxClockSkew,
+		TLSCertFile:     *tlsCertFile,
+		TLSKeyFile:      *tlsKeyFile,
 	}
-
-	// Environment variable overrides
-	if hostStr := strings.TrimSpace(os.Getenv("HOST")); hostStr != "" {
-		cfg.Host = hostStr
-	}
-	if authStr := strings.TrimSpace(os.Getenv("AUTH_ENABLED")); authStr != "" {
-		if strings.ToLower(authStr) == "true" || authStr == "1" {
-			cfg.AuthEnabled = true
-		}
-	}
-	if sec := strings.TrimSpace(os.Getenv("SHARED_SECRET")); sec != "" {
-		cfg.SharedSecret = sec
-		cfg.AuthEnabled = true
-	}
-	if tok := strings.TrimSpace(os.Getenv("ADMIN_TOKEN")); tok != "" {
-		cfg.AdminToken = tok
-	}
-	if cert := strings.TrimSpace(os.Getenv("TLS_CERT_FILE")); cert != "" {
-		cfg.TLSCertFile = cert
-	}
-	if key := strings.TrimSpace(os.Getenv("TLS_KEY_FILE")); key != "" {
-		cfg.TLSKeyFile = key
-	}
-
-	listenAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	// Environment posture check
 	envStr := strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
@@ -101,21 +153,13 @@ func main() {
 	}
 	isProduction := envStr == "production" || envStr == "prod"
 
-	authConfig := server.AuthConfig{
-		Enabled:          cfg.AuthEnabled,
-		SharedSecret:     cfg.SharedSecret,
-		AdminToken:       cfg.AdminToken,
-		MaxClockSkew:     cfg.MaxClockSkew,
-		ReplayProtection: true,
-		TLSCertFile:      cfg.TLSCertFile,
-		TLSKeyFile:       cfg.TLSKeyFile,
-	}
-
-	// Fail closed if configuration fails safety validation
-	if err := authConfig.Validate(listenAddr, isProduction); err != nil {
-		fmt.Fprintf(os.Stderr, "FATAL: invalid security configuration: %v\n", err)
+	cfg, authConfig, err := BuildServerConfig(rawFlags, isProduction)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
 		os.Exit(1)
 	}
+
+	listenAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	// NATS configuration from environment
 	if natsStr := strings.TrimSpace(os.Getenv("NATS_ENABLED")); natsStr != "" {
