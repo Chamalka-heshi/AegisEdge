@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -111,6 +113,8 @@ func (c *ReplayCache) Len() int {
 }
 
 // resolveNodeSecret retrieves the appropriate symmetric secret for the claimed node ID.
+// If per-node credentials (SecretResolver or NodeSecrets) are configured, lookup MUST NOT fall through
+// to SharedSecret if the node is unknown or resolution fails.
 func (s *Server) resolveNodeSecret(nodeID string, cfg AuthConfig) ([]byte, error) {
 	if cfg.SecretResolver != nil {
 		secret, err := cfg.SecretResolver(nodeID)
@@ -272,6 +276,9 @@ func (c AuthConfig) Validate(listenAddr string, isProduction bool) error {
 		if c.AdminToken == "" {
 			return errors.New("admin token is required in production")
 		}
+		if c.SharedSecret != "" {
+			return errors.New("fleet-wide shared secret is strictly prohibited in production; per-node credentials (NodeSecrets or SecretResolver) must be used exclusively")
+		}
 		if len(c.NodeSecrets) == 0 && c.SecretResolver == nil {
 			return errors.New("production environment requires per-node credentials (NodeSecrets or SecretResolver); fleet-wide shared secret is prohibited in production")
 		}
@@ -338,4 +345,99 @@ func ValidateTLSConfig(certFile, keyFile string) error {
 	}
 
 	return nil
+}
+
+// LoadNodeSecretsFile reads, parses, and validates a JSON file containing per-node secrets.
+// It maps node IDs to individual symmetric secrets (nodeID -> secret).
+// It rejects malformed JSON, duplicate keys, empty node IDs, empty secrets, and secrets shorter than 16 characters.
+// In accordance with security requirements, secret values are NEVER printed or formatted in returned error messages.
+func LoadNodeSecretsFile(filePath string) (map[string]string, error) {
+	cleanPath := strings.TrimSpace(filePath)
+	if cleanPath == "" {
+		return nil, errors.New("node secrets file path cannot be empty")
+	}
+
+	data, err := os.ReadFile(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read node secrets file %q: %w", cleanPath, err)
+	}
+
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, fmt.Errorf("node secrets file %q is empty", cleanPath)
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+
+	// Ensure top-level token is an opening brace '{'
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse node secrets JSON: %w", err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return nil, errors.New("invalid node secrets JSON: root must be a JSON object")
+	}
+
+	secrets := make(map[string]string)
+
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse key in node secrets JSON: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, errors.New("invalid node secrets JSON: expected string key")
+		}
+
+		// Reject duplicate keys rather than silently overwriting
+		if _, exists := secrets[key]; exists {
+			return nil, fmt.Errorf("invalid node secrets JSON: duplicate key detected for node %q", key)
+		}
+
+		var val string
+		if err := dec.Decode(&val); err != nil {
+			return nil, fmt.Errorf("invalid value for node %q in secrets JSON: expected string", key)
+		}
+
+		nodeID := strings.TrimSpace(key)
+		if nodeID == "" {
+			return nil, errors.New("invalid node secrets JSON: node ID cannot be blank")
+		}
+
+		if !isValidNodeID(nodeID) {
+			return nil, fmt.Errorf("invalid node identifier %q in node secrets JSON", nodeID)
+		}
+
+		secret := strings.TrimSpace(val)
+		if secret == "" {
+			return nil, fmt.Errorf("invalid secret for node %q: secret cannot be empty", nodeID)
+		}
+		if len(secret) < 16 {
+			return nil, fmt.Errorf("invalid secret for node %q: secret must be at least 16 characters for cryptographic security", nodeID)
+		}
+
+		secrets[nodeID] = secret
+	}
+
+	// Read closing brace '}'
+	tok, err = dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse closing token in node secrets JSON: %w", err)
+	}
+	delim, ok = tok.(json.Delim)
+	if !ok || delim != '}' {
+		return nil, errors.New("invalid node secrets JSON: expected closing '}'")
+	}
+
+	// Verify no trailing data after root object
+	if dec.More() {
+		return nil, errors.New("invalid node secrets JSON: unexpected trailing data after JSON object")
+	}
+
+	if len(secrets) == 0 {
+		return nil, errors.New("node secrets file contains no credentials (empty map)")
+	}
+
+	return secrets, nil
 }
