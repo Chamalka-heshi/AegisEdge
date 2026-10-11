@@ -58,6 +58,7 @@ Key architectural decisions are formally documented in `docs/decisions/`:
 * [ADR-0015: Persistent Runtime State & Safe Restart Recovery](docs/decisions/ADR-0015-persistent-runtime-state-and-safe-restart-recovery.md)
 * [ADR-0016: Edge ↔ Control-Plane Coordination Layer](docs/decisions/ADR-0016-edge-control-plane-coordination.md)
 * [ADR-0017: Secure Edge–Control-Plane Communication](docs/decisions/ADR-0017-secure-edge-control-plane-communication.md)
+* [ADR-0018: Security Regression & Adversarial Testing Suite](docs/decisions/ADR-0018-security-regression-testing.md)
 
 ---
 
