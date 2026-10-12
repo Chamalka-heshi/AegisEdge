@@ -58,6 +58,7 @@ type ReplayCache struct {
 	mu         sync.Mutex
 	seen       map[string]time.Time
 	maxEntries int
+	nowFunc    func() time.Time
 }
 
 // NewReplayCache constructs a ReplayCache with the specified capacity limit.
@@ -68,7 +69,38 @@ func NewReplayCache(maxEntries int) *ReplayCache {
 	return &ReplayCache{
 		seen:       make(map[string]time.Time),
 		maxEntries: maxEntries,
+		nowFunc: func() time.Time {
+			return time.Now().UTC()
+		},
 	}
+}
+
+// SetNowFunc overrides the internal clock provider for deterministic testing.
+func (c *ReplayCache) SetNowFunc(fn func() time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fn == nil {
+		c.nowFunc = func() time.Time { return time.Now().UTC() }
+	} else {
+		c.nowFunc = fn
+	}
+}
+
+// PruneExpired explicitly removes all expired nonces relative to the current cache time.
+// Returns the number of entries pruned.
+func (c *ReplayCache) PruneExpired() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.nowFunc()
+	pruned := 0
+	for k, exp := range c.seen {
+		if now.After(exp) {
+			delete(c.seen, k)
+			pruned++
+		}
+	}
+	return pruned
 }
 
 // CheckAndAdd verifies whether a nonce is novel. If novel, it is recorded with an expiration
@@ -77,7 +109,7 @@ func (c *ReplayCache) CheckAndAdd(nonce string, expiry time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	now := time.Now().UTC()
+	now := c.nowFunc()
 
 	// Check for duplicate nonce
 	if exp, exists := c.seen[nonce]; exists {
