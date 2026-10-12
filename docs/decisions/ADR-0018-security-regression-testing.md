@@ -54,15 +54,27 @@ The Phase 6.16 test suite covers the following security properties:
 
 ---
 
-## 3. Replay-Cache Architecture & Architectural Limitations
+## 3. Replay-Cache Lifecycle, Capacity Policy & Request Hardening
+
+### 3.1 Lifecycle, Capacity & Expiration Policy
+- **Memory Bounding & Fixed Ceiling**: `ReplayCache` enforces an upper capacity limit (`maxEntries`, default: `DefaultMaxReplayKeys = 100,000`).
+- **Amortized Sliding-Window Pruning**: When the cache reaches half-capacity (`len(seen) >= maxEntries/2`), expired nonces whose TTL has elapsed relative to the server clock are pruned during insertion.
+- **Fail-Closed on Saturation**: If the cache reaches maximum capacity (`len(seen) >= maxEntries`) and no entries can be pruned (e.g. under an intense legitimate burst or novel nonce flood), `CheckAndAdd` returns `false` (HTTP `401 Unauthorized`, `replay_detected`). The cache **never evicts active, unexpired nonces** via arbitrary LRU or FIFO schemes, ensuring that capacity handling never silently weakens replay protection.
+- **Deterministic Time Boundaries**: For predictable testing and clock skew auditing, `ReplayCache` supports deterministic clock injection (`SetNowFunc`) and explicit expiration sweeps (`PruneExpired()`).
+
+### 3.2 Request Lifecycle & Downstream Cancellation
+- **Synchronous In-Memory Handler Boundary**: Control-plane HTTP handlers (`/healthz`, `/api/v1/telemetry/batches`, `/api/v1/nodes/*`) operate strictly synchronously against in-memory registries (`s.ingested`, `s.nodes`) under mutexes (`s.mu`). Handlers do not spawn unmanaged long-lived background goroutines on behalf of incoming requests.
+- **Client Disconnect Termination**: When an HTTP client aborts or disconnects in flight, the standard library `http.Request.Context()` transitions to `<-ctx.Done()`. Standard library context cancellation propagation is verified via `TestAdversarial_Lifecycle_HTTPRequestContextCancellation`, which utilizes an inline test handler to assert that server-side request contexts unblock upon client cancellation (this test verifies standard library plumbing, not production-handler execution or goroutine-leak freedom).
+- **Controlled Downstream Transports**: On the edge agent side, coordination (`edge/agent/coordination`) and syncer (`edge/agent/sync`) pass bounded, cancellable contexts to HTTP client operations (`doPost`, `SyncBatch`). When a client context expires, requests abort immediately and local database transactions in SQLite remain safe and unmutated.
 
 > [!WARNING]
-> **MULTI-REPLICA LIMITATION NOTICE:**  
-> The current `ReplayCache` is thread-safe and memory-bounded within the **local process memory**.  
-> In multi-replica active-active control-plane deployments operating behind a stateless round-robin load balancer, a captured request could theoretically be replayed against a different control-plane instance within the clock skew window.  
-> **Production Recommendation**: Deployments utilizing multiple active control-plane instances MUST either:
+> **MULTI-REPLICA DEPLOYMENT BOUNDARY:**
+> The current `ReplayCache` is thread-safe and memory-bounded within the **local process memory**.
+> In multi-replica active-active control-plane deployments operating behind a stateless round-robin load balancer without sticky sessions, a captured request could theoretically be replayed against a different control-plane instance within the clock skew window.
+> **Deployment Requirements for Clustered Control Planes**:
+> Deployments utilizing multiple active control-plane instances MUST either:
 > 1. Use stateful L7 load balancing with consistent hashing / session affinity on `X-AegisEdge-Node-ID`, OR
-> 2. Introduce a distributed shared cache (e.g. Redis) for synchronized nonce deduplication across cluster nodes.
+> 2. Introduce a distributed shared cache (e.g. Redis / Valkey) for synchronized nonce deduplication across cluster nodes. (Documented as an architectural deployment boundary for future multi-node clustering phases).
 
 ---
 
@@ -82,7 +94,7 @@ The Phase 6.16 test suite covers the following security properties:
 ## 5. Verification Summary
 
 The regression suite is verified across:
-1. `services/control-plane/server/security_regression_test.go`: Adversarial protocol tampering, query string mutation, replay defense integrity, admin authorization tiers, trailing data rejection, and concurrent multi-node authentication.
-2. `services/control-plane/server/auth_test.go`: Core authentication, per-node credential isolation, duplicate key rejection, and production gate checks.
+1. `services/control-plane/server/security_regression_test.go`: Adversarial protocol tampering, query string mutation, replay defense integrity, deterministic time pruning, capacity ceiling fail-closed behavior, standard-library HTTP request-context cancellation via an inline test handler, admin authorization tiers, trailing data rejection, and concurrent multi-node authentication.
+2. `services/control-plane/server/auth_test.go`: Core authentication, per-node credential isolation, duplicate key rejection, concurrent nonce replay rejection, and production gate checks.
 3. `services/control-plane/main_test.go`: CLI vs environment variable configuration precedence and fail-closed startup validation.
 4. `edge/agent/sync/offline_regression_test.go`: Offline persistence, sequence gap prevention, and non-destructive failure handling.
