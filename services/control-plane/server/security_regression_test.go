@@ -274,22 +274,132 @@ func TestAdversarial_Replay_InvalidSignatureDoesNotConsumeNonce(t *testing.T) {
 func TestAdversarial_Replay_ExpiredEntriesPruned(t *testing.T) {
 	cache := server.NewReplayCache(10)
 
-	// Add an expired nonce
+	// 1. Add an expired nonce
 	expiredNonce := "expired-nonce-001"
 	pastTime := time.Now().UTC().Add(-10 * time.Minute)
 	if !cache.CheckAndAdd(expiredNonce, pastTime) {
 		t.Fatalf("expected adding expired nonce to succeed initially")
 	}
 
-	// Adding same nonce with future time should succeed because prior entry was expired
+	// 2. Adding same nonce with future time should succeed because prior entry was expired
 	futureTime := time.Now().UTC().Add(5 * time.Minute)
 	if !cache.CheckAndAdd(expiredNonce, futureTime) {
 		t.Errorf("expected expired nonce to be refreshable")
 	}
 
-	// Adding it again with future time should fail (replay detected)
+	// 3. Adding it again with future time should fail (replay detected)
 	if cache.CheckAndAdd(expiredNonce, futureTime) {
 		t.Errorf("expected duplicate valid nonce to be rejected")
+	}
+
+	// 4. Add another distinct nonce with an expired timestamp
+	anotherExpiredNonce := "expired-nonce-002"
+	if !cache.CheckAndAdd(anotherExpiredNonce, pastTime) {
+		t.Fatalf("expected adding second expired nonce to succeed")
+	}
+
+	// Cache now contains exactly 2 entries:
+	// - "expired-nonce-001" with futureTime (active)
+	// - "expired-nonce-002" with pastTime (expired)
+	if cache.Len() != 2 {
+		t.Fatalf("expected cache len 2 before prune, got %d", cache.Len())
+	}
+
+	// Explicit prune must remove exactly the 1 expired entry ("expired-nonce-002")
+	pruned := cache.PruneExpired()
+	if pruned != 1 {
+		t.Errorf("expected exactly 1 expired entry pruned, got %d", pruned)
+	}
+
+	// Active entry must remain
+	if cache.Len() != 1 {
+		t.Errorf("expected cache len 1 after prune, got %d", cache.Len())
+	}
+
+	// Active entry must still trigger replay rejection
+	if cache.CheckAndAdd(expiredNonce, futureTime) {
+		t.Errorf("expected active nonce to still be rejected after pruning expired entries")
+	}
+}
+
+func TestAdversarial_Replay_DeterministicTimeAndPruning(t *testing.T) {
+	cache := server.NewReplayCache(10)
+
+	baseTime := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	currentTime := baseTime
+	cache.SetNowFunc(func() time.Time {
+		return currentTime
+	})
+
+	nonce := "det-nonce-001"
+	expiry := baseTime.Add(5 * time.Minute) // expires at 12:05
+
+	// 1. Initial registration at 12:00 succeeds
+	if !cache.CheckAndAdd(nonce, expiry) {
+		t.Fatalf("expected initial nonce check to succeed")
+	}
+
+	// 2. Replay at 12:04 fails (before expiry)
+	currentTime = baseTime.Add(4 * time.Minute)
+	if cache.CheckAndAdd(nonce, expiry) {
+		t.Errorf("expected replay at 12:04 to be rejected")
+	}
+
+	// 3. At 12:04, Len should be 1
+	if cache.Len() != 1 {
+		t.Errorf("expected cache len 1 at 12:04, got %d", cache.Len())
+	}
+
+	// 4. Advance time past expiry to 12:06: explicit prune removes it
+	currentTime = baseTime.Add(6 * time.Minute)
+	pruned := cache.PruneExpired()
+	if pruned != 1 {
+		t.Errorf("expected exactly 1 entry pruned at 12:06, got %d", pruned)
+	}
+	if cache.Len() != 0 {
+		t.Errorf("expected cache len 0 after pruning, got %d", cache.Len())
+	}
+
+	// 5. Subsequent submission with new expiry after prune succeeds
+	newExpiry := currentTime.Add(5 * time.Minute)
+	if !cache.CheckAndAdd(nonce, newExpiry) {
+		t.Errorf("expected new submission after expiry and prune to succeed")
+	}
+}
+
+func TestAdversarial_Replay_CapacityCeilingNeverWeakensReplay(t *testing.T) {
+	// Cache with small capacity limit of 4 entries
+	maxCap := 4
+	cache := server.NewReplayCache(maxCap)
+
+	baseTime := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	cache.SetNowFunc(func() time.Time { return baseTime })
+
+	futureExpiry := baseTime.Add(10 * time.Minute)
+
+	// Fill cache to capacity (4 entries) with active nonces
+	activeNonces := []string{"active-1", "active-2", "active-3", "active-4"}
+	for _, n := range activeNonces {
+		if !cache.CheckAndAdd(n, futureExpiry) {
+			t.Fatalf("failed to add active nonce %s to capacity", n)
+		}
+	}
+
+	if cache.Len() != maxCap {
+		t.Fatalf("expected cache len %d, got %d", maxCap, cache.Len())
+	}
+
+	// Attempt to add a 5th novel nonce: must fail closed (return false)
+	novelNonce := "novel-overflow"
+	if cache.CheckAndAdd(novelNonce, futureExpiry) {
+		t.Fatalf("CRITICAL SECURITY DEFECT: cache exceeded capacity ceiling without failing closed!")
+	}
+
+	// Ensure NONE of the active nonces can be replayed despite capacity saturation
+	for _, n := range activeNonces {
+		if cache.CheckAndAdd(n, futureExpiry) {
+			t.Fatalf("CRITICAL SECURITY DEFECT: replay of %s was permitted under capacity saturation!", n)
+		}
 	}
 }
 
@@ -469,5 +579,71 @@ func TestAdversarial_Concurrency_ContextCancellation(t *testing.T) {
 	_, err := http.DefaultClient.Do(req)
 	if err == nil {
 		t.Errorf("expected client request to fail with cancelled context, got nil error")
+	}
+}
+
+func TestAdversarial_Lifecycle_HTTPRequestContextCancellation(t *testing.T) {
+	// Verifies standard-library HTTP request-context cancellation behavior using an inline test handler.
+	// NOTE: This test asserts that standard net/http server and client plumbing properly propagates
+	// context cancellation upon client disconnect. It does NOT exercise production handlers or prove
+	// production goroutine-leak freedom.
+	requestReceived := make(chan struct{})
+	serverSawContextDone := make(chan struct{})
+
+	srv := server.NewServer(nil)
+	srv.SetAuthConfig(server.AuthConfig{
+		Enabled:    false, // simplifies handler entry for lifecycle cancellation testing
+		AdminToken: regTestAdminToken,
+	})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Signal deterministically that the handler has received the request
+		close(requestReceived)
+
+		// Wait for request context cancellation
+		<-r.Context().Done()
+		close(serverSawContextDone)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	clientErrChan := make(chan error, 1)
+	go func() {
+		_, clientErr := http.DefaultClient.Do(req)
+		clientErrChan <- clientErr
+	}()
+
+	// Deterministically wait for request to arrive at the server handler before cancelling context
+	select {
+	case <-requestReceived:
+		// Request has arrived at the server handler
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for request to reach server handler")
+	}
+
+	// Cancel context to simulate client disconnect
+	cancel()
+
+	// Assert client unblocks immediately
+	select {
+	case err := <-clientErrChan:
+		if err == nil {
+			t.Errorf("expected client to report error on context cancel")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("client hung after context cancellation")
+	}
+
+	// Assert server observes context cancellation deterministically
+	select {
+	case <-serverSawContextDone:
+		// Succeeded: server context was cancelled and unblocked
+	case <-time.After(1 * time.Second):
+		t.Fatalf("server did not receive context cancellation within deadline")
 	}
 }
