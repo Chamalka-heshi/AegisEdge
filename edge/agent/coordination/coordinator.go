@@ -81,7 +81,10 @@ type Coordinator struct {
 	seqNumber int64
 
 	currentBackoff time.Duration
+	retryDelay     time.Duration
 	registered     bool
+
+	timerFunc func(d time.Duration) (<-chan time.Time, func() bool)
 }
 
 // NewCoordinator constructs a new Coordinator.
@@ -126,7 +129,26 @@ func NewCoordinator(
 		healthTracker:  healthTracker,
 		auditRec:       auditRec,
 		currentBackoff: cfg.InitialReconnectInterval,
+		retryDelay:     cfg.InitialReconnectInterval,
+		timerFunc: func(d time.Duration) (<-chan time.Time, func() bool) {
+			t := time.NewTimer(d)
+			return t.C, t.Stop
+		},
 	}
+}
+
+// BackoffDuration returns the current backoff delay in a concurrency-safe manner.
+func (c *Coordinator) BackoffDuration() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.currentBackoff
+}
+
+// SetTimerFuncForTest configures an alternative timer constructor for deterministic testing.
+func (c *Coordinator) SetTimerFuncForTest(fn func(d time.Duration) (<-chan time.Time, func() bool)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timerFunc = fn
 }
 
 // Tracker returns the underlying StateTracker.
@@ -179,6 +201,33 @@ func (c *Coordinator) Stop(ctx context.Context) error {
 	}
 }
 
+func (c *Coordinator) nextInterval() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// If registered and connected, run on normal heartbeat cadence.
+	if c.registered && c.tracker.State() == StateConnected {
+		return c.cfg.HeartbeatInterval
+	}
+	// When disconnected or degraded, schedule next attempt according to recorded retry delay.
+	if c.retryDelay <= 0 {
+		return c.cfg.InitialReconnectInterval
+	}
+	return c.retryDelay
+}
+
+func (c *Coordinator) waitWithBackoff(ctx context.Context, d time.Duration) bool {
+	ch, stop := c.timerFunc(d)
+	defer stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-ch:
+		return true
+	}
+}
+
 func (c *Coordinator) run(ctx context.Context) {
 	defer close(c.done)
 
@@ -187,23 +236,23 @@ func (c *Coordinator) run(ctx context.Context) {
 	// Initial registration attempt
 	c.attemptRegistration(ctx)
 
-	ticker := time.NewTicker(c.cfg.HeartbeatInterval)
-	defer ticker.Stop()
-
 	for {
-		select {
-		case <-ctx.Done():
+		interval := c.nextInterval()
+		if !c.waitWithBackoff(ctx, interval) {
 			slog.Info("coordination manager stopped", "node_id", c.cfg.NodeID)
 			return
-
-		case <-ticker.C:
-			if !c.registered {
-				c.attemptRegistration(ctx)
-				continue
-			}
-
-			c.sendHeartbeat(ctx)
 		}
+
+		c.mu.Lock()
+		isRegistered := c.registered
+		c.mu.Unlock()
+
+		if !isRegistered {
+			c.attemptRegistration(ctx)
+			continue
+		}
+
+		c.sendHeartbeat(ctx)
 	}
 }
 
@@ -267,8 +316,11 @@ func (c *Coordinator) attemptRegistration(ctx context.Context) {
 		return
 	}
 
+	c.mu.Lock()
 	c.registered = true
 	c.currentBackoff = c.cfg.InitialReconnectInterval
+	c.retryDelay = c.cfg.InitialReconnectInterval
+	c.mu.Unlock()
 
 	regStatus := "success"
 	if resp != nil && resp.Status == "already_registered" {
@@ -331,7 +383,9 @@ func (c *Coordinator) sendHeartbeat(ctx context.Context) {
 
 		if errors.Is(err, ErrNodeNotFound) {
 			slog.Warn("control plane reported node not found, re-registering", "node_id", c.cfg.NodeID)
+			c.mu.Lock()
 			c.registered = false
+			c.mu.Unlock()
 			c.attemptRegistration(ctx)
 			return
 		}
@@ -343,7 +397,10 @@ func (c *Coordinator) sendHeartbeat(ctx context.Context) {
 
 	// Successful heartbeat
 	c.tracker.RecordHeartbeat(ctx, true, duration, "")
+	c.mu.Lock()
 	c.currentBackoff = c.cfg.InitialReconnectInterval
+	c.retryDelay = c.cfg.InitialReconnectInterval
+	c.mu.Unlock()
 
 	if c.tracker.State() != StateConnected {
 		c.tracker.Transition(ctx, StateConnected, "heartbeat restored connection")
@@ -353,7 +410,18 @@ func (c *Coordinator) sendHeartbeat(ctx context.Context) {
 func (c *Coordinator) scheduleReconnect(ctx context.Context) {
 	c.metrics.RecordControlPlaneReconnect()
 
+	c.mu.Lock()
 	backoff := c.currentBackoff
+	c.retryDelay = backoff
+
+	// Increase backoff exponentially for next failure, capped at MaxReconnectInterval
+	nextBackoff := time.Duration(float64(c.currentBackoff) * c.cfg.BackoffFactor)
+	if nextBackoff > c.cfg.MaxReconnectInterval {
+		nextBackoff = c.cfg.MaxReconnectInterval
+	}
+	c.currentBackoff = nextBackoff
+	c.mu.Unlock()
+
 	if c.auditRec != nil {
 		_ = c.auditRec.Record(ctx, audit.AuditEvent{
 			EventType:  audit.EventTypeControlPlaneReconnectSched,
@@ -367,11 +435,4 @@ func (c *Coordinator) scheduleReconnect(ctx context.Context) {
 			Timestamp: time.Now().UTC(),
 		})
 	}
-
-	// Increase backoff exponentially for next failure, capped at MaxReconnectInterval
-	nextBackoff := time.Duration(float64(c.currentBackoff) * c.cfg.BackoffFactor)
-	if nextBackoff > c.cfg.MaxReconnectInterval {
-		nextBackoff = c.cfg.MaxReconnectInterval
-	}
-	c.currentBackoff = nextBackoff
 }
