@@ -566,3 +566,238 @@ func TestSQLite_MigrationV2_PublishedAt(t *testing.T) {
 		t.Errorf("published_at column query failed: %v", err)
 	}
 }
+
+// TestSQLite_PruneCompletedBatches verifies all retention and sequence-preservation contracts:
+// 1. Old SYNCED records are pruned.
+// 2. Old PUBLISHED records are pruned.
+// 3. Recent completed records are retained.
+// 4. Old PENDING records are retained.
+// 5. Old FAILED records are retained.
+// 6. Prune limit is respected.
+// 7. Latest sequence number for each node is permanently preserved.
+// 8. Monotonic sequence continuity survives close, reopen, and restart.
+func TestSQLite_PruneCompletedBatches(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "prune_test.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	oldTime := now.Add(-48 * time.Hour)
+	recentTime := now.Add(-10 * time.Minute)
+	cutoff := now.Add(-24 * time.Hour)
+
+	// Node 1:
+	// batch-1: old SYNCED (seq 1) -> eligible for prune
+	// batch-2: old SYNCED (seq 2) -> eligible for prune
+	// batch-3: old PUBLISHED (seq 3) -> eligible for prune
+	// batch-4: recent SYNCED (seq 4) -> NOT eligible (recent)
+	// batch-5: old PENDING (seq 5) -> NOT eligible (pending)
+	// batch-6: old FAILED (seq 6) -> NOT eligible (failed)
+	// batch-7: old SYNCED (seq 7, latest) -> NOT eligible (highest sequence for node-1)
+	b1 := newTestBatch("batch-1", "node-1", 1, oldTime)
+	b2 := newTestBatch("batch-2", "node-1", 2, oldTime)
+	b3 := newTestBatch("batch-3", "node-1", 3, oldTime)
+	b4 := newTestBatch("batch-4", "node-1", 4, recentTime)
+	b5 := newTestBatch("batch-5", "node-1", 5, oldTime)
+	b6 := newTestBatch("batch-6", "node-1", 6, oldTime)
+	b7 := newTestBatch("batch-7", "node-1", 7, oldTime)
+
+	// Node 2:
+	// batch-n2-1: old SYNCED (seq 10) -> eligible for prune
+	// batch-n2-2: old PUBLISHED (seq 20, latest) -> NOT eligible (highest sequence for node-2)
+	bn2_1 := newTestBatch("batch-n2-1", "node-2", 10, oldTime)
+	bn2_2 := newTestBatch("batch-n2-2", "node-2", 20, oldTime)
+
+	for _, b := range []*types.TelemetryBatch{b1, b2, b3, b4, b5, b6, b7, bn2_1, bn2_2} {
+		if err := store.PersistBatch(ctx, b); err != nil {
+			t.Fatalf("PersistBatch %s failed: %v", b.BatchID, err)
+		}
+	}
+
+	// Transition statuses:
+	if err := store.MarkBatchSynced(ctx, "batch-1", oldTime); err != nil {
+		t.Fatalf("MarkBatchSynced batch-1 failed: %v", err)
+	}
+	if err := store.MarkBatchSynced(ctx, "batch-2", oldTime); err != nil {
+		t.Fatalf("MarkBatchSynced batch-2 failed: %v", err)
+	}
+	if err := store.MarkBatchPublished(ctx, "batch-3", oldTime); err != nil {
+		t.Fatalf("MarkBatchPublished batch-3 failed: %v", err)
+	}
+	if err := store.MarkBatchSynced(ctx, "batch-4", recentTime); err != nil {
+		t.Fatalf("MarkBatchSynced batch-4 failed: %v", err)
+	}
+	// batch-5 left as PENDING
+	// batch-6 set to FAILED via direct query:
+	_, err = store.db.ExecContext(ctx, "UPDATE telemetry_batches SET sync_status = 'FAILED' WHERE batch_id = 'batch-6';")
+	if err != nil {
+		t.Fatalf("setting batch-6 to FAILED failed: %v", err)
+	}
+	if err := store.MarkBatchSynced(ctx, "batch-7", oldTime); err != nil {
+		t.Fatalf("MarkBatchSynced batch-7 failed: %v", err)
+	}
+	if err := store.MarkBatchSynced(ctx, "batch-n2-1", oldTime); err != nil {
+		t.Fatalf("MarkBatchSynced batch-n2-1 failed: %v", err)
+	}
+	if err := store.MarkBatchPublished(ctx, "batch-n2-2", oldTime); err != nil {
+		t.Fatalf("MarkBatchPublished batch-n2-2 failed: %v", err)
+	}
+
+	// 1. Test limit bounding: prune with limit = 2
+	pruned, err := store.PruneCompletedBatches(ctx, cutoff, 2)
+	if err != nil {
+		t.Fatalf("PruneCompletedBatches with limit 2 failed: %v", err)
+	}
+	if pruned != 2 {
+		t.Errorf("expected 2 pruned rows with limit=2, got %d", pruned)
+	}
+
+	// 2. Prune remaining eligible batches with limit = 100
+	prunedRemaining, err := store.PruneCompletedBatches(ctx, cutoff, 100)
+	if err != nil {
+		t.Fatalf("PruneCompletedBatches remaining failed: %v", err)
+	}
+	// Eligible were: batch-1, batch-2, batch-3 from node-1 (total 3), and batch-n2-1 from node-2 (total 1). Total eligible = 4.
+	// Since 2 were already pruned, remaining should be 2.
+	if prunedRemaining != 2 {
+		t.Errorf("expected 2 remaining pruned rows, got %d", prunedRemaining)
+	}
+
+	// 3. Verify batch retention
+	// Must be deleted:
+	for _, id := range []string{"batch-1", "batch-2", "batch-3", "batch-n2-1"} {
+		if _, err := store.GetBatch(ctx, id); !errors.Is(err, ErrBatchNotFound) {
+			t.Errorf("expected batch %s to be deleted, got %v", id, err)
+		}
+	}
+	// Must be retained:
+	// batch-4 (recent SYNCED)
+	if _, err := store.GetBatch(ctx, "batch-4"); err != nil {
+		t.Errorf("expected batch-4 to be retained: %v", err)
+	}
+	// batch-5 (old PENDING)
+	if _, err := store.GetBatch(ctx, "batch-5"); err != nil {
+		t.Errorf("expected batch-5 to be retained: %v", err)
+	}
+	// batch-6 (old FAILED)
+	if _, err := store.GetBatch(ctx, "batch-6"); err != nil {
+		t.Errorf("expected batch-6 to be retained: %v", err)
+	}
+	// batch-7 (latest sequence for node-1, preserved despite being old SYNCED)
+	if _, err := store.GetBatch(ctx, "batch-7"); err != nil {
+		t.Errorf("expected batch-7 (highest seq node-1) to be retained: %v", err)
+	}
+	// batch-n2-2 (latest sequence for node-2, preserved despite being old PUBLISHED)
+	if _, err := store.GetBatch(ctx, "batch-n2-2"); err != nil {
+		t.Errorf("expected batch-n2-2 (highest seq node-2) to be retained: %v", err)
+	}
+
+	// 4. Verify sequence continuity across close and reopen
+	seq1, err := store.GetLatestSequenceNumber(ctx, "node-1")
+	if err != nil {
+		t.Fatalf("GetLatestSequenceNumber node-1 failed: %v", err)
+	}
+	if seq1 != 7 {
+		t.Errorf("expected node-1 latest sequence to remain 7, got %d", seq1)
+	}
+	seq2, err := store.GetLatestSequenceNumber(ctx, "node-2")
+	if err != nil {
+		t.Fatalf("GetLatestSequenceNumber node-2 failed: %v", err)
+	}
+	if seq2 != 20 {
+		t.Errorf("expected node-2 latest sequence to remain 20, got %d", seq2)
+	}
+
+	// Close store and reopen to test restart recovery
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close store failed: %v", err)
+	}
+
+	reopenedStore, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("reopened OpenSQLite failed: %v", err)
+	}
+	defer reopenedStore.Close()
+
+	reopenedSeq1, err := reopenedStore.GetLatestSequenceNumber(ctx, "node-1")
+	if err != nil {
+		t.Fatalf("reopened GetLatestSequenceNumber node-1 failed: %v", err)
+	}
+	if reopenedSeq1 != 7 {
+		t.Errorf("expected reopened node-1 latest sequence 7, got %d", reopenedSeq1)
+	}
+
+	reopenedSeq2, err := reopenedStore.GetLatestSequenceNumber(ctx, "node-2")
+	if err != nil {
+		t.Fatalf("reopened GetLatestSequenceNumber node-2 failed: %v", err)
+	}
+	if reopenedSeq2 != 20 {
+		t.Errorf("expected reopened node-2 latest sequence 20, got %d", reopenedSeq2)
+	}
+}
+
+// TestSQLite_PruneCompletedBatches_ConcurrentPersistence ensures concurrent writes
+// and pruning do not cause lock contention failures or corrupt sequence numbers.
+func TestSQLite_PruneCompletedBatches_ConcurrentPersistence(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "concurrent_prune.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	oldTime := now.Add(-48 * time.Hour)
+	cutoff := now.Add(-24 * time.Hour)
+
+	// Insert 10 old synced batches
+	for i := int64(1); i <= 10; i++ {
+		b := newTestBatch(strings.Repeat("a", 8)+string(rune('0'+i)), "node-conc", i, oldTime)
+		if err := store.PersistBatch(ctx, b); err != nil {
+			t.Fatalf("PersistBatch %d failed: %v", i, err)
+		}
+		if err := store.MarkBatchSynced(ctx, b.BatchID, oldTime); err != nil {
+			t.Fatalf("MarkBatchSynced %d failed: %v", i, err)
+		}
+	}
+
+	// Concurrently prune and insert new batches
+	errCh := make(chan error, 2)
+
+	go func() {
+		// Insert 5 new batches
+		for i := int64(11); i <= 15; i++ {
+			b := newTestBatch(strings.Repeat("b", 8)+string(rune('0'+i)), "node-conc", i, time.Now().UTC())
+			if err := store.PersistBatch(ctx, b); err != nil {
+				errCh <- err
+				return
+			}
+		}
+		errCh <- nil
+	}()
+
+	go func() {
+		// Prune
+		_, err := store.PruneCompletedBatches(ctx, cutoff, 5)
+		errCh <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent operation failed: %v", err)
+		}
+	}
+
+	latestSeq, err := store.GetLatestSequenceNumber(ctx, "node-conc")
+	if err != nil {
+		t.Fatalf("GetLatestSequenceNumber failed: %v", err)
+	}
+	if latestSeq < 10 {
+		t.Errorf("expected latest sequence >= 10, got %d", latestSeq)
+	}
+}
