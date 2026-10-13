@@ -863,3 +863,367 @@ func TestCoordination_AuthFailureDegradesSafelyWithoutBlocking(t *testing.T) {
 		t.Fatalf("failed to stop coordinator: %v", err)
 	}
 }
+
+type fakeClientWithCallbacks struct {
+	mu          sync.Mutex
+	onRegister  func(ctx context.Context, reg *types.NodeRegistration) (*RegistrationResponse, error)
+	onHeartbeat func(ctx context.Context, hb *types.Heartbeat) (*HeartbeatResponse, error)
+	onGetNode   func(ctx context.Context, nodeID string) (*types.NodeRegistration, error)
+}
+
+func (f *fakeClientWithCallbacks) RegisterNode(ctx context.Context, reg *types.NodeRegistration) (*RegistrationResponse, error) {
+	f.mu.Lock()
+	fn := f.onRegister
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, reg)
+	}
+	return &RegistrationResponse{Status: "registered"}, nil
+}
+
+func (f *fakeClientWithCallbacks) SendHeartbeat(ctx context.Context, hb *types.Heartbeat) (*HeartbeatResponse, error) {
+	f.mu.Lock()
+	fn := f.onHeartbeat
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, hb)
+	}
+	return &HeartbeatResponse{Status: "ok"}, nil
+}
+
+func (f *fakeClientWithCallbacks) GetNode(ctx context.Context, nodeID string) (*types.NodeRegistration, error) {
+	f.mu.Lock()
+	fn := f.onGetNode
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, nodeID)
+	}
+	return &types.NodeRegistration{NodeID: nodeID}, nil
+}
+
+func TestCoordination_RetryScheduling_ConsecutiveFailuresFollowBackoff(t *testing.T) {
+	// Verifies:
+	// 1. First failure schedules the expected initial retry delay.
+	// 2. Consecutive failures follow the configured backoff factor and maximum.
+	// 3. Delays are genuinely scheduled via timerFunc, not ignored or spun in a tight loop.
+	var scheduledDelays []time.Duration
+	var delaysMu sync.Mutex
+
+	client := &fakeClientWithCallbacks{
+		onRegister: func(ctx context.Context, reg *types.NodeRegistration) (*RegistrationResponse, error) {
+			return nil, errors.New("temporary network outage")
+		},
+	}
+
+	metricRec := metrics.NewDefaultRecorder(nil)
+	auditRec := &fakeAuditRecorder{}
+	tracker := NewTracker("backoff-node-01", metricRec, nil, auditRec)
+
+	cfg := DefaultConfig("backoff-node-01")
+	cfg.HeartbeatInterval = 10 * time.Second
+	cfg.InitialReconnectInterval = 100 * time.Millisecond
+	cfg.BackoffFactor = 2.0
+	cfg.MaxReconnectInterval = 400 * time.Millisecond
+	cfg.RequestTimeout = 50 * time.Millisecond
+
+	coordinator := NewCoordinator(cfg, client, tracker, metricRec, nil, auditRec)
+
+	timerTrigger := make(chan time.Time, 10)
+	coordinator.SetTimerFuncForTest(func(d time.Duration) (<-chan time.Time, func() bool) {
+		delaysMu.Lock()
+		scheduledDelays = append(scheduledDelays, d)
+		delaysMu.Unlock()
+		return timerTrigger, func() bool { return true }
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := coordinator.Start(ctx); err != nil {
+		t.Fatalf("failed to start coordinator: %v", err)
+	}
+
+	// Wait until at least 4 failures have been scheduled
+	for i := 0; i < 4; i++ {
+		// Verify that a delay was recorded before triggering the timer
+		deadline := time.Now().Add(1 * time.Second)
+		for {
+			delaysMu.Lock()
+			count := len(scheduledDelays)
+			delaysMu.Unlock()
+			if count > i {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for scheduled delay %d", i+1)
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+		// Trigger next attempt
+		timerTrigger <- time.Now()
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer stopCancel()
+	_ = coordinator.Stop(stopCtx)
+
+	delaysMu.Lock()
+	defer delaysMu.Unlock()
+
+	if len(scheduledDelays) < 4 {
+		t.Fatalf("expected at least 4 scheduled delays, got %d: %v", len(scheduledDelays), scheduledDelays)
+	}
+
+	// 1st retry delay must match InitialReconnectInterval
+	if scheduledDelays[0] != 100*time.Millisecond {
+		t.Errorf("expected 1st delay to be 100ms, got %v", scheduledDelays[0])
+	}
+	// 2nd retry delay must be initial * factor = 200ms
+	if scheduledDelays[1] != 200*time.Millisecond {
+		t.Errorf("expected 2nd delay to be 200ms, got %v", scheduledDelays[1])
+	}
+	// 3rd retry delay must be capped at MaxReconnectInterval = 400ms
+	if scheduledDelays[2] != 400*time.Millisecond {
+		t.Errorf("expected 3rd delay to be 400ms, got %v", scheduledDelays[2])
+	}
+	// 4th retry delay must remain capped at MaxReconnectInterval = 400ms
+	if scheduledDelays[3] != 400*time.Millisecond {
+		t.Errorf("expected 4th delay to be 400ms, got %v", scheduledDelays[3])
+	}
+}
+
+func TestCoordination_RetryScheduling_RecoveryResetsBackoffAndResumesCadence(t *testing.T) {
+	// Verifies:
+	// 1. Failures increase backoff delay.
+	// 2. Recovery on registration/heartbeat resets backoff to InitialReconnectInterval.
+	// 3. While healthy, normal HeartbeatInterval is scheduled.
+	var scheduledDelays []time.Duration
+	var delaysMu sync.Mutex
+
+	var shouldFail atomic.Bool
+	shouldFail.Store(true)
+
+	client := &fakeClientWithCallbacks{
+		onRegister: func(ctx context.Context, reg *types.NodeRegistration) (*RegistrationResponse, error) {
+			if shouldFail.Load() {
+				return nil, errors.New("transient control plane outage")
+			}
+			return &RegistrationResponse{Status: "registered"}, nil
+		},
+		onHeartbeat: func(ctx context.Context, hb *types.Heartbeat) (*HeartbeatResponse, error) {
+			return &HeartbeatResponse{Status: "ok"}, nil
+		},
+	}
+
+	metricRec := metrics.NewDefaultRecorder(nil)
+	tracker := NewTracker("recovery-node-01", metricRec, nil, nil)
+
+	cfg := DefaultConfig("recovery-node-01")
+	cfg.HeartbeatInterval = 5 * time.Second
+	cfg.InitialReconnectInterval = 50 * time.Millisecond
+	cfg.BackoffFactor = 2.0
+	cfg.MaxReconnectInterval = 500 * time.Millisecond
+
+	coordinator := NewCoordinator(cfg, client, tracker, metricRec, nil, nil)
+
+	timerTrigger := make(chan time.Time, 10)
+	coordinator.SetTimerFuncForTest(func(d time.Duration) (<-chan time.Time, func() bool) {
+		delaysMu.Lock()
+		scheduledDelays = append(scheduledDelays, d)
+		delaysMu.Unlock()
+		return timerTrigger, func() bool { return true }
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := coordinator.Start(ctx); err != nil {
+		t.Fatalf("failed to start coordinator: %v", err)
+	}
+
+	// 1st attempt fails -> schedules 50ms
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		delaysMu.Lock()
+		count := len(scheduledDelays)
+		delaysMu.Unlock()
+		if count >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for 1st delay")
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	// Bring control plane back online
+	shouldFail.Store(false)
+	timerTrigger <- time.Now()
+
+	// Coordinator should now register successfully and schedule HeartbeatInterval (5s)
+	deadline = time.Now().Add(1 * time.Second)
+	for {
+		delaysMu.Lock()
+		count := len(scheduledDelays)
+		delaysMu.Unlock()
+		if count >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for 2nd delay (heartbeat interval)")
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer stopCancel()
+	_ = coordinator.Stop(stopCtx)
+
+	delaysMu.Lock()
+	defer delaysMu.Unlock()
+
+	if scheduledDelays[0] != 50*time.Millisecond {
+		t.Errorf("expected 1st delay to be 50ms, got %v", scheduledDelays[0])
+	}
+	if scheduledDelays[1] != 5*time.Second {
+		t.Errorf("expected 2nd delay after recovery to be HeartbeatInterval (5s), got %v", scheduledDelays[1])
+	}
+	if backoff := coordinator.BackoffDuration(); backoff != 50*time.Millisecond {
+		t.Errorf("expected backoff to be reset to 50ms upon recovery, got %v", backoff)
+	}
+}
+
+func TestCoordination_RetryScheduling_CancellationExitsPromptly(t *testing.T) {
+	// Verifies that when coordinator is waiting in backoff sleep,
+	// cancelling context terminates the run loop immediately without waiting out the duration.
+	timerStopped := make(chan struct{})
+	timerBlocked := make(chan time.Time) // Never fires
+
+	client := &fakeClientWithCallbacks{
+		onRegister: func(ctx context.Context, reg *types.NodeRegistration) (*RegistrationResponse, error) {
+			return nil, errors.New("offline")
+		},
+	}
+
+	tracker := NewTracker("cancel-node-01", nil, nil, nil)
+	cfg := DefaultConfig("cancel-node-01")
+	cfg.InitialReconnectInterval = 1 * time.Hour // Huge duration
+
+	coordinator := NewCoordinator(cfg, client, tracker, nil, nil, nil)
+	coordinator.SetTimerFuncForTest(func(d time.Duration) (<-chan time.Time, func() bool) {
+		return timerBlocked, func() bool {
+			close(timerStopped)
+			return true
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := coordinator.Start(ctx); err != nil {
+		t.Fatalf("failed to start coordinator: %v", err)
+	}
+
+	// Trigger cancellation while coordinator is waiting in 1-hour backoff
+	start := time.Now()
+	cancel()
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	if err := coordinator.Stop(stopCtx); err != nil {
+		t.Fatalf("expected coordinator to stop promptly, got error: %v", err)
+	}
+
+	elapsed := time.Since(start)
+	if elapsed > 1*time.Second {
+		t.Errorf("coordinator took too long to exit on cancellation: %v", elapsed)
+	}
+
+	select {
+	case <-timerStopped:
+		// Timer stop func was invoked cleanly
+	case <-time.After(100 * time.Millisecond):
+		t.Errorf("expected timer cleanup/stop func to be called")
+	}
+}
+
+func TestCoordination_RetryScheduling_OfflineTelemetryPreserved(t *testing.T) {
+	// Verifies the core invariant:
+	// EDGE OPERATES OFFLINE -> PERSISTS TO WAL -> RECONNECTS
+	// While the control plane is failing and backoff is active,
+	// the edge agent remains healthy/ready and local storage persists batches without blockage.
+	dbPath := t.TempDir() + "/offline_durability.db"
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	client := &fakeClientWithCallbacks{
+		onRegister: func(ctx context.Context, reg *types.NodeRegistration) (*RegistrationResponse, error) {
+			return nil, errors.New("control plane unreachable")
+		},
+	}
+
+	ht := health.NewTracker()
+	_ = ht.RegisterCheck(health.CheckStorage, true)
+	_ = ht.RegisterCheck(health.CheckControlPlane, false)
+	_ = ht.SetCheckStatus(health.CheckStorage, health.StatusOk, "sqlite ready")
+	_ = ht.Transition(health.StateReady)
+
+	metricRec := metrics.NewDefaultRecorder(nil)
+	tracker := NewTracker("durability-node-01", metricRec, ht, nil)
+
+	cfg := DefaultConfig("durability-node-01")
+	cfg.HeartbeatInterval = 50 * time.Millisecond
+	cfg.InitialReconnectInterval = 100 * time.Millisecond
+	cfg.RequestTimeout = 50 * time.Millisecond
+
+	coordinator := NewCoordinator(cfg, client, tracker, metricRec, ht, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := coordinator.Start(ctx); err != nil {
+		t.Fatalf("failed to start coordinator: %v", err)
+	}
+
+	// While control plane is unreachable and coordinator is in degraded state:
+	time.Sleep(50 * time.Millisecond)
+
+	if tracker.State() != StateDegraded {
+		t.Errorf("expected StateDegraded, got %v", tracker.State())
+	}
+	if !ht.IsReady() {
+		t.Errorf("CRITICAL INVARIANT VIOLATION: Edge agent readiness must NOT fail when control plane is degraded")
+	}
+
+	// Edge persists local telemetry to WAL store during control-plane outage
+	batch := &types.TelemetryBatch{
+		BatchID:        "offline-batch-001",
+		NodeID:         "durability-node-01",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics: []types.MetricSample{
+			{
+				Name:      "system.cpu.utilization",
+				Value:     42.5,
+				Timestamp: time.Now().UTC(),
+			},
+		},
+	}
+
+	if err := store.PersistBatch(ctx, batch); err != nil {
+		t.Fatalf("failed to store local batch offline: %v", err)
+	}
+
+	retrieved, err := store.GetBatch(ctx, "offline-batch-001")
+	if err != nil {
+		t.Fatalf("failed to retrieve local batch: %v", err)
+	}
+	if retrieved.BatchID != "offline-batch-001" {
+		t.Errorf("expected offline-batch-001, got %s", retrieved.BatchID)
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer stopCancel()
+	_ = coordinator.Stop(stopCtx)
+}
