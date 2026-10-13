@@ -56,6 +56,18 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	if cfg.MaxReconnectInterval != DefaultMaxReconnectInterval {
 		t.Errorf("expected default MaxReconnectInterval %v, got %v", DefaultMaxReconnectInterval, cfg.MaxReconnectInterval)
 	}
+	if cfg.RetentionEnabled != DefaultRetentionEnabled {
+		t.Errorf("expected default RetentionEnabled %v, got %v", DefaultRetentionEnabled, cfg.RetentionEnabled)
+	}
+	if cfg.RetentionPeriod != DefaultRetentionPeriod {
+		t.Errorf("expected default RetentionPeriod %v, got %v", DefaultRetentionPeriod, cfg.RetentionPeriod)
+	}
+	if cfg.PruneInterval != DefaultPruneInterval {
+		t.Errorf("expected default PruneInterval %v, got %v", DefaultPruneInterval, cfg.PruneInterval)
+	}
+	if cfg.PruneLimit != DefaultPruneLimit {
+		t.Errorf("expected default PruneLimit %v, got %v", DefaultPruneLimit, cfg.PruneLimit)
+	}
 }
 
 func TestLoadFromEnv_Overrides(t *testing.T) {
@@ -72,6 +84,10 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	os.Setenv("AEGISEDGE_HEARTBEAT_INTERVAL", "15s")
 	os.Setenv("AEGISEDGE_RECONNECT_INTERVAL", "2s")
 	os.Setenv("AEGISEDGE_MAX_RECONNECT_INTERVAL", "45s")
+	os.Setenv("AEGISEDGE_RETENTION_ENABLED", "true")
+	os.Setenv("AEGISEDGE_RETENTION_PERIOD", "48h")
+	os.Setenv("AEGISEDGE_PRUNE_INTERVAL", "30m")
+	os.Setenv("AEGISEDGE_PRUNE_LIMIT", "250")
 	defer func() {
 		os.Unsetenv("AEGISEDGE_NODE_ID")
 		os.Unsetenv("AEGISEDGE_DATABASE_PATH")
@@ -86,6 +102,10 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 		os.Unsetenv("AEGISEDGE_HEARTBEAT_INTERVAL")
 		os.Unsetenv("AEGISEDGE_RECONNECT_INTERVAL")
 		os.Unsetenv("AEGISEDGE_MAX_RECONNECT_INTERVAL")
+		os.Unsetenv("AEGISEDGE_RETENTION_ENABLED")
+		os.Unsetenv("AEGISEDGE_RETENTION_PERIOD")
+		os.Unsetenv("AEGISEDGE_PRUNE_INTERVAL")
+		os.Unsetenv("AEGISEDGE_PRUNE_LIMIT")
 	}()
 
 	cfg := LoadFromEnv()
@@ -128,5 +148,17 @@ func TestLoadFromEnv_Overrides(t *testing.T) {
 	}
 	if cfg.MaxReconnectInterval != 45*time.Second {
 		t.Errorf("expected custom MaxReconnectInterval 45s, got %v", cfg.MaxReconnectInterval)
+	}
+	if !cfg.RetentionEnabled {
+		t.Errorf("expected RetentionEnabled to be true")
+	}
+	if cfg.RetentionPeriod != 48*time.Hour {
+		t.Errorf("expected RetentionPeriod 48h, got %v", cfg.RetentionPeriod)
+	}
+	if cfg.PruneInterval != 30*time.Minute {
+		t.Errorf("expected PruneInterval 30m, got %v", cfg.PruneInterval)
+	}
+	if cfg.PruneLimit != 250 {
+		t.Errorf("expected PruneLimit 250, got %d", cfg.PruneLimit)
 	}
 }
