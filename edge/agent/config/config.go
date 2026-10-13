@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -22,6 +23,10 @@ const (
 	DefaultHeartbeatInterval        = 10 * time.Second
 	DefaultInitialReconnectInterval = 1 * time.Second
 	DefaultMaxReconnectInterval     = 30 * time.Second
+	DefaultRetentionEnabled         = false
+	DefaultRetentionPeriod          = 24 * time.Hour
+	DefaultPruneInterval            = 1 * time.Hour
+	DefaultPruneLimit               = 500
 )
 
 // Config represents runtime configuration parameters for the edge agent.
@@ -46,6 +51,10 @@ type Config struct {
 	MaxReconnectInterval     time.Duration
 	AuthEnabled              bool
 	SharedSecret             string
+	RetentionEnabled         bool
+	RetentionPeriod          time.Duration
+	PruneInterval            time.Duration
+	PruneLimit               int
 }
 
 // LoadFromEnv loads configuration from environment variables, falling back to sensible defaults.
@@ -167,6 +176,35 @@ func LoadFromEnv() Config {
 		authEnabled = true
 	}
 
+	retentionEnabled := DefaultRetentionEnabled
+	if retStr := strings.TrimSpace(os.Getenv("AEGISEDGE_RETENTION_ENABLED")); retStr != "" {
+		if strings.ToLower(retStr) == "true" || retStr == "1" {
+			retentionEnabled = true
+		}
+	}
+
+	retentionPeriod := DefaultRetentionPeriod
+	if retPeriodStr := strings.TrimSpace(os.Getenv("AEGISEDGE_RETENTION_PERIOD")); retPeriodStr != "" {
+		if parsed, err := time.ParseDuration(retPeriodStr); err == nil && parsed > 0 {
+			retentionPeriod = parsed
+		}
+	}
+
+	pruneInterval := DefaultPruneInterval
+	if pruneIntStr := strings.TrimSpace(os.Getenv("AEGISEDGE_PRUNE_INTERVAL")); pruneIntStr != "" {
+		if parsed, err := time.ParseDuration(pruneIntStr); err == nil && parsed > 0 {
+			pruneInterval = parsed
+		}
+	}
+
+	pruneLimit := DefaultPruneLimit
+	if pruneLimStr := strings.TrimSpace(os.Getenv("AEGISEDGE_PRUNE_LIMIT")); pruneLimStr != "" {
+		var lim int
+		if _, err := fmt.Sscanf(pruneLimStr, "%d", &lim); err == nil && lim > 0 {
+			pruneLimit = lim
+		}
+	}
+
 	return Config{
 		NodeID:                   nodeID,
 		DatabasePath:             dbPath,
@@ -188,5 +226,9 @@ func LoadFromEnv() Config {
 		MaxReconnectInterval:     maxReconnectInterval,
 		AuthEnabled:              authEnabled,
 		SharedSecret:             sharedSecret,
+		RetentionEnabled:         retentionEnabled,
+		RetentionPeriod:          retentionPeriod,
+		PruneInterval:            pruneInterval,
+		PruneLimit:               pruneLimit,
 	}
 }
