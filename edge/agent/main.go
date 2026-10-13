@@ -50,6 +50,10 @@ func main() {
 		shutdownTimeout     = flag.Duration("shutdown-timeout", cfg.ShutdownTimeout, "Graceful shutdown timeout")
 		coordinationEnabled = flag.Bool("coordination-enabled", cfg.CoordinationEnabled, "Enable control plane coordination")
 		heartbeatInterval   = flag.Duration("heartbeat-interval", cfg.HeartbeatInterval, "Control plane heartbeat interval")
+		retentionEnabled    = flag.Bool("retention-enabled", cfg.RetentionEnabled, "Enable retention pruning of completed telemetry batches")
+		retentionPeriod     = flag.Duration("retention-period", cfg.RetentionPeriod, "Minimum age before completed batch is eligible for pruning")
+		pruneInterval       = flag.Duration("prune-interval", cfg.PruneInterval, "Interval between background storage pruning cycles")
+		pruneLimit          = flag.Int("prune-limit", cfg.PruneLimit, "Maximum rows pruned per transaction")
 	)
 	flag.Parse()
 
@@ -70,6 +74,10 @@ func main() {
 	cfg.ShutdownTimeout = *shutdownTimeout
 	cfg.CoordinationEnabled = *coordinationEnabled
 	cfg.HeartbeatInterval = *heartbeatInterval
+	cfg.RetentionEnabled = *retentionEnabled
+	cfg.RetentionPeriod = *retentionPeriod
+	cfg.PruneInterval = *pruneInterval
+	cfg.PruneLimit = *pruneLimit
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -466,6 +474,17 @@ func main() {
 		defer syncTicker.Stop()
 	}
 
+	var pruneTicker *time.Ticker
+	if cfg.RetentionEnabled && cfg.PruneInterval > 0 {
+		pruneTicker = time.NewTicker(cfg.PruneInterval)
+		defer pruneTicker.Stop()
+		logger.Info("storage retention pruning enabled",
+			slog.Duration("retention_period", cfg.RetentionPeriod),
+			slog.Duration("prune_interval", cfg.PruneInterval),
+			slog.Int("prune_limit", cfg.PruneLimit),
+		)
+	}
+
 	logger.Info("entering autonomous telemetry collection and synchronization loop")
 
 	for {
@@ -500,6 +519,25 @@ func main() {
 			if syncer != nil {
 				if _, err := syncer.SyncPendingBatches(ctx, 50); err != nil {
 					logger.Debug("periodic sync cycle encountered transient issue", slog.Any("error", err))
+				}
+			}
+
+		case <-func() <-chan time.Time {
+			if pruneTicker != nil {
+				return pruneTicker.C
+			}
+			return nil
+		}():
+			if cfg.RetentionEnabled {
+				cutoff := time.Now().UTC().Add(-cfg.RetentionPeriod)
+				pruned, err := store.PruneCompletedBatches(ctx, cutoff, cfg.PruneLimit)
+				if err != nil {
+					logger.Warn("storage retention pruning failed", slog.Any("error", err))
+				} else if pruned > 0 {
+					logger.Info("pruned completed telemetry batches from storage",
+						slog.Int64("batches_pruned", pruned),
+						slog.Time("cutoff", cutoff),
+					)
 				}
 			}
 		}
