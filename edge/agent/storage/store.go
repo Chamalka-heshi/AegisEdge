@@ -125,6 +125,13 @@ type Store interface {
 	// CountBatches returns the total count of telemetry batches stored locally.
 	CountBatches(ctx context.Context) (int64, error)
 
+	// PruneCompletedBatches deletes batches in terminal completion states (SYNCED or PUBLISHED)
+	// whose completion timestamp is older than cutoff.
+	// It guarantees that the highest sequence number for each node is preserved so that
+	// GetLatestSequenceNumber continues to reflect the sequence high-water mark across restarts.
+	// Returns the number of rows deleted.
+	PruneCompletedBatches(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+
 	// Close cleanly terminates database connections and checkpoints the WAL journal.
 	Close() error
 }
