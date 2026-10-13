@@ -590,12 +590,6 @@ func TestAdversarial_Lifecycle_HTTPRequestContextCancellation(t *testing.T) {
 	requestReceived := make(chan struct{})
 	serverSawContextDone := make(chan struct{})
 
-	srv := server.NewServer(nil)
-	srv.SetAuthConfig(server.AuthConfig{
-		Enabled:    false, // simplifies handler entry for lifecycle cancellation testing
-		AdminToken: regTestAdminToken,
-	})
-
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Signal deterministically that the handler has received the request
 		close(requestReceived)
