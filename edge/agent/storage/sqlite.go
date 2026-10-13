@@ -819,6 +819,53 @@ func (s *SQLiteStore) CountBatches(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+// PruneCompletedBatches transactionally removes terminal batches (SYNCED or PUBLISHED)
+// whose completion timestamp is older than cutoff, up to limit rows.
+// It preserves the highest sequence number for each node to ensure sequence monotonicity across restarts.
+func (s *SQLiteStore) PruneCompletedBatches(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return 0, ErrStoreClosed
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	cutoffStr := cutoff.UTC().Format(time.RFC3339Nano)
+
+	query := `
+	DELETE FROM telemetry_batches
+	WHERE batch_id IN (
+		SELECT b.batch_id
+		FROM telemetry_batches b
+		WHERE b.sync_status IN (?, ?)
+		  AND COALESCE(b.published_at, b.sent_at) IS NOT NULL
+		  AND COALESCE(b.published_at, b.sent_at) < ?
+		  AND b.sequence_number < (
+			  SELECT MAX(m.sequence_number)
+			  FROM telemetry_batches m
+			  WHERE m.node_id = b.node_id
+		  )
+		ORDER BY b.sequence_number ASC
+		LIMIT ?
+	);`
+
+	res, err := s.db.ExecContext(ctx, query, string(SyncStatusSynced), string(SyncStatusPublished), cutoffStr, limit)
+	if err != nil {
+		return 0, fmt.Errorf("pruning completed batches failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("getting pruned rows affected failed: %w", err)
+	}
+
+	return rowsAffected, nil
+}
+
 // Close terminates the database connection and flushes write-ahead logs.
 func (s *SQLiteStore) Close() error {
 	s.mu.Lock()
