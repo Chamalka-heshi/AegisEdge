@@ -9,33 +9,38 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	cpnats "github.com/Chamalka-heshi/AegisEdge/services/control-plane/nats"
 	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/server"
+	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/storage"
 )
 
 const (
-	Version = "0.3.0-dev"
-	AppName = "aegisedge-control-plane"
+	Version       = "0.3.0-dev"
+	AppName       = "aegisedge-control-plane"
+	DefaultDBPath = "data/control-plane.db"
 )
 
 // ServerConfig holds runtime configuration for the control plane.
 type ServerConfig struct {
-	Host            string
-	Port            int
-	LogLevel        string
-	NATSEnabled     bool
-	NATSURL         string
-	AuthEnabled     bool
-	SharedSecret    string
-	NodeSecretsFile string
-	AdminToken      string
-	MaxClockSkew    time.Duration
-	TLSCertFile     string
-	TLSKeyFile      string
+	Host              string
+	Port              int
+	LogLevel          string
+	NATSEnabled       bool
+	NATSURL           string
+	AuthEnabled       bool
+	SharedSecret      string
+	NodeSecretsFile   string
+	AdminToken        string
+	MaxClockSkew      time.Duration
+	TLSCertFile       string
+	TLSKeyFile        string
+	MaxHistoryBatches int
+	DBPath            string
 }
 
 // BuildServerConfig constructs and validates ServerConfig and AuthConfig from CLI flags and environment variables.
@@ -82,6 +87,24 @@ func BuildServerConfig(flags ServerConfig, isProduction bool) (ServerConfig, ser
 			cfg.TLSKeyFile = key
 		}
 	}
+	if cfg.MaxHistoryBatches <= 0 {
+		if histStr := strings.TrimSpace(os.Getenv("MAX_HISTORY_BATCHES")); histStr != "" {
+			if val, err := strconv.Atoi(histStr); err == nil && val > 0 {
+				cfg.MaxHistoryBatches = val
+			}
+		}
+	}
+	if cfg.MaxHistoryBatches <= 0 {
+		cfg.MaxHistoryBatches = server.DefaultMaxHistoryBatches
+	}
+	if cfg.DBPath == "" {
+		if envDB := strings.TrimSpace(os.Getenv("AEGISEDGE_CP_DB_PATH")); envDB != "" {
+			cfg.DBPath = envDB
+		}
+	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = DefaultDBPath
+	}
 
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
@@ -114,17 +137,19 @@ func BuildServerConfig(flags ServerConfig, isProduction bool) (ServerConfig, ser
 
 func main() {
 	var (
-		showVersion     = flag.Bool("version", false, "Print version and exit")
-		host            = flag.String("host", "127.0.0.1", "HTTP server listening host interface")
-		port            = flag.Int("port", 8080, "HTTP server listening port")
-		logLevel        = flag.String("log-level", "info", "Logging level (debug, info, warn, error)")
-		authEnabled     = flag.Bool("auth-enabled", false, "Enable HMAC and Bearer authentication")
-		sharedSecret    = flag.String("shared-secret", "", "Shared secret for edge node HMAC authentication")
-		nodeSecretsFile = flag.String("node-secrets-file", "", "Path to JSON file containing per-node secrets mapping")
-		adminToken      = flag.String("admin-token", "", "Admin Bearer token for privileged control-plane endpoints")
-		maxClockSkew    = flag.Duration("max-clock-skew", 5*time.Minute, "Maximum allowed clock skew for requests")
-		tlsCertFile     = flag.String("tls-cert", "", "Path to TLS certificate file")
-		tlsKeyFile      = flag.String("tls-key", "", "Path to TLS private key file")
+		showVersion       = flag.Bool("version", false, "Print version and exit")
+		host              = flag.String("host", "127.0.0.1", "HTTP server listening host interface")
+		port              = flag.Int("port", 8080, "HTTP server listening port")
+		logLevel          = flag.String("log-level", "info", "Logging level (debug, info, warn, error)")
+		authEnabled       = flag.Bool("auth-enabled", false, "Enable HMAC and Bearer authentication")
+		sharedSecret      = flag.String("shared-secret", "", "Shared secret for edge node HMAC authentication")
+		nodeSecretsFile   = flag.String("node-secrets-file", "", "Path to JSON file containing per-node secrets mapping")
+		adminToken        = flag.String("admin-token", "", "Admin Bearer token for privileged control-plane endpoints")
+		maxClockSkew      = flag.Duration("max-clock-skew", 5*time.Minute, "Maximum allowed clock skew for requests")
+		tlsCertFile       = flag.String("tls-cert", "", "Path to TLS certificate file")
+		tlsKeyFile        = flag.String("tls-key", "", "Path to TLS private key file")
+		maxHistoryBatches = flag.Int("max-history-batches", server.DefaultMaxHistoryBatches, "Maximum number of recent telemetry batch payloads retained in memory")
+		dbPath            = flag.String("db-path", DefaultDBPath, "Path to SQLite database file for durable idempotency tracking")
 	)
 	flag.Parse()
 
@@ -134,16 +159,18 @@ func main() {
 	}
 
 	rawFlags := ServerConfig{
-		Host:            *host,
-		Port:            *port,
-		LogLevel:        *logLevel,
-		AuthEnabled:     *authEnabled,
-		SharedSecret:    *sharedSecret,
-		NodeSecretsFile: *nodeSecretsFile,
-		AdminToken:      *adminToken,
-		MaxClockSkew:    *maxClockSkew,
-		TLSCertFile:     *tlsCertFile,
-		TLSKeyFile:      *tlsKeyFile,
+		Host:              *host,
+		Port:              *port,
+		LogLevel:          *logLevel,
+		AuthEnabled:       *authEnabled,
+		SharedSecret:      *sharedSecret,
+		NodeSecretsFile:   *nodeSecretsFile,
+		AdminToken:        *adminToken,
+		MaxClockSkew:      *maxClockSkew,
+		TLSCertFile:       *tlsCertFile,
+		TLSKeyFile:        *tlsKeyFile,
+		MaxHistoryBatches: *maxHistoryBatches,
+		DBPath:            *dbPath,
 	}
 
 	// Environment posture check
@@ -176,7 +203,21 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	srvInstance := server.NewServer(logger)
+	// Initialize durable SQLite idempotency store
+	store, err := storage.OpenSQLite(cfg.DBPath)
+	if err != nil {
+		logger.Error("failed to open sqlite database",
+			slog.String("db_path", cfg.DBPath),
+			slog.Any("error", err),
+		)
+		os.Exit(1)
+	}
+	defer store.Close()
+
+	srvInstance := server.NewServer(logger,
+		server.WithIdempotencyStore(store),
+		server.WithMaxHistory(cfg.MaxHistoryBatches),
+	)
 	srvInstance.SetAuthConfig(authConfig)
 
 	httpServer := &http.Server{
@@ -195,6 +236,7 @@ func main() {
 			slog.String("app", AppName),
 			slog.String("version", Version),
 			slog.Int("port", cfg.Port),
+			slog.String("db_path", cfg.DBPath),
 			slog.Bool("auth_enabled", cfg.AuthEnabled),
 			slog.Bool("tls_enabled", cfg.TLSCertFile != ""),
 		)
@@ -244,6 +286,9 @@ func main() {
 	if err := httpServer.Shutdown(ctx); err != nil {
 		logger.Error("error during graceful shutdown", slog.Any("error", err))
 		os.Exit(1)
+	}
+	if err := store.Close(); err != nil {
+		logger.Error("error closing storage", slog.Any("error", err))
 	}
 	logger.Info("control plane server stopped successfully")
 }
