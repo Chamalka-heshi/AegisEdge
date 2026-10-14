@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/storage"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
 
@@ -40,18 +41,160 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
+// DefaultMaxHistoryBatches is the conservative default capacity for in-memory payload history retention.
+const DefaultMaxHistoryBatches = 1000
+
+// IngestedMeta holds minimal metadata for a deduplicated batch without retaining full metric sample slices.
+type IngestedMeta struct {
+	NodeID         string    `json:"node_id"`
+	BatchID        string    `json:"batch_id"`
+	SequenceNumber int64     `json:"sequence_number"`
+	IngestedAt     time.Time `json:"ingested_at"`
+}
+
+// IdempotencyKey identifies a telemetry batch uniquely by its node and batch identifiers.
+// Using a typed struct rather than delimiter concatenation eliminates key ambiguity
+// regardless of characters present in NodeID or BatchID.
+type IdempotencyKey struct {
+	NodeID  string
+	BatchID string
+}
+
+func idempotencyKey(nodeID, batchID string) IdempotencyKey {
+	return IdempotencyKey{
+		NodeID:  nodeID,
+		BatchID: batchID,
+	}
+}
+
+// historyRingBuffer is an efficient, bounded circular ring buffer storing IngestedBatch payloads.
+// It maintains items in strict FIFO arrival order with O(1) insertions, avoiding per-append slice shifting.
+type historyRingBuffer struct {
+	entries  []*IngestedBatch
+	capacity int
+	head     int // points to the oldest item
+	count    int // current number of stored items
+}
+
+func newHistoryRingBuffer(capacity int) *historyRingBuffer {
+	if capacity <= 0 {
+		capacity = DefaultMaxHistoryBatches
+	}
+	return &historyRingBuffer{
+		entries:  make([]*IngestedBatch, capacity),
+		capacity: capacity,
+		head:     0,
+		count:    0,
+	}
+}
+
+// push appends a new record to the ring buffer in O(1) time.
+// If the buffer is full, the oldest record at head is overwritten and head advances.
+func (r *historyRingBuffer) push(record *IngestedBatch) {
+	if r.capacity <= 0 {
+		return
+	}
+	if r.count < r.capacity {
+		idx := (r.head + r.count) % r.capacity
+		r.entries[idx] = record
+		r.count++
+	} else {
+		r.entries[r.head] = record
+		r.head = (r.head + 1) % r.capacity
+	}
+}
+
+// snapshot returns a slice of all stored records in chronological order (oldest to newest).
+func (r *historyRingBuffer) snapshot() []*IngestedBatch {
+	if r.count == 0 {
+		return []*IngestedBatch{}
+	}
+	out := make([]*IngestedBatch, r.count)
+	firstChunk := r.capacity - r.head
+	if firstChunk > r.count {
+		firstChunk = r.count
+	}
+	copy(out, r.entries[r.head:r.head+firstChunk])
+	if secondChunk := r.count - firstChunk; secondChunk > 0 {
+		copy(out[firstChunk:], r.entries[:secondChunk])
+	}
+	return out
+}
+
+// len returns the current count of elements in the ring buffer.
+func (r *historyRingBuffer) len() int {
+	return r.count
+}
+
+// cap returns the maximum capacity of the ring buffer.
+func (r *historyRingBuffer) cap() int {
+	return r.capacity
+}
+
+// resize updates the ring buffer capacity. If the new capacity is smaller than count,
+// the oldest entries are dropped, retaining the newest 'newCap' items in chronological order.
+func (r *historyRingBuffer) resize(newCap int) error {
+	if newCap <= 0 {
+		return fmt.Errorf("max history size must be greater than zero, got %d", newCap)
+	}
+	if newCap == r.capacity {
+		return nil
+	}
+
+	current := r.snapshot()
+	newEntries := make([]*IngestedBatch, newCap)
+
+	if len(current) > newCap {
+		excess := len(current) - newCap
+		copy(newEntries, current[excess:])
+		r.count = newCap
+	} else {
+		copy(newEntries, current)
+		r.count = len(current)
+	}
+
+	r.entries = newEntries
+	r.capacity = newCap
+	r.head = 0
+	return nil
+}
+
+// ServerOption allows customizing Server parameters during construction.
+type ServerOption func(*Server) error
+
+// WithMaxHistory configures the maximum number of batch payloads to retain in memory.
+func WithMaxHistory(maxHistory int) ServerOption {
+	return func(s *Server) error {
+		if maxHistory <= 0 {
+			return fmt.Errorf("max history size must be greater than zero, got %d", maxHistory)
+		}
+		return s.history.resize(maxHistory)
+	}
+}
+
+// WithIdempotencyStore configures the persistent idempotency store for deduplication.
+func WithIdempotencyStore(store storage.IdempotencyStore) ServerOption {
+	return func(s *Server) error {
+		if store == nil {
+			return errors.New("idempotency store cannot be nil")
+		}
+		s.store = store
+		return nil
+	}
+}
+
 // Server provides the HTTP ingestion endpoints for AegisEdge telemetry.
 //
-// NOTE (Phase 3 In-Memory Limitation):
-// In Phase 3, this server stores ingested batches strictly in-memory.
-// Accepted batches survive only for the lifetime of the control-plane process.
-// If the process restarts, its accepted set is reset. The edge retains its
-// local SQLite records until synchronization is confirmed. Persistent control-plane
-// storage and brokers are scheduled for later phases.
+// NOTE (Phase 6.22B Durable Control-Plane Idempotency Architecture):
+// Deduplication is scoped to typed composite struct (NodeID, BatchID) enforced
+// by a durable SQLite database (or pluggable IdempotencyStore).
+// The deduplication store guarantees atomic, restart-safe deduplication.
+// Telemetry payload history (for listing batches) is stored in a genuine, thread-safe, bounded circular
+// ring buffer (default 1,000 batches), completely decoupled from the persistent deduplication records.
 type Server struct {
 	mu             sync.RWMutex
-	ingested       map[string]*IngestedBatch
-	ingestedList   []*IngestedBatch
+	store          storage.IdempotencyStore
+	history        *historyRingBuffer
 	nodes          map[string]*NodeRecord
 	nodesList      []*NodeRecord
 	logger         *slog.Logger
@@ -60,16 +203,16 @@ type Server struct {
 	replayCache    *ReplayCache
 }
 
-// NewServer initializes an in-memory control-plane HTTP ingestion server.
-func NewServer(logger *slog.Logger) *Server {
+// NewServer initializes a control-plane HTTP ingestion server with optional configuration.
+// If no WithIdempotencyStore option is provided, an in-memory SQLite store is initialized by default.
+func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
 		}))
 	}
-	return &Server{
-		ingested:       make(map[string]*IngestedBatch),
-		ingestedList:   make([]*IngestedBatch, 0),
+	s := &Server{
+		history:        newHistoryRingBuffer(DefaultMaxHistoryBatches),
 		nodes:          make(map[string]*NodeRecord),
 		nodesList:      make([]*NodeRecord, 0),
 		logger:         logger,
@@ -77,6 +220,49 @@ func NewServer(logger *slog.Logger) *Server {
 		authConfig:     DefaultAuthConfig(),
 		replayCache:    NewReplayCache(DefaultMaxReplayKeys),
 	}
+	for _, opt := range opts {
+		if err := opt(s); err != nil {
+			s.logger.Warn("invalid server option ignored", slog.Any("error", err))
+		}
+	}
+	if s.store == nil {
+		memStore, err := storage.OpenSQLite(":memory:")
+		if err != nil {
+			s.logger.Error("failed to initialize default in-memory sqlite store", slog.Any("error", err))
+		} else {
+			s.store = memStore
+		}
+	}
+
+	// Warm in-memory history ring buffer from durable recent payloads if available
+	if s.store != nil {
+		recent, err := s.store.GetRecentBatches(context.Background(), s.history.cap())
+		if err == nil {
+			for _, item := range recent {
+				s.history.push(&IngestedBatch{
+					Batch:      item.Batch,
+					IngestedAt: item.IngestedAt,
+				})
+			}
+		}
+	}
+	return s
+}
+
+// Close gracefully closes the server's underlying persistent storage.
+func (s *Server) Close() error {
+	if s.store != nil {
+		return s.store.Close()
+	}
+	return nil
+}
+
+// GetPayload retrieves a persisted telemetry batch by node ID and batch ID from the durable store.
+func (s *Server) GetPayload(ctx context.Context, nodeID, batchID string) (*types.TelemetryBatch, error) {
+	if s.store != nil {
+		return s.store.GetPayload(ctx, nodeID, batchID)
+	}
+	return nil, storage.ErrStoreClosed
 }
 
 // SetAuthConfig sets the authentication configuration for the control plane.
@@ -209,11 +395,24 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. Idempotency Check & Ingestion
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// 6. Atomic Durable Ingestion (both metadata and complete payload committed in single transaction)
+	ingestedAt := time.Now().UTC()
 
-	if _, exists := s.ingested[batch.BatchID]; exists {
+	isNew, err := s.store.RecordBatch(r.Context(), &batch, ingestedAt)
+	if err != nil {
+		s.logger.Error("failed to record batch in durable store",
+			slog.String("batch_id", batch.BatchID),
+			slog.String("node_id", batch.NodeID),
+			slog.Any("error", err),
+		)
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "internal_server_error",
+			Message: "failed to persist telemetry batch",
+		})
+		return
+	}
+
+	if !isNew {
 		// Duplicate batch: already accepted. Return 200 OK with already_accepted status.
 		s.logger.Info("duplicate telemetry batch received (idempotent no-op)",
 			slog.String("batch_id", batch.BatchID),
@@ -228,15 +427,14 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record new batch with control plane ingestion timestamp
-	ingestedAt := time.Now().UTC()
+	// New batch successfully persisted: append to bounded payload history
 	record := &IngestedBatch{
 		Batch:      batch,
 		IngestedAt: ingestedAt,
 	}
-
-	s.ingested[batch.BatchID] = record
-	s.ingestedList = append(s.ingestedList, record)
+	s.mu.Lock()
+	s.appendHistoryLocked(record)
+	s.mu.Unlock()
 
 	s.logger.Info("telemetry batch accepted and ingested",
 		slog.String("batch_id", batch.BatchID),
@@ -254,7 +452,14 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleListBatches returns all ingested batches in memory (admin only when auth enabled).
+func (s *Server) appendHistoryLocked(record *IngestedBatch) {
+	if s.history == nil {
+		s.history = newHistoryRingBuffer(DefaultMaxHistoryBatches)
+	}
+	s.history.push(record)
+}
+
+// handleListBatches returns ingested batches currently retained in the history window (admin only when auth enabled).
 func (s *Server) handleListBatches(w http.ResponseWriter, r *http.Request) {
 	authCtx, err := s.AuthenticateRequest(r, nil)
 	if err != nil {
@@ -277,45 +482,84 @@ func (s *Server) handleListBatches(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	s.writeJSON(w, http.StatusOK, s.ingestedList)
+	s.writeJSON(w, http.StatusOK, s.history.snapshot())
 }
 
-// GetIngestedBatches returns a copy of all ingested batches for testing/inspection.
+// GetIngestedBatches returns a copy of all ingested batches currently retained in the history window in chronological order.
 func (s *Server) GetIngestedBatches() []*IngestedBatch {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	out := make([]*IngestedBatch, len(s.ingestedList))
-	copy(out, s.ingestedList)
-	return out
+	return s.history.snapshot()
 }
 
-// Count returns the number of uniquely ingested batches.
+// Count returns the number of uniquely ingested batch keys in the deduplication store.
 func (s *Server) Count() int {
+	if s.store != nil {
+		c, err := s.store.Count(context.Background())
+		if err == nil {
+			return c
+		}
+	}
+	return 0
+}
+
+// HistoryCount returns the current count of batch payloads retained in the history buffer.
+func (s *Server) HistoryCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.ingested)
+	return s.history.len()
+}
+
+// MaxHistorySize returns the configured maximum payload history capacity.
+func (s *Server) MaxHistorySize() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.history.cap()
+}
+
+// SetMaxHistorySize dynamically updates and enforces the history buffer capacity.
+func (s *Server) SetMaxHistorySize(size int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.history.resize(size)
+}
+
+// HasIngestedBatch reports whether a batch for the specified node and batch ID has been ingested.
+func (s *Server) HasIngestedBatch(nodeID, batchID string) bool {
+	if s.store != nil {
+		has, err := s.store.HasBatch(context.Background(), nodeID, batchID)
+		if err == nil {
+			return has
+		}
+	}
+	return false
 }
 
 // IngestBatch programmatically ingests a validated telemetry batch.
-// Used by the NATS consumer to share the same in-memory idempotency boundary as HTTP.
+// Used by the NATS consumer to share the same durable idempotency boundary as HTTP.
 //
 // Returns nil on successful first ingestion.
 // Returns ErrDuplicateBatch if the batch has already been ingested (idempotent no-op).
-//
-// Limitation (Phase 4.3):
-// Duplicate detection is idempotent during the lifetime of the current control-plane process.
-// Persistent duplicate detection across control-plane restarts is NOT provided by the
-// current in-memory ingestion boundary and is deferred to a future persistent ingestion layer.
-func (s *Server) IngestBatch(_ context.Context, batch *types.TelemetryBatch) error {
+func (s *Server) IngestBatch(ctx context.Context, batch *types.TelemetryBatch) error {
 	if err := batch.Validate(); err != nil {
 		return fmt.Errorf("batch validation failed: %w", err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	ingestedAt := time.Now().UTC()
 
-	if _, exists := s.ingested[batch.BatchID]; exists {
+	isNew, err := s.store.RecordBatch(ctx, batch, ingestedAt)
+	if err != nil {
+		s.logger.Error("failed to record batch in durable store",
+			slog.String("batch_id", batch.BatchID),
+			slog.String("node_id", batch.NodeID),
+			slog.Any("error", err),
+		)
+		return fmt.Errorf("failed to persist telemetry batch: %w", err)
+	}
+
+	if !isNew {
 		s.logger.Info("duplicate batch ingestion (idempotent no-op via NATS consumer)",
 			slog.String("batch_id", batch.BatchID),
 			slog.String("node_id", batch.NodeID),
@@ -323,14 +567,13 @@ func (s *Server) IngestBatch(_ context.Context, batch *types.TelemetryBatch) err
 		return ErrDuplicateBatch
 	}
 
-	ingestedAt := time.Now().UTC()
 	record := &IngestedBatch{
 		Batch:      *batch,
 		IngestedAt: ingestedAt,
 	}
-
-	s.ingested[batch.BatchID] = record
-	s.ingestedList = append(s.ingestedList, record)
+	s.mu.Lock()
+	s.appendHistoryLocked(record)
+	s.mu.Unlock()
 
 	s.logger.Info("telemetry batch ingested via NATS consumer",
 		slog.String("batch_id", batch.BatchID),
