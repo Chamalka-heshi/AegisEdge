@@ -801,3 +801,81 @@ func TestSQLite_PruneCompletedBatches_ConcurrentPersistence(t *testing.T) {
 		t.Errorf("expected latest sequence >= 10, got %d", latestSeq)
 	}
 }
+
+// TestSQLite_PruneCompletedBatches_StatusSpecificTimestamps verifies that:
+// 1. An old SYNCED row with sent_at is eligible.
+// 2. An old PUBLISHED row with published_at is eligible.
+// 3. A SYNCED row with sent_at NULL is retained even if published_at is populated.
+// 4. A PUBLISHED row with published_at NULL is retained even if sent_at is populated.
+func TestSQLite_PruneCompletedBatches_StatusSpecificTimestamps(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "status_timestamps_test.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	oldTimeStr := now.Add(-48 * time.Hour).Format(time.RFC3339Nano)
+	cutoff := now.Add(-24 * time.Hour)
+
+	// Insert batches manually to test precise column populated states
+	// b1: SYNCED with sent_at populated, published_at NULL (eligible)
+	// b2: PUBLISHED with published_at populated, sent_at NULL (eligible)
+	// b3: SYNCED with sent_at NULL, published_at populated (must NOT be pruned)
+	// b4: PUBLISHED with published_at NULL, sent_at populated (must NOT be pruned)
+	// b5: SYNCED with sent_at populated (highest sequence 99 -> must NOT be pruned)
+
+	insertQuery := `
+	INSERT INTO telemetry_batches (batch_id, node_id, sequence_number, collected_at, sent_at, published_at, payload, created_at, sync_status)
+	VALUES (?, 'node-status', ?, ?, ?, ?, '{}', ?, ?);
+	`
+
+	if _, err := store.db.ExecContext(ctx, insertQuery, "b1-synced-valid", 1, oldTimeStr, oldTimeStr, nil, oldTimeStr, "SYNCED"); err != nil {
+		t.Fatalf("insert b1 failed: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, insertQuery, "b2-pub-valid", 2, oldTimeStr, nil, oldTimeStr, oldTimeStr, "PUBLISHED"); err != nil {
+		t.Fatalf("insert b2 failed: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, insertQuery, "b3-synced-nullsent", 3, oldTimeStr, nil, oldTimeStr, oldTimeStr, "SYNCED"); err != nil {
+		t.Fatalf("insert b3 failed: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, insertQuery, "b4-pub-nullpub", 4, oldTimeStr, oldTimeStr, nil, oldTimeStr, "PUBLISHED"); err != nil {
+		t.Fatalf("insert b4 failed: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, insertQuery, "b5-highest-seq", 99, oldTimeStr, oldTimeStr, nil, oldTimeStr, "SYNCED"); err != nil {
+		t.Fatalf("insert b5 failed: %v", err)
+	}
+
+	pruned, err := store.PruneCompletedBatches(ctx, cutoff, 100)
+	if err != nil {
+		t.Fatalf("PruneCompletedBatches failed: %v", err)
+	}
+	if pruned != 2 {
+		t.Errorf("expected exactly 2 pruned rows (b1 and b2), got %d", pruned)
+	}
+
+	// b1 and b2 must be deleted
+	if _, err := store.GetBatch(ctx, "b1-synced-valid"); !errors.Is(err, ErrBatchNotFound) {
+		t.Errorf("expected b1-synced-valid to be pruned, got %v", err)
+	}
+	if _, err := store.GetBatch(ctx, "b2-pub-valid"); !errors.Is(err, ErrBatchNotFound) {
+		t.Errorf("expected b2-pub-valid to be pruned, got %v", err)
+	}
+
+	// b3 (SYNCED with NULL sent_at) must be retained
+	if _, err := store.GetBatch(ctx, "b3-synced-nullsent"); err != nil {
+		t.Errorf("expected b3-synced-nullsent to be retained: %v", err)
+	}
+
+	// b4 (PUBLISHED with NULL published_at) must be retained
+	if _, err := store.GetBatch(ctx, "b4-pub-nullpub"); err != nil {
+		t.Errorf("expected b4-pub-nullpub to be retained: %v", err)
+	}
+
+	// b5 (highest sequence) must be retained
+	if _, err := store.GetBatch(ctx, "b5-highest-seq"); err != nil {
+		t.Errorf("expected b5-highest-seq to be retained: %v", err)
+	}
+}
