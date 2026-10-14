@@ -841,9 +841,11 @@ func (s *SQLiteStore) PruneCompletedBatches(ctx context.Context, cutoff time.Tim
 	WHERE batch_id IN (
 		SELECT b.batch_id
 		FROM telemetry_batches b
-		WHERE b.sync_status IN (?, ?)
-		  AND COALESCE(b.published_at, b.sent_at) IS NOT NULL
-		  AND COALESCE(b.published_at, b.sent_at) < ?
+		WHERE (
+			(b.sync_status = ? AND b.sent_at IS NOT NULL AND b.sent_at < ?)
+			OR
+			(b.sync_status = ? AND b.published_at IS NOT NULL AND b.published_at < ?)
+		)
 		  AND b.sequence_number < (
 			  SELECT MAX(m.sequence_number)
 			  FROM telemetry_batches m
@@ -853,7 +855,7 @@ func (s *SQLiteStore) PruneCompletedBatches(ctx context.Context, cutoff time.Tim
 		LIMIT ?
 	);`
 
-	res, err := s.db.ExecContext(ctx, query, string(SyncStatusSynced), string(SyncStatusPublished), cutoffStr, limit)
+	res, err := s.db.ExecContext(ctx, query, string(SyncStatusSynced), cutoffStr, string(SyncStatusPublished), cutoffStr, limit)
 	if err != nil {
 		return 0, fmt.Errorf("pruning completed batches failed: %w", err)
 	}
