@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/server"
 )
 
 func TestServerConfig_Defaults(t *testing.T) {
@@ -205,5 +207,73 @@ func TestBuildServerConfig_PrecedenceAndEnvOverrides(t *testing.T) {
 	}
 	if authCfgB.AdminToken != "cli-admin-token-16chars" {
 		t.Errorf("expected CLI admin token to take precedence")
+	}
+}
+
+func TestBuildServerConfig_MaxHistoryBatches(t *testing.T) {
+	baseCfg := ServerConfig{Host: "127.0.0.1", Port: 8080}
+
+	// 1. Default when unset
+	cfg1, _, err := BuildServerConfig(baseCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig failed: %v", err)
+	}
+	if cfg1.MaxHistoryBatches != server.DefaultMaxHistoryBatches {
+		t.Errorf("expected default %d, got %d", server.DefaultMaxHistoryBatches, cfg1.MaxHistoryBatches)
+	}
+
+	// 2. Env variable override
+	t.Setenv("MAX_HISTORY_BATCHES", "250")
+	cfg2, _, err := BuildServerConfig(baseCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig failed: %v", err)
+	}
+	if cfg2.MaxHistoryBatches != 250 {
+		t.Errorf("expected env override 250, got %d", cfg2.MaxHistoryBatches)
+	}
+
+	// 3. CLI flag precedence over env variable
+	cliCfg := baseCfg
+	cliCfg.MaxHistoryBatches = 500
+	cfg3, _, err := BuildServerConfig(cliCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig failed: %v", err)
+	}
+	if cfg3.MaxHistoryBatches != 500 {
+		t.Errorf("expected CLI precedence 500, got %d", cfg3.MaxHistoryBatches)
+	}
+}
+
+func TestBuildServerConfig_DBPath(t *testing.T) {
+	baseCfg := ServerConfig{Host: "127.0.0.1", Port: 8080}
+
+	// 1. Default when unset
+	cfg1, _, err := BuildServerConfig(baseCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig failed: %v", err)
+	}
+	if cfg1.DBPath != DefaultDBPath {
+		t.Errorf("expected default DBPath %q, got %q", DefaultDBPath, cfg1.DBPath)
+	}
+
+	// 2. Env variable override
+	t.Setenv("AEGISEDGE_CP_DB_PATH", "/tmp/custom-cp.db")
+	cfg2, _, err := BuildServerConfig(baseCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig failed: %v", err)
+	}
+	if cfg2.DBPath != "/tmp/custom-cp.db" {
+		t.Errorf("expected env override '/tmp/custom-cp.db', got %q", cfg2.DBPath)
+	}
+
+	// 3. CLI flag precedence over env variable
+	cliCfg := baseCfg
+	cliCfg.DBPath = "/custom/cli-path.db"
+	cfg3, _, err := BuildServerConfig(cliCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig failed: %v", err)
+	}
+	if cfg3.DBPath != "/custom/cli-path.db" {
+		t.Errorf("expected CLI precedence '/custom/cli-path.db', got %q", cfg3.DBPath)
 	}
 }
