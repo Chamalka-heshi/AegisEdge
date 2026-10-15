@@ -16,7 +16,23 @@ var (
 	ErrStoreClosed    = errors.New("idempotency store is closed")
 	ErrInvalidMeta    = errors.New("invalid batch metadata")
 	ErrBatchNotFound  = errors.New("batch not found in store")
+	ErrCorruptPayload = errors.New("corrupt telemetry payload")
 )
+
+// CorruptPayloadError captures diagnostic information about a corrupted stored payload.
+type CorruptPayloadError struct {
+	NodeID  string
+	BatchID string
+	Err     error
+}
+
+func (e *CorruptPayloadError) Error() string {
+	return fmt.Sprintf("corrupt payload for node %q, batch %q: %v", e.NodeID, e.BatchID, e.Err)
+}
+
+func (e *CorruptPayloadError) Unwrap() error {
+	return ErrCorruptPayload
+}
 
 // BatchMeta holds minimal metadata for a telemetry batch.
 type BatchMeta struct {
