@@ -251,12 +251,19 @@ func (s *SQLiteStore) GetPayload(ctx context.Context, nodeID, batchID string) (*
 
 	var batch types.TelemetryBatch
 	if err := json.Unmarshal([]byte(payloadJSON), &batch); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal batch payload: %w", err)
+		return nil, &CorruptPayloadError{
+			NodeID:  nodeID,
+			BatchID: batchID,
+			Err:     err,
+		}
 	}
 	return &batch, nil
 }
 
 // GetRecentBatches retrieves up to limit recent persisted batches in chronological order (oldest to newest).
+// If individual stored batch payloads are corrupted, it skips them without aborting recovery,
+// recovers all other valid batches in chronological order, and returns an error combining diagnostics
+// for all skipped rows (identifying their NodeID, BatchID, and JSON decode error).
 func (s *SQLiteStore) GetRecentBatches(ctx context.Context, limit int) ([]*StoredBatch, error) {
 	s.mu.RLock()
 	if s.closed {
@@ -270,9 +277,9 @@ func (s *SQLiteStore) GetRecentBatches(ctx context.Context, limit int) ([]*Store
 	}
 
 	query := `
-	SELECT payload_json, ingested_at
+	SELECT node_id, batch_id, payload_json, ingested_at
 	FROM (
-		SELECT payload_json, ingested_at, rowid
+		SELECT node_id, batch_id, payload_json, ingested_at, rowid
 		FROM cp_telemetry_payloads
 		ORDER BY rowid DESC
 		LIMIT ?
@@ -286,14 +293,22 @@ func (s *SQLiteStore) GetRecentBatches(ctx context.Context, limit int) ([]*Store
 	defer rows.Close()
 
 	var out []*StoredBatch
+	var corruptErrs []error
+
 	for rows.Next() {
-		var payloadJSON, ingestedAtStr string
-		if err := rows.Scan(&payloadJSON, &ingestedAtStr); err != nil {
+		var nodeID, batchID, payloadJSON, ingestedAtStr string
+		if err := rows.Scan(&nodeID, &batchID, &payloadJSON, &ingestedAtStr); err != nil {
 			return nil, fmt.Errorf("failed to scan payload row: %w", err)
 		}
 		var batch types.TelemetryBatch
 		if err := json.Unmarshal([]byte(payloadJSON), &batch); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal payload row: %w", err)
+			// Record diagnostic for skipped corrupt row without aborting the recovery of valid rows
+			corruptErrs = append(corruptErrs, &CorruptPayloadError{
+				NodeID:  nodeID,
+				BatchID: batchID,
+				Err:     err,
+			})
+			continue
 		}
 		ingestedAt, _ := time.Parse(time.RFC3339Nano, ingestedAtStr)
 		out = append(out, &StoredBatch{
@@ -302,10 +317,13 @@ func (s *SQLiteStore) GetRecentBatches(ctx context.Context, limit int) ([]*Store
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows error: %w", err)
+		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
 	if out == nil {
 		out = []*StoredBatch{}
+	}
+	if len(corruptErrs) > 0 {
+		return out, errors.Join(corruptErrs...)
 	}
 	return out, nil
 }
