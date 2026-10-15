@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1710,5 +1711,125 @@ func TestServer_Durable_RehydrationFailureLogged(t *testing.T) {
 	}
 	if !srv.HasIngestedBatch("node-rehydrate", "batch-rehydrate-01") {
 		t.Errorf("expected duplicate recognition to function regardless of history cache status")
+	}
+}
+
+// TestServer_Durable_StartupRehydration_CorruptPayloadTolerant verifies that when SQLite contains
+// malformed payload rows, NewServer continues startup, successfully warms all valid payloads into
+// the history ring buffer, emits structured warning logs detailing the skipped rows, and remains fully functional.
+func TestServer_Durable_StartupRehydration_CorruptPayloadTolerant(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "corrupt_rehydrate.db")
+
+	baseStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+
+	ctx := context.Background()
+	baseTime := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+	// Ingest 3 batches
+	b1 := sampleTestBatch("batch-corrupt-01", "node-rehydrate", 1)
+	b2 := sampleTestBatch("batch-corrupt-02", "node-rehydrate", 2)
+	b3 := sampleTestBatch("batch-corrupt-03", "node-rehydrate", 3)
+
+	if _, err := baseStore.RecordBatch(ctx, &b1, baseTime.Add(1*time.Minute)); err != nil {
+		t.Fatalf("RecordBatch 1 failed: %v", err)
+	}
+	if _, err := baseStore.RecordBatch(ctx, &b2, baseTime.Add(2*time.Minute)); err != nil {
+		t.Fatalf("RecordBatch 2 failed: %v", err)
+	}
+	if _, err := baseStore.RecordBatch(ctx, &b3, baseTime.Add(3*time.Minute)); err != nil {
+		t.Fatalf("RecordBatch 3 failed: %v", err)
+	}
+
+	// Close store so we can inject corrupt JSON into batch 2
+	if err := baseStore.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open failed: %v", err)
+	}
+	if _, err := rawDB.Exec(`UPDATE cp_telemetry_payloads SET payload_json = '{"truncated": false,' WHERE batch_id = 'batch-corrupt-02'`); err != nil {
+		rawDB.Close()
+		t.Fatalf("failed to inject corruption: %v", err)
+	}
+	rawDB.Close()
+
+	// Reopen store
+	reopenedStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("reopening OpenSQLite failed: %v", err)
+	}
+	defer reopenedStore.Close()
+
+	// Capture slog warning output
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	// Initialize server with the store containing the corrupted row
+	srv := NewServer(logger, WithIdempotencyStore(reopenedStore))
+	defer srv.Close()
+
+	// Assert that valid batches 01 and 03 were warmed into history (count = 2)
+	if srv.HistoryCount() != 2 {
+		t.Errorf("expected HistoryCount=2, got %d", srv.HistoryCount())
+	}
+
+	ingested := srv.GetIngestedBatches()
+	if len(ingested) != 2 {
+		t.Fatalf("expected 2 ingested batches in history, got %d", len(ingested))
+	}
+	if ingested[0].Batch.BatchID != "batch-corrupt-01" {
+		t.Errorf("expected first batch to be batch-corrupt-01, got %q", ingested[0].Batch.BatchID)
+	}
+	if ingested[1].Batch.BatchID != "batch-corrupt-03" {
+		t.Errorf("expected second batch to be batch-corrupt-03, got %q", ingested[1].Batch.BatchID)
+	}
+
+	// Structured warning log assertions
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "corrupted telemetry payloads detected during history rehydration; skipped invalid rows") {
+		t.Errorf("expected warning log about corrupt payloads, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "batch-corrupt-02") {
+		t.Errorf("expected log to identify the corrupt batch, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, `"recovered_batches":2`) {
+		t.Errorf("expected log to report recovered_batches:2, got: %s", logOutput)
+	}
+
+	// Valid payloads can still be read
+	p1, err := srv.GetPayload(ctx, "node-rehydrate", "batch-corrupt-01")
+	if err != nil || p1 == nil {
+		t.Errorf("failed to retrieve valid payload 01: %v", err)
+	}
+	p3, err := srv.GetPayload(ctx, "node-rehydrate", "batch-corrupt-03")
+	if err != nil || p3 == nil {
+		t.Errorf("failed to retrieve valid payload 03: %v", err)
+	}
+
+	// Corrupt payload returns ErrCorruptPayload
+	p2, err := srv.GetPayload(ctx, "node-rehydrate", "batch-corrupt-02")
+	if p2 != nil {
+		t.Errorf("expected nil payload for corrupt batch, got %+v", p2)
+	}
+	if !errors.Is(err, storage.ErrCorruptPayload) {
+		t.Errorf("expected ErrCorruptPayload for corrupt batch, got %v", err)
+	}
+
+	// HTTP routes still function normally
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("health check failed after corrupt rehydration: resp=%v, err=%v", resp, err)
+	}
+	if resp != nil {
+		resp.Body.Close()
 	}
 }
