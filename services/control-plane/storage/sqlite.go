@@ -13,7 +13,8 @@ import (
 	"time"
 
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // SQLiteStore implements IdempotencyStore using pure-Go SQLite in WAL mode.
@@ -51,7 +52,9 @@ func OpenSQLite(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// Configure connection pool: single connection avoids database-level write contention
+	// Configure connection pool: a single connection avoids database-level write contention
+	// and guarantees that connection-scoped PRAGMAs (synchronous=FULL, foreign_keys=ON, busy_timeout=5000)
+	// remain permanently active on the single underlying connection used by all operations.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
@@ -355,7 +358,9 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
-// isDuplicateKeyError detects unique constraint violations from SQLite.
+// isDuplicateKeyError detects unique and primary-key constraint violations from SQLite.
+// It strictly distinguishes duplicate key errors from non-uniqueness errors such as
+// foreign-key failures, check-constraint failures, NOT NULL failures, or I/O errors.
 func isDuplicateKeyError(err error) bool {
 	if err == nil {
 		return false
@@ -363,8 +368,19 @@ func isDuplicateKeyError(err error) bool {
 	if errors.Is(err, ErrDuplicateBatch) {
 		return true
 	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		code := sqliteErr.Code()
+		if code == sqlite3.SQLITE_CONSTRAINT_UNIQUE || code == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY {
+			return true
+		}
+		// Any other SQLite error code (foreign key, check constraint, not null, disk full, etc.)
+		// is not a duplicate batch and must not be classified as one.
+		return false
+	}
+	// Fallback to narrow string matching if the driver error was wrapped without exposing *sqlite.Error.
+	// Only match unambiguous uniqueness and primary key failures, never generic "constraint failed".
 	errStr := err.Error()
 	return strings.Contains(errStr, "UNIQUE constraint failed") ||
-		strings.Contains(errStr, "constraint failed") ||
-		strings.Contains(errStr, "PRIMARY KEY")
+		strings.Contains(errStr, "PRIMARY KEY constraint failed")
 }
