@@ -237,7 +237,11 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 	// Warm in-memory history ring buffer from durable recent payloads if available
 	if s.store != nil {
 		recent, err := s.store.GetRecentBatches(context.Background(), s.history.cap())
-		if err == nil {
+		if err != nil {
+			s.logger.Warn("failed to warm in-memory history cache from durable store",
+				slog.Any("error", err),
+			)
+		} else {
 			for _, item := range recent {
 				s.history.push(&IngestedBatch{
 					Batch:      item.Batch,
