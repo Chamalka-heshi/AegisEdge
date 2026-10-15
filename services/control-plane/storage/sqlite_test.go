@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -553,5 +554,200 @@ func TestSQLiteStore_PragmasReadback(t *testing.T) {
 	}
 	if busyTimeout != 5000 {
 		t.Errorf("expected busy_timeout=5000, got %d", busyTimeout)
+	}
+}
+
+// TestSQLiteStore_CorruptPayload_GetPayload asserts that GetPayload on a corrupted row
+// returns an error that unwraps to ErrCorruptPayload and contains contextual node and batch IDs.
+func TestSQLiteStore_CorruptPayload_GetPayload(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	batch := sampleBatch("node-c1", "batch-c1", 1)
+	if _, err := store.RecordBatch(ctx, batch, time.Now().UTC()); err != nil {
+		t.Fatalf("RecordBatch failed: %v", err)
+	}
+
+	// Manually corrupt the payload JSON in the database
+	if _, err := store.db.Exec(`UPDATE cp_telemetry_payloads SET payload_json = '{"metrics": [corrupted...' WHERE node_id = 'node-c1' AND batch_id = 'batch-c1'`); err != nil {
+		t.Fatalf("failed to inject payload corruption: %v", err)
+	}
+
+	payload, err := store.GetPayload(ctx, "node-c1", "batch-c1")
+	if payload != nil {
+		t.Errorf("expected nil payload on corruption, got %+v", payload)
+	}
+	if err == nil {
+		t.Fatalf("expected error on corrupt payload, got nil")
+	}
+
+	if !errors.Is(err, ErrCorruptPayload) {
+		t.Errorf("expected errors.Is(err, ErrCorruptPayload) to be true, got %v", err)
+	}
+
+	var corruptErr *CorruptPayloadError
+	if !errors.As(err, &corruptErr) {
+		t.Fatalf("expected error to cast to *CorruptPayloadError, got %T", err)
+	}
+	if corruptErr.NodeID != "node-c1" || corruptErr.BatchID != "batch-c1" {
+		t.Errorf("unexpected CorruptPayloadError fields: node=%q, batch=%q", corruptErr.NodeID, corruptErr.BatchID)
+	}
+	if !strings.Contains(corruptErr.Error(), "node-c1") || !strings.Contains(corruptErr.Error(), "batch-c1") {
+		t.Errorf("expected error message to contain node and batch IDs, got: %s", corruptErr.Error())
+	}
+}
+
+// TestSQLiteStore_CorruptPayload_GetRecentBatches_TolerantRecovery asserts that GetRecentBatches
+// recovers valid batches in chronological order even when some rows have corrupt JSON, while
+// returning a joined error surfacing all corrupt rows.
+func TestSQLiteStore_CorruptPayload_GetRecentBatches_TolerantRecovery(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	baseTime := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+
+	// Ingest 5 batches chronologically
+	for i := 1; i <= 5; i++ {
+		batch := sampleBatch("node-mix", fmt.Sprintf("batch-%02d", i), int64(i))
+		ingestedAt := baseTime.Add(time.Duration(i) * time.Minute)
+		if _, err := store.RecordBatch(ctx, batch, ingestedAt); err != nil {
+			t.Fatalf("RecordBatch %d failed: %v", i, err)
+		}
+	}
+
+	// Corrupt batches 2 and 4
+	corruptQuery := `UPDATE cp_telemetry_payloads SET payload_json = '{invalid-json' WHERE batch_id IN ('batch-02', 'batch-04')`
+	if _, err := store.db.Exec(corruptQuery); err != nil {
+		t.Fatalf("failed to inject corruption: %v", err)
+	}
+
+	// Retrieve recent batches
+	recent, err := store.GetRecentBatches(ctx, 10)
+	if err == nil {
+		t.Fatalf("expected error containing corruption diagnostics, got nil")
+	}
+
+	if !errors.Is(err, ErrCorruptPayload) {
+		t.Errorf("expected errors.Is(err, ErrCorruptPayload) to be true, got %v", err)
+	}
+
+	// Verify error mentions both corrupted batches
+	errStr := err.Error()
+	if !strings.Contains(errStr, "batch-02") || !strings.Contains(errStr, "batch-04") {
+		t.Errorf("expected joined error to name both corrupt batches, got: %s", errStr)
+	}
+
+	// Exactly 3 valid batches should be recovered
+	if len(recent) != 3 {
+		t.Fatalf("expected 3 valid batches recovered, got %d", len(recent))
+	}
+
+	// Chronological order: batch-01, batch-03, batch-05
+	expectedIDs := []string{"batch-01", "batch-03", "batch-05"}
+	for i, expectedID := range expectedIDs {
+		if recent[i].Batch.BatchID != expectedID {
+			t.Errorf("at index %d: expected batch %q, got %q", i, expectedID, recent[i].Batch.BatchID)
+		}
+	}
+
+	// Verify that corrupted rows were NOT deleted or altered in the database (no auto-repair/deletion)
+	var rowCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM cp_telemetry_payloads WHERE batch_id IN ('batch-02', 'batch-04')`).Scan(&rowCount); err != nil {
+		t.Fatalf("failed to count corrupt rows: %v", err)
+	}
+	if rowCount != 2 {
+		t.Errorf("corrupted rows must remain in the database for post-mortem forensics, expected 2 rows, found %d", rowCount)
+	}
+}
+
+// TestSQLiteStore_CorruptPayload_AllCorrupt asserts that when all rows are corrupted,
+// GetRecentBatches returns an empty non-nil slice and the joined error.
+func TestSQLiteStore_CorruptPayload_AllCorrupt(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		batch := sampleBatch("node-all-c", fmt.Sprintf("batch-%d", i), int64(i))
+		if _, err := store.RecordBatch(ctx, batch, time.Now().UTC()); err != nil {
+			t.Fatalf("RecordBatch failed: %v", err)
+		}
+	}
+
+	if _, err := store.db.Exec(`UPDATE cp_telemetry_payloads SET payload_json = 'corrupt'`); err != nil {
+		t.Fatalf("failed to corrupt all rows: %v", err)
+	}
+
+	recent, err := store.GetRecentBatches(ctx, 10)
+	if err == nil {
+		t.Fatalf("expected error on all corrupt, got nil")
+	}
+	if !errors.Is(err, ErrCorruptPayload) {
+		t.Errorf("expected ErrCorruptPayload, got %v", err)
+	}
+	if recent == nil {
+		t.Fatalf("expected non-nil empty slice, got nil")
+	}
+	if len(recent) != 0 {
+		t.Errorf("expected 0 recovered batches, got %d", len(recent))
+	}
+}
+
+// TestSQLiteStore_QueryFailure_DistinguishedFromCorruption asserts that database query/connection
+// errors (closed store, canceled context) are properly differentiated from payload corruption.
+func TestSQLiteStore_QueryFailure_DistinguishedFromCorruption(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+
+	ctx := context.Background()
+	batch := sampleBatch("node-qf", "batch-qf", 1)
+	if _, err := store.RecordBatch(ctx, batch, time.Now().UTC()); err != nil {
+		t.Fatalf("RecordBatch failed: %v", err)
+	}
+
+	// 1. Canceled context during query
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, errCanceled := store.GetRecentBatches(canceledCtx, 5)
+	if errCanceled == nil {
+		t.Fatalf("expected error on canceled context, got nil")
+	}
+	if errors.Is(errCanceled, ErrCorruptPayload) {
+		t.Errorf("canceled context error must not be classified as ErrCorruptPayload: %v", errCanceled)
+	}
+
+	// 2. Closed store
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	_, errClosedRecent := store.GetRecentBatches(ctx, 5)
+	if !errors.Is(errClosedRecent, ErrStoreClosed) {
+		t.Errorf("expected ErrStoreClosed, got %v", errClosedRecent)
+	}
+	if errors.Is(errClosedRecent, ErrCorruptPayload) {
+		t.Errorf("closed store error must not be classified as ErrCorruptPayload")
+	}
+
+	_, errClosedPayload := store.GetPayload(ctx, "node-qf", "batch-qf")
+	if !errors.Is(errClosedPayload, ErrStoreClosed) {
+		t.Errorf("expected ErrStoreClosed, got %v", errClosedPayload)
+	}
+	if errors.Is(errClosedPayload, ErrCorruptPayload) {
+		t.Errorf("closed store error must not be classified as ErrCorruptPayload")
 	}
 }
