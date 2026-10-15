@@ -433,3 +433,125 @@ func TestSQLiteStore_InvalidPath(t *testing.T) {
 		t.Errorf("expected error for empty db path, got nil")
 	}
 }
+
+// TestSQLiteStore_DuplicateKeyNarrowDetection verifies that isDuplicateKeyError strictly
+// distinguishes primary-key and unique constraint violations from other constraint failures
+// (e.g., check constraints, foreign-key failures, NOT NULL violations) and generic errors.
+func TestSQLiteStore_DuplicateKeyNarrowDetection(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Genuine primary-key duplicate on cp_ingested_batches
+	query := `INSERT INTO cp_ingested_batches (node_id, batch_id, sequence_number, collected_at, ingested_at) VALUES ('n1', 'b1', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');`
+	if _, err := store.db.Exec(query); err != nil {
+		t.Fatalf("initial insert failed: %v", err)
+	}
+	_, errDup := store.db.Exec(query)
+	if errDup == nil {
+		t.Fatalf("expected error on duplicate insert, got nil")
+	}
+	if !isDuplicateKeyError(errDup) {
+		t.Errorf("expected isDuplicateKeyError=true for primary-key violation, got false (%v)", errDup)
+	}
+
+	// 2. Setup a helper table with various non-uniqueness constraints to test error discrimination
+	if _, err := store.db.Exec(`
+		CREATE TABLE test_constraint_discrimination (
+			id TEXT PRIMARY KEY,
+			val INT CHECK (val > 0),
+			parent_id TEXT REFERENCES cp_ingested_batches(batch_id)
+		);
+	`); err != nil {
+		t.Fatalf("creating test constraint table failed: %v", err)
+	}
+
+	// 2a. CHECK constraint failure
+	_, errCheck := store.db.Exec(`INSERT INTO test_constraint_discrimination VALUES ('t1', -1, NULL);`)
+	if errCheck == nil {
+		t.Fatalf("expected CHECK constraint failure, got nil")
+	}
+	if isDuplicateKeyError(errCheck) {
+		t.Errorf("false positive: isDuplicateKeyError treated CHECK constraint error as duplicate: %v", errCheck)
+	}
+
+	// 2b. FOREIGN KEY constraint failure
+	_, errFK := store.db.Exec(`INSERT INTO test_constraint_discrimination VALUES ('t2', 10, 'nonexistent_batch');`)
+	if errFK == nil {
+		t.Fatalf("expected FOREIGN KEY constraint failure, got nil")
+	}
+	if isDuplicateKeyError(errFK) {
+		t.Errorf("false positive: isDuplicateKeyError treated FOREIGN KEY error as duplicate: %v", errFK)
+	}
+
+	// 2c. NOT NULL constraint failure
+	_, errNotNull := store.db.Exec(`INSERT INTO test_constraint_discrimination VALUES (NULL, 10, NULL);`)
+	if errNotNull == nil {
+		t.Fatalf("expected NOT NULL constraint failure, got nil")
+	}
+	if isDuplicateKeyError(errNotNull) {
+		t.Errorf("false positive: isDuplicateKeyError treated NOT NULL error as duplicate: %v", errNotNull)
+	}
+
+	// 2d. Generic non-database error
+	genericErr := errors.New("network socket timeout during query")
+	if isDuplicateKeyError(genericErr) {
+		t.Errorf("false positive: isDuplicateKeyError treated generic error as duplicate: %v", genericErr)
+	}
+
+	// 2e. ErrDuplicateBatch sentinel
+	if !isDuplicateKeyError(ErrDuplicateBatch) {
+		t.Errorf("expected isDuplicateKeyError=true for ErrDuplicateBatch sentinel")
+	}
+}
+
+// TestSQLiteStore_PragmasReadback verifies that all durability, concurrency, and integrity
+// PRAGMAs are active on the configured single-connection pool.
+func TestSQLiteStore_PragmasReadback(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "pragmas_verify.db")
+
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. journal_mode must be WAL
+	var journalMode string
+	if err := store.db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+		t.Fatalf("failed to query journal_mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Errorf("expected journal_mode 'wal', got %q", journalMode)
+	}
+
+	// 2. synchronous must be FULL (2)
+	var synchronous int
+	if err := store.db.QueryRow("PRAGMA synchronous;").Scan(&synchronous); err != nil {
+		t.Fatalf("failed to query synchronous: %v", err)
+	}
+	if synchronous != 2 {
+		t.Errorf("expected synchronous=2 (FULL), got %d", synchronous)
+	}
+
+	// 3. foreign_keys must be ON (1)
+	var foreignKeys int
+	if err := store.db.QueryRow("PRAGMA foreign_keys;").Scan(&foreignKeys); err != nil {
+		t.Fatalf("failed to query foreign_keys: %v", err)
+	}
+	if foreignKeys != 1 {
+		t.Errorf("expected foreign_keys=1 (ON), got %d", foreignKeys)
+	}
+
+	// 4. busy_timeout must be 5000ms
+	var busyTimeout int
+	if err := store.db.QueryRow("PRAGMA busy_timeout;").Scan(&busyTimeout); err != nil {
+		t.Fatalf("failed to query busy_timeout: %v", err)
+	}
+	if busyTimeout != 5000 {
+		t.Errorf("expected busy_timeout=5000, got %d", busyTimeout)
+	}
+}
