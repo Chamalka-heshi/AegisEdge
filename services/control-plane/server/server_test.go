@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1650,5 +1651,64 @@ func TestServer_Durable_AtomicTransactionRollback(t *testing.T) {
 	}
 	if len(recoveredPayload.Metrics) != 1 || recoveredPayload.Metrics[0].Name != "system_load" {
 		t.Fatalf("expected restored metric payload, got %+v", recoveredPayload)
+	}
+}
+
+type faultyRehydrationStore struct {
+	storage.IdempotencyStore
+}
+
+func (f *faultyRehydrationStore) GetRecentBatches(ctx context.Context, limit int) ([]*storage.StoredBatch, error) {
+	return nil, errors.New("simulated database I/O error during rehydration")
+}
+
+// 9. Rehydration failure logging: failure during startup cache warming logs structured warning
+func TestServer_Durable_RehydrationFailureLogged(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rehydrate_fail.db")
+	baseStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer baseStore.Close()
+
+	// Ingest a batch into the baseStore first so durable data actually exists
+	batch := sampleTestBatch("batch-rehydrate-01", "node-rehydrate", 1)
+	if isNew, err := baseStore.RecordBatch(context.Background(), &batch, time.Now().UTC()); err != nil || !isNew {
+		t.Fatalf("initial RecordBatch failed: %v", err)
+	}
+
+	// Capture slog warnings
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	// Wrap baseStore with faulty GetRecentBatches
+	store := &faultyRehydrationStore{IdempotencyStore: baseStore}
+
+	// Construct server with the faulty store
+	srv := NewServer(logger, WithIdempotencyStore(store))
+	defer srv.Close()
+
+	// Server startup must not panic or fail
+	// History buffer remains empty because warming failed
+	if srv.HistoryCount() != 0 {
+		t.Errorf("expected HistoryCount 0 when warming fails, got %d", srv.HistoryCount())
+	}
+
+	// Warning must be logged with structured error
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "failed to warm in-memory history cache from durable store") {
+		t.Errorf("expected warning log for warming failure, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "simulated database I/O error during rehydration") {
+		t.Errorf("expected error message in log output, got: %s", logOutput)
+	}
+
+	// Crucial: Durable payloads and deduplication remain intact and functional!
+	payload, err := srv.GetPayload(context.Background(), "node-rehydrate", "batch-rehydrate-01")
+	if err != nil || payload == nil {
+		t.Fatalf("expected durable payload to be retrievable even if history warming failed: %v", err)
+	}
+	if !srv.HasIngestedBatch("node-rehydrate", "batch-rehydrate-01") {
+		t.Errorf("expected duplicate recognition to function regardless of history cache status")
 	}
 }
