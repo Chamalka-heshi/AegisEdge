@@ -133,3 +133,63 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-nats.ps1
 * This environment is configured strictly for **local development and testing**.
 * Plaintext TCP and unauthenticated connections are used solely on `127.0.0.1`.
 * Do NOT expose port 4222 or 8222 to untrusted network interfaces without configuring TLS and NKey authentication.
+
+---
+
+## 10. Consumer Poison-Message Containment & Reliability (Phase 6.26A)
+
+The control-plane telemetry consumer implements strict error classification, bounded retry backoff, and poison-message containment to uphold the core invariant:
+$$\text{EDGE OPERATES OFFLINE} \longrightarrow \text{PERSISTS TO WAL} \longrightarrow \text{RECONNECTS} \longrightarrow \text{SYNCHRONIZES IDEMPOTENTLY}$$
+
+### Failure Classification & Handling
+
+| Category | Triggers / Errors | Consumer Action | Rationale |
+| :--- | :--- | :--- | :--- |
+| **Permanent / Poison** | Malformed JSON envelope, envelope schema validation failure, invalid batch domain payload, or storage `ErrInvalidMeta` | `msg.TermWithReason(reason)` (or `msg.Term()`) | Message content is structurally unprocessable. Immediate termination prevents poison-message redelivery loops. |
+| **Duplicate Delivery** | Composite key collision (`storage.ErrDuplicateBatch`) | `msg.Ack()` | Edge sync retries are idempotent; duplicates are acknowledged to drain them from the queue. |
+| **Transient Error** | Database busy/locked, I/O timeout, network disruption | `msg.NakWithDelay(backoff)` | Bounded exponential backoff gives downstream storage time to recover. |
+| **Delivery Exhaustion** | Delivery count reaches `MaxDeliver` on transient failure | Structured `CRITICAL` log + `msg.Nak()` (NOT `Term()`) | Prevents silent data loss for valid telemetry during outages; leaves message preserved in stream. |
+| **Graceful Shutdown** | Consumer context canceled (`c.ctx.Err() != nil`) | No ACK / No NAK / No Term | Leaves in-flight message available for next process instance. |
+
+### Consumer Configuration Defaults
+
+The consumer uses explicit durability tuning parameters (configurable via `ConsumerConfig`):
+* `MaxDeliver: 5` (finite delivery attempts before halting redelivery)
+* `AckWait: 30s` (server acknowledgement timeout window)
+* `MaxAckPending: 1000` (concurrency limit)
+* `RetryBackoff: 100ms` (base delay for transient retries, capped at 10s with jitter)
+
+### Stream Retention, Undelivered Messages & Replay Limitations
+
+> [!IMPORTANT]
+> **Stream retention is not an automated Dead-Letter Queue (DLQ), and replay is not implemented.**
+>
+> 1. **Messages no longer delivered to the durable consumer**:
+>    * **Permanently Poison Messages**: When a message has malformed JSON, invalid envelope schema, invalid batch domain payload, or storage `ErrInvalidMeta`, the consumer calls `TermWithReason` (or `Term`). JetStream permanently removes the message from the consumer's delivery schedule. It will **never** be redelivered to this consumer group.
+>    * **Transiently Exhausted Messages**: When a message fails due to transient storage/network errors and exceeds `MaxDeliver` (default: 5), the consumer issues a final `Nak()`. JetStream halts redelivery to this consumer and emits a `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.AEGISEDGE_TELEMETRY.<consumer>` advisory event.
+>    * **Stream Storage Preservation**: In both cases, the message physically remains in the `AEGISEDGE_TELEMETRY` stream on disk for up to 7 days (`max_age: 7d`, `max_bytes: 512MB`), ensuring raw records are not lost from the broker during outages.
+>
+> 2. **Inspecting vs. Replaying Messages**:
+>    * **Inspection**: Operators can inspect stream contents and read specific messages using the NATS CLI without affecting consumer state.
+>    * **Replay / Redrive Limitation**: **AegisEdge does not currently implement or verify automated message replay, redrive, or dead-letter queue extraction.** Reading a message with `nats msg get` is strictly a read-only operation and does **not** redeliver or replay the message to the consumer. Replaying an exhausted message requires manual operator re-publication or custom tooling outside the current control-plane scope.
+
+### Operator Diagnostic Commands
+
+When investigating poison messages, transient delivery exhaustion, or advisory alerts, operators can use the standard NATS CLI for diagnostic inspection:
+
+```powershell
+# 1. View overall consumer progress, ack state, and pending redeliveries
+nats consumer report AEGISEDGE_TELEMETRY
+
+# 2. Inspect detailed consumer configuration, redelivery counts, and stream state
+nats consumer info AEGISEDGE_TELEMETRY aegisedge-control-plane-telemetry
+
+# 3. Interactively page through stored messages and metadata in the stream (read-only)
+nats stream view AEGISEDGE_TELEMETRY
+
+# 4. Read a specific raw message payload and headers by stream sequence number (read-only; does not replay)
+nats msg get AEGISEDGE_TELEMETRY <sequence_number>
+
+# 5. Monitor real-time broker advisory events, including MaxDeliver exhaustion alerts
+nats event --advisory
+```
