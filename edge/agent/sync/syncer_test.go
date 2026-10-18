@@ -1,13 +1,17 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -439,17 +443,21 @@ func TestSyncer_TimestampSemantics(t *testing.T) {
 	}
 }
 
-// TestSyncer_FailureSafetyMatrix explicitly tests item 4 of the audit:
-// HTTP timeout → PENDING
-// connection refused → PENDING
-// HTTP 5xx → PENDING
-// HTTP 4xx validation failure → PENDING
+// TestSyncer_FailureSafetyMatrix tests failure behavior across failure modes:
+// HTTP timeout → PENDING (attempt incremented)
+// connection refused → PENDING (attempt incremented)
+// HTTP 5xx → PENDING (attempt incremented)
+// HTTP 4xx validation failure → FAILED (quarantined, attempt preserved, never deleted)
 // Confirming that no failed sync deletes the batch or marks it SYNCED.
 func TestSyncer_FailureSafetyMatrix(t *testing.T) {
 	testCases := []struct {
-		name       string
-		setupMock  func() (string, func())
-		clientOpts []HTTPClientOption
+		name               string
+		setupMock          func() (string, func())
+		clientOpts         []HTTPClientOption
+		expectedStatus     storage.SyncStatus
+		expectedAttempt    int
+		expectedFailed     int
+		expectedQuarantine int
 	}{
 		{
 			name: "ConnectionRefused",
@@ -461,6 +469,10 @@ func TestSyncer_FailureSafetyMatrix(t *testing.T) {
 				WithMaxRetries(1),
 				WithBaseBackoff(1 * time.Millisecond),
 			},
+			expectedStatus:     storage.SyncStatusPending,
+			expectedAttempt:    1,
+			expectedFailed:     1,
+			expectedQuarantine: 0,
 		},
 		{
 			name: "HTTPTimeout",
@@ -475,6 +487,10 @@ func TestSyncer_FailureSafetyMatrix(t *testing.T) {
 				WithMaxRetries(1),
 				WithBaseBackoff(1 * time.Millisecond),
 			},
+			expectedStatus:     storage.SyncStatusPending,
+			expectedAttempt:    1,
+			expectedFailed:     1,
+			expectedQuarantine: 0,
 		},
 		{
 			name: "HTTP500InternalServerError",
@@ -488,6 +504,10 @@ func TestSyncer_FailureSafetyMatrix(t *testing.T) {
 				WithMaxRetries(2),
 				WithBaseBackoff(1 * time.Millisecond),
 			},
+			expectedStatus:     storage.SyncStatusPending,
+			expectedAttempt:    1,
+			expectedFailed:     1,
+			expectedQuarantine: 0,
 		},
 		{
 			name: "HTTP400BadRequest",
@@ -502,6 +522,10 @@ func TestSyncer_FailureSafetyMatrix(t *testing.T) {
 				WithMaxRetries(1),
 				WithBaseBackoff(1 * time.Millisecond),
 			},
+			expectedStatus:     storage.SyncStatusFailed,
+			expectedAttempt:    0,
+			expectedFailed:     0,
+			expectedQuarantine: 1,
 		},
 	}
 
@@ -533,8 +557,11 @@ func TestSyncer_FailureSafetyMatrix(t *testing.T) {
 			if stats.TotalSynced != 0 {
 				t.Errorf("expected 0 synced, got %d", stats.TotalSynced)
 			}
-			if stats.TotalFailed != 1 {
-				t.Errorf("expected 1 failed batch, got %d", stats.TotalFailed)
+			if stats.TotalFailed != tc.expectedFailed {
+				t.Errorf("expected %d failed batch, got %d", tc.expectedFailed, stats.TotalFailed)
+			}
+			if stats.TotalQuarantined != tc.expectedQuarantine {
+				t.Errorf("expected %d quarantined batch, got %d", tc.expectedQuarantine, stats.TotalQuarantined)
 			}
 
 			// Invariant 1: Local batch MUST NOT be deleted (count remains 1)
@@ -546,19 +573,1114 @@ func TestSyncer_FailureSafetyMatrix(t *testing.T) {
 				t.Errorf("expected count to remain 1, got %d", count)
 			}
 
-			// Invariant 2: Local batch MUST NOT be marked SYNCED (remains PENDING)
+			// Invariant 2: Local batch status matches expectedStatus (FAILED for 400, PENDING for transient)
 			rec, err := store.GetBatch(ctx, batchID)
 			if err != nil {
 				t.Fatalf("GetBatch failed: %v", err)
 			}
-			if rec.SyncStatus != storage.SyncStatusPending {
-				t.Errorf("expected status PENDING after failure, got %s", rec.SyncStatus)
+			if rec.SyncStatus != tc.expectedStatus {
+				t.Errorf("expected status %s after failure, got %s", tc.expectedStatus, rec.SyncStatus)
 			}
 
-			// Invariant 3: Persisted attempt counter incremented to 1
-			if rec.Attempt != 1 {
-				t.Errorf("expected attempt 1, got %d", rec.Attempt)
+			// Invariant 3: Persisted attempt counter matches expectedAttempt
+			if rec.Attempt != tc.expectedAttempt {
+				t.Errorf("expected attempt %d, got %d", tc.expectedAttempt, rec.Attempt)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6.28 Stage 2: Poison-Batch Quarantine and HOL Blocking Prevention Tests
+// ---------------------------------------------------------------------------
+
+type failingQuarantineStore struct {
+	storage.Store
+}
+
+func (f *failingQuarantineStore) MarkBatchQuarantined(ctx context.Context, batchID string, reason string, failedAt time.Time) error {
+	return errors.New("simulated storage failure during quarantine")
+}
+
+type mockPublisher struct {
+	publishFunc func(ctx context.Context, batch *types.TelemetryBatch) error
+}
+
+func (m *mockPublisher) PublishBatch(ctx context.Context, batch *types.TelemetryBatch) error {
+	if m.publishFunc != nil {
+		return m.publishFunc(ctx, batch)
+	}
+	return nil
+}
+
+func (m *mockPublisher) Close() error {
+	return nil
+}
+
+// 1. Permanent HTTP 400 validation failure is quarantined.
+func TestSyncer_Quarantine_HTTP400Validation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "q_http400.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	batch := newTestBatch("batch-400", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, batch); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"malformed_telemetry_schema"}`))
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger())
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+
+	if stats.TotalSynced != 0 {
+		t.Errorf("expected 0 synced, got %d", stats.TotalSynced)
+	}
+	if stats.TotalQuarantined != 1 {
+		t.Errorf("expected 1 quarantined batch, got %d", stats.TotalQuarantined)
+	}
+	if stats.TotalFailed != 0 {
+		t.Errorf("expected 0 failed (halted) batches, got %d", stats.TotalFailed)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-400")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.SyncStatus)
+	}
+	if rec.FailedAt == nil {
+		t.Fatal("expected failed_at to be populated")
+	}
+	if !strings.Contains(rec.ErrorReason, "400") {
+		t.Errorf("expected error_reason to mention 400, got %q", rec.ErrorReason)
+	}
+
+	// Verify not in pending batches
+	pending, err := store.GetPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingBatches failed: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected 0 pending batches, got %d", len(pending))
+	}
+}
+
+// 2. HTTP 413 is quarantined when the existing client reports it as permanent.
+func TestSyncer_Quarantine_HTTP413EntityTooLarge(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "q_http413.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	batch := newTestBatch("batch-413", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, batch); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":"payload_exceeds_max_bytes"}`))
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger())
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+
+	if stats.TotalQuarantined != 1 {
+		t.Errorf("expected 1 quarantined batch, got %d", stats.TotalQuarantined)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-413")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.SyncStatus)
+	}
+	if !strings.Contains(rec.ErrorReason, "413") {
+		t.Errorf("expected error_reason to mention 413, got %q", rec.ErrorReason)
+	}
+}
+
+// 3. A permanently invalid batch is quarantined and a later valid batch for the same node can sync in the same cycle.
+func TestSyncer_HeadOfLineBlocking_QuarantineAllowsSubsequentSync(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "hol_quarantine.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	// Batch 1 (seq 1): poison batch
+	b1 := newTestBatch("batch-poison-seq1", "node-hol", 1, now)
+	if err := store.PersistBatch(ctx, b1); err != nil {
+		t.Fatalf("PersistBatch b1 failed: %v", err)
+	}
+	// Batch 2 (seq 2): healthy batch
+	b2 := newTestBatch("batch-valid-seq2", "node-hol", 2, now)
+	if err := store.PersistBatch(ctx, b2); err != nil {
+		t.Fatalf("PersistBatch b2 failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b types.TelemetryBatch
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		if b.BatchID == "batch-poison-seq1" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"poison_payload"}`))
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger())
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+
+	if stats.TotalQuarantined != 1 {
+		t.Errorf("expected 1 quarantined batch, got %d", stats.TotalQuarantined)
+	}
+	if stats.TotalSynced != 1 {
+		t.Errorf("expected 1 synced batch, got %d", stats.TotalSynced)
+	}
+	if stats.TotalFailed != 0 {
+		t.Errorf("expected 0 failed batches, got %d", stats.TotalFailed)
+	}
+
+	// Batch 1 must be FAILED
+	rec1, err := store.GetBatch(ctx, "batch-poison-seq1")
+	if err != nil {
+		t.Fatalf("GetBatch b1 failed: %v", err)
+	}
+	if rec1.SyncStatus != storage.SyncStatusFailed {
+		t.Errorf("expected b1 to be FAILED, got %s", rec1.SyncStatus)
+	}
+
+	// Batch 2 must be SYNCED
+	rec2, err := store.GetBatch(ctx, "batch-valid-seq2")
+	if err != nil {
+		t.Fatalf("GetBatch b2 failed: %v", err)
+	}
+	if rec2.SyncStatus != storage.SyncStatusSynced {
+		t.Errorf("expected b2 to be SYNCED, got %s", rec2.SyncStatus)
+	}
+}
+
+// 4. Repeated transient 503/network failures remain PENDING below the retry threshold.
+func TestSyncer_TransientFailure_BelowThresholdRemainsPending(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "transient_below_thresh.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-503-transient", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithMaxRetries(1), WithBaseBackoff(1*time.Millisecond), WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithMaxSyncAttempts(5))
+
+	// Run 3 cycles (less than threshold 5)
+	for i := 1; i <= 3; i++ {
+		stats, err := syncer.SyncPendingBatches(ctx, 10)
+		if err != nil {
+			t.Fatalf("cycle %d failed: %v", i, err)
+		}
+		if stats.TotalQuarantined != 0 {
+			t.Errorf("cycle %d: expected 0 quarantined, got %d", i, stats.TotalQuarantined)
+		}
+		if stats.TotalFailed != 1 {
+			t.Errorf("cycle %d: expected 1 failed, got %d", i, stats.TotalFailed)
+		}
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-503-transient")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusPending {
+		t.Errorf("expected status PENDING below threshold, got %s", rec.SyncStatus)
+	}
+	if rec.Attempt != 3 {
+		t.Errorf("expected attempt 3, got %d", rec.Attempt)
+	}
+}
+
+// 5. A transient failure reaching the threshold becomes FAILED.
+func TestSyncer_TransientFailure_RetryExhaustionQuarantined(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "transient_exhaustion.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b1 := newTestBatch("batch-exhaust", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, b1); err != nil {
+		t.Fatalf("PersistBatch b1 failed: %v", err)
+	}
+	b2 := newTestBatch("batch-after-exhaust", "node-1", 2, now)
+	if err := store.PersistBatch(ctx, b2); err != nil {
+		t.Fatalf("PersistBatch b2 failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b types.TelemetryBatch
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		if b.BatchID == "batch-exhaust" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithMaxRetries(1), WithBaseBackoff(1*time.Millisecond), WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithMaxSyncAttempts(3))
+
+	// Cycle 1: fails, attempt -> 1, PENDING
+	stats1, _ := syncer.SyncPendingBatches(ctx, 10)
+	if stats1.TotalQuarantined != 0 || stats1.TotalFailed != 1 {
+		t.Fatalf("cycle 1: expected 0 quarantined, 1 failed, got %+v", stats1)
+	}
+
+	// Cycle 2: fails, attempt -> 2, PENDING
+	stats2, _ := syncer.SyncPendingBatches(ctx, 10)
+	if stats2.TotalQuarantined != 0 || stats2.TotalFailed != 1 {
+		t.Fatalf("cycle 2: expected 0 quarantined, 1 failed, got %+v", stats2)
+	}
+
+	// Cycle 3: attempt 2 + 1 >= 3 -> QUARANTINED!
+	// And b2 should sync in the same cycle now that b1 is quarantined!
+	stats3, _ := syncer.SyncPendingBatches(ctx, 10)
+	if stats3.TotalQuarantined != 1 {
+		t.Errorf("cycle 3: expected 1 quarantined, got %d", stats3.TotalQuarantined)
+	}
+	if stats3.TotalSynced != 1 {
+		t.Errorf("cycle 3: expected 1 synced (b2 unblocked), got %d", stats3.TotalSynced)
+	}
+
+	rec1, _ := store.GetBatch(ctx, "batch-exhaust")
+	if rec1.SyncStatus != storage.SyncStatusFailed {
+		t.Errorf("expected b1 FAILED after exhaustion, got %s", rec1.SyncStatus)
+	}
+	if !strings.Contains(rec1.ErrorReason, "exhausted") {
+		t.Errorf("expected reason to contain 'exhausted', got %q", rec1.ErrorReason)
+	}
+
+	rec2, _ := store.GetBatch(ctx, "batch-after-exhaust")
+	if rec2.SyncStatus != storage.SyncStatusSynced {
+		t.Errorf("expected b2 SYNCED after b1 unblocked, got %s", rec2.SyncStatus)
+	}
+}
+
+// 6. The attempt threshold counts logical sync cycles rather than internal HTTP attempts.
+func TestSyncer_AttemptCounting_LogicalCyclesNotHTTPAttempts(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "logical_attempt_count.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-attempts-test", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	httpTries := int32(0)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&httpTries, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	// Configure HTTP client with maxRetries = 3 (will attempt 3 HTTP requests per cycle)
+	client := NewHTTPClient(ts.URL, WithMaxRetries(3), WithBaseBackoff(1*time.Millisecond), WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithMaxSyncAttempts(10))
+
+	// Execute ONE logical sync cycle
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+	if stats.TotalFailed != 1 {
+		t.Errorf("expected 1 failed cycle, got %d", stats.TotalFailed)
+	}
+
+	// 3 HTTP tries should have been executed by HTTPClient
+	if atomic.LoadInt32(&httpTries) != 3 {
+		t.Errorf("expected 3 internal HTTP attempts, got %d", atomic.LoadInt32(&httpTries))
+	}
+
+	// SQLite record attempt counter MUST be 1 (counting logical cycles, not internal HTTP tries)
+	rec, err := store.GetBatch(ctx, "batch-attempts-test")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.Attempt != 1 {
+		t.Errorf("expected persisted attempt counter to be 1, got %d", rec.Attempt)
+	}
+}
+
+// 7. Failure to persist quarantine stops subsequent processing safely and returns a meaningful error.
+func TestSyncer_QuarantinePersistenceFailure_StopsNodeSafely(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "q_persist_fail.db")
+	realStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer realStore.Close()
+
+	now := time.Now().UTC()
+	b1 := newTestBatch("batch-qfail-1", "node-1", 1, now)
+	if err := realStore.PersistBatch(ctx, b1); err != nil {
+		t.Fatalf("PersistBatch b1 failed: %v", err)
+	}
+	b2 := newTestBatch("batch-qfail-2", "node-1", 2, now)
+	if err := realStore.PersistBatch(ctx, b2); err != nil {
+		t.Fatalf("PersistBatch b2 failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest) // triggers permanent quarantine path
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	failingStore := &failingQuarantineStore{Store: realStore}
+	syncer := NewSyncer(failingStore, client, newDiscardLogger())
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches returned unexpected error: %v", err)
+	}
+
+	if stats.TotalQuarantined != 0 {
+		t.Errorf("expected 0 quarantined due to persistence failure, got %d", stats.TotalQuarantined)
+	}
+	if stats.TotalFailed != 1 {
+		t.Errorf("expected 1 failed (halted) batch, got %d", stats.TotalFailed)
+	}
+	if stats.TotalSynced != 0 {
+		t.Errorf("expected 0 synced, got %d", stats.TotalSynced)
+	}
+	if stats.NodeFailures["node-1"] == nil || !strings.Contains(stats.NodeFailures["node-1"].Error(), "quarantine persistence failed") {
+		t.Errorf("expected quarantine persistence failure recorded in NodeFailures, got %v", stats.NodeFailures["node-1"])
+	}
+
+	// Batch 2 must remain PENDING and untouched (attempt 0)
+	rec2, err := realStore.GetBatch(ctx, "batch-qfail-2")
+	if err != nil {
+		t.Fatalf("GetBatch b2 failed: %v", err)
+	}
+	if rec2.SyncStatus != storage.SyncStatusPending || rec2.Attempt != 0 {
+		t.Errorf("expected b2 to remain PENDING with attempt 0, got status=%s attempt=%d", rec2.SyncStatus, rec2.Attempt)
+	}
+}
+
+// 8. Parent context cancellation does not record an attempt with a cancelled context and does not quarantine the batch.
+func TestSyncer_Cancellation_DoesNotRecordAttemptOrQuarantine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dbPath := filepath.Join(t.TempDir(), "cancel_test.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-cancel", "node-1", 1, now)
+	if err := store.PersistBatch(context.Background(), b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Cancel parent context before responding
+		cancel()
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger())
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled error, got %v", err)
+	}
+	if stats.TotalQuarantined != 0 {
+		t.Errorf("expected 0 quarantined on cancellation, got %d", stats.TotalQuarantined)
+	}
+
+	// Batch must remain PENDING with attempt 0 (no attempt recorded with cancelled context)
+	rec, err := store.GetBatch(context.Background(), "batch-cancel")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusPending {
+		t.Errorf("expected status PENDING after cancellation, got %s", rec.SyncStatus)
+	}
+	if rec.Attempt != 0 {
+		t.Errorf("expected attempt 0, got %d", rec.Attempt)
+	}
+}
+
+// 9. Internal request timeout is not incorrectly treated as parent shutdown.
+func TestSyncer_InternalTimeout_NotParentCancellation(t *testing.T) {
+	// Generous 5-second parent context
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "internal_timeout.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-timeout", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond) // exceeds client timeout
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	// Short internal client timeout (10ms)
+	client := NewHTTPClient(ts.URL, WithHTTPTimeout(10*time.Millisecond), WithMaxRetries(1), WithBaseBackoff(1*time.Millisecond), WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithMaxSyncAttempts(5))
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+
+	// Handled as a transient cycle failure (NOT parent shutdown)
+	if stats.TotalFailed != 1 {
+		t.Errorf("expected 1 failed batch, got %d", stats.TotalFailed)
+	}
+	if stats.TotalQuarantined != 0 {
+		t.Errorf("expected 0 quarantined, got %d", stats.TotalQuarantined)
+	}
+
+	// Batch remains PENDING with attempt incremented to 1
+	rec, err := store.GetBatch(ctx, "batch-timeout")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusPending {
+		t.Errorf("expected status PENDING after internal timeout, got %s", rec.SyncStatus)
+	}
+	if rec.Attempt != 1 {
+		t.Errorf("expected attempt 1, got %d", rec.Attempt)
+	}
+}
+
+// 10. Successful recovery after a transient failure still uses the existing successful status transition.
+func TestSyncer_TransientRecovery_MarksSynced(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "recovery_synced.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-recover", "node-1", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	shouldFail := true
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if shouldFail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithMaxRetries(1), WithBaseBackoff(1*time.Millisecond), WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithMaxSyncAttempts(5))
+
+	// Cycle 1: fails
+	stats1, _ := syncer.SyncPendingBatches(ctx, 10)
+	if stats1.TotalFailed != 1 || stats1.TotalSynced != 0 {
+		t.Fatalf("cycle 1: expected failure, got %+v", stats1)
+	}
+
+	// Server recovers
+	shouldFail = false
+
+	// Cycle 2: recovers
+	stats2, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("cycle 2 failed: %v", err)
+	}
+	if stats2.TotalSynced != 1 {
+		t.Errorf("expected 1 synced batch after recovery, got %d", stats2.TotalSynced)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-recover")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusSynced {
+		t.Errorf("expected status SYNCED, got %s", rec.SyncStatus)
+	}
+	if rec.SentAt == nil {
+		t.Errorf("expected sent_at to be populated")
+	}
+}
+
+// 11. Sequence numbers and payload identity remain unchanged when a batch is quarantined.
+func TestSyncer_Quarantine_PreservesSequenceAndPayloadIdentity(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "preserve_identity.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := &types.TelemetryBatch{
+		BatchID:        "batch-exact-identity",
+		NodeID:         "node-exact",
+		SequenceNumber: 77,
+		CollectedAt:    now,
+		Metrics: []types.MetricSample{
+			{Name: "cpu_usage_percent", Value: 88.5, Unit: "percent", Timestamp: now},
+			{Name: "disk_iops", Value: 1200.0, Unit: "ops", Timestamp: now},
+		},
+	}
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad_schema"}`))
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger())
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+	if stats.TotalQuarantined != 1 {
+		t.Errorf("expected 1 quarantined, got %d", stats.TotalQuarantined)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-exact-identity")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+
+	if rec.BatchID != "batch-exact-identity" {
+		t.Errorf("batch_id modified: %s", rec.BatchID)
+	}
+	if rec.NodeID != "node-exact" {
+		t.Errorf("node_id modified: %s", rec.NodeID)
+	}
+	if rec.SequenceNumber != 77 {
+		t.Errorf("sequence_number modified: %d", rec.SequenceNumber)
+	}
+	if !rec.CollectedAt.Equal(now) {
+		t.Errorf("collected_at modified: %v vs %v", rec.CollectedAt, now)
+	}
+	if len(rec.Payload.Metrics) != 2 || rec.Payload.Metrics[0].Name != "cpu_usage_percent" {
+		t.Errorf("payload corrupted: %+v", rec.Payload)
+	}
+}
+
+// 12. Audit events are emitted for quarantine and requeue at the appropriate integration points.
+func TestSyncer_Quarantine_AuditEventsEmitted(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "audit_quarantine.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-audit-test", "node-aud", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad_signature"}`))
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithAuditStore(store))
+
+	// Quarantine
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+	if stats.TotalQuarantined != 1 {
+		t.Fatalf("expected 1 quarantined, got %d", stats.TotalQuarantined)
+	}
+
+	// Verify quarantine audit event was recorded in AuditStore
+	events, err := store.ListAuditEvents(ctx, storage.AuditFilter{NodeID: "node-aud"})
+	if err != nil {
+		t.Fatalf("ListAuditEvents failed: %v", err)
+	}
+	if len(events) < 1 {
+		t.Fatalf("expected at least 1 audit event, got %d", len(events))
+	}
+
+	var qEvt *storage.StoredAuditEvent
+	for _, e := range events {
+		if e.EventType == "TELEMETRY_BATCH_QUARANTINED" {
+			qEvt = e
+			break
+		}
+	}
+	if qEvt == nil {
+		t.Fatal("expected TELEMETRY_BATCH_QUARANTINED audit event to be recorded")
+	}
+	if qEvt.NodeID != "node-aud" {
+		t.Errorf("expected node_id node-aud, got %s", qEvt.NodeID)
+	}
+	if qEvt.Metadata["batch_id"] != "batch-audit-test" {
+		t.Errorf("expected metadata batch_id batch-audit-test, got %s", qEvt.Metadata["batch_id"])
+	}
+
+	// Requeue batch
+	if err := syncer.RequeueBatch(ctx, "batch-audit-test"); err != nil {
+		t.Fatalf("RequeueBatch failed: %v", err)
+	}
+
+	// Verify requeue audit event was recorded in AuditStore
+	eventsAfter, err := store.ListAuditEvents(ctx, storage.AuditFilter{NodeID: "node-aud"})
+	if err != nil {
+		t.Fatalf("ListAuditEvents after requeue failed: %v", err)
+	}
+
+	var rqEvt *storage.StoredAuditEvent
+	for _, e := range eventsAfter {
+		if e.EventType == "TELEMETRY_BATCH_REQUEUED" {
+			rqEvt = e
+			break
+		}
+	}
+	if rqEvt == nil {
+		t.Fatal("expected TELEMETRY_BATCH_REQUEUED audit event to be recorded")
+	}
+	if rqEvt.Metadata["batch_id"] != "batch-audit-test" {
+		t.Errorf("expected metadata batch_id batch-audit-test in requeue event, got %s", rqEvt.Metadata["batch_id"])
+	}
+}
+
+// 13. If NATS uses a separate dispatch path, test invalid-subject quarantine there.
+func TestSyncer_NATS_InvalidSubjectQuarantined(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "nats_invalid_subj.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-nats-badnode", "node.bad*id", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	publisher := &mockPublisher{
+		publishFunc: func(ctx context.Context, batch *types.TelemetryBatch) error {
+			// buildSubject fails with ErrInvalidNodeID for nodes containing '.' or '*'
+			return fmt.Errorf("%w: prohibited characters", ErrInvalidNodeID)
+		},
+	}
+
+	syncer := NewSyncerWithPublisher(store, publisher, newDiscardLogger())
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+
+	if stats.TotalQuarantined != 1 {
+		t.Errorf("expected 1 quarantined batch for invalid NATS subject, got %d", stats.TotalQuarantined)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-nats-badnode")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.SyncStatus)
+	}
+	if !strings.Contains(rec.ErrorReason, "permanent sync failure") {
+		t.Errorf("expected permanent failure reason, got %q", rec.ErrorReason)
+	}
+}
+
+// 14. NATS transient failure below threshold remains PENDING.
+func TestSyncer_NATS_TransientFailureBelowThreshold(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "nats_transient.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-nats-transient", "node-nats", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	publisher := &mockPublisher{
+		publishFunc: func(ctx context.Context, batch *types.TelemetryBatch) error {
+			return ErrPublishNack
+		},
+	}
+
+	syncer := NewSyncerWithPublisher(store, publisher, newDiscardLogger(), WithMaxSyncAttempts(5))
+
+	// Cycle 1: fails transiently
+	stats1, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches cycle 1 failed: %v", err)
+	}
+	if stats1.TotalQuarantined != 0 || stats1.TotalFailed != 1 {
+		t.Errorf("cycle 1: expected 0 quarantined, 1 failed, got %+v", stats1)
+	}
+
+	rec, err := store.GetBatch(ctx, "batch-nats-transient")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusPending {
+		t.Errorf("expected status PENDING, got %s", rec.SyncStatus)
+	}
+	if rec.Attempt != 1 {
+		t.Errorf("expected attempt 1, got %d", rec.Attempt)
+	}
+}
+
+type failingAuditStore struct {
+	storage.AuditStore
+	err error
+}
+
+func (f *failingAuditStore) RecordAuditEvent(ctx context.Context, event *storage.StoredAuditEvent) error {
+	if f.err != nil {
+		return f.err
+	}
+	return f.AuditStore.RecordAuditEvent(ctx, event)
+}
+
+// 15. Audit-store failure does not undo quarantine or block subsequent batches.
+func TestSyncer_Quarantine_AuditStoreFailureDoesNotUndoQuarantine(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "audit_fail_quarantine.db")
+	realStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer realStore.Close()
+
+	now := time.Now().UTC()
+	// Batch 1 (seq 1): poison batch (HTTP 400)
+	b1 := &types.TelemetryBatch{
+		BatchID:        "batch-auditfail-poison-1",
+		NodeID:         "node-auditfail",
+		SequenceNumber: 1,
+		CollectedAt:    now,
+		Metrics: []types.MetricSample{
+			{Name: "cpu_usage", Value: 99.9, Unit: "percent", Timestamp: now},
+		},
+	}
+	if err := realStore.PersistBatch(ctx, b1); err != nil {
+		t.Fatalf("PersistBatch b1 failed: %v", err)
+	}
+
+	// Batch 2 (seq 2): healthy batch
+	b2 := &types.TelemetryBatch{
+		BatchID:        "batch-auditfail-valid-2",
+		NodeID:         "node-auditfail",
+		SequenceNumber: 2,
+		CollectedAt:    now.Add(1 * time.Second),
+		Metrics: []types.MetricSample{
+			{Name: "cpu_usage", Value: 25.0, Unit: "percent", Timestamp: now.Add(1 * time.Second)},
+		},
+	}
+	if err := realStore.PersistBatch(ctx, b2); err != nil {
+		t.Fatalf("PersistBatch b2 failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b types.TelemetryBatch
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		if b.BatchID == "batch-auditfail-poison-1" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"bad_schema"}`))
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	}))
+	defer ts.Close()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	sentinelAuditErr := errors.New("sentinel: disk full during audit event write")
+	mockAudit := &failingAuditStore{
+		AuditStore: realStore,
+		err:        sentinelAuditErr,
+	}
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(realStore, client, logger, WithAuditStore(mockAudit))
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches returned unexpected error: %v", err)
+	}
+
+	// Quarantine statistics must reflect successful quarantine, NOT audit write failure
+	if stats.TotalQuarantined != 1 {
+		t.Errorf("expected TotalQuarantined == 1, got %d", stats.TotalQuarantined)
+	}
+	if stats.TotalSynced != 1 {
+		t.Errorf("expected TotalSynced == 1 (later valid batch synced), got %d", stats.TotalSynced)
+	}
+	if stats.TotalFailed != 0 {
+		t.Errorf("expected TotalFailed == 0, got %d", stats.TotalFailed)
+	}
+
+	// Audit error must be observable through the established logger
+	loggedOutput := logBuf.String()
+	if !strings.Contains(loggedOutput, "failed to record audit event for quarantined batch") {
+		t.Errorf("expected log to contain audit failure message, got:\n%s", loggedOutput)
+	}
+	if !strings.Contains(loggedOutput, sentinelAuditErr.Error()) {
+		t.Errorf("expected log to contain sentinel audit error %q, got:\n%s", sentinelAuditErr.Error(), loggedOutput)
+	}
+
+	// Batch 1 must be durably quarantined in SQLite as FAILED (not rolled back)
+	rec1, err := realStore.GetBatch(ctx, "batch-auditfail-poison-1")
+	if err != nil {
+		t.Fatalf("GetBatch b1 failed: %v", err)
+	}
+	if rec1.SyncStatus != storage.SyncStatusFailed {
+		t.Errorf("expected batch 1 to be FAILED in storage, got %s", rec1.SyncStatus)
+	}
+	if rec1.FailedAt == nil {
+		t.Error("expected failed_at to be populated")
+	}
+	if rec1.BatchID != "batch-auditfail-poison-1" || rec1.NodeID != "node-auditfail" || rec1.SequenceNumber != 1 {
+		t.Errorf("batch 1 metadata corrupted: id=%s node=%s seq=%d", rec1.BatchID, rec1.NodeID, rec1.SequenceNumber)
+	}
+	if len(rec1.Payload.Metrics) != 1 || rec1.Payload.Metrics[0].Value != 99.9 {
+		t.Errorf("batch 1 payload corrupted: %+v", rec1.Payload)
+	}
+
+	// Batch 2 must be SYNCED (head-of-line blocking prevented even with audit failure)
+	rec2, err := realStore.GetBatch(ctx, "batch-auditfail-valid-2")
+	if err != nil {
+		t.Fatalf("GetBatch b2 failed: %v", err)
+	}
+	if rec2.SyncStatus != storage.SyncStatusSynced {
+		t.Errorf("expected batch 2 to be SYNCED, got %s", rec2.SyncStatus)
+	}
+}
+
+// 16. RequeueBatch error propagation and preservation of identity.
+func TestSyncer_RequeueBatch_ErrorPropagationAndStateTransitions(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "requeue_errors.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	client := NewHTTPClient("http://127.0.0.1:59999", WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithAuditStore(store))
+
+	// 1. Nonexistent batch returns ErrBatchNotFound via errors.Is
+	errNonexistent := syncer.RequeueBatch(ctx, "nonexistent-batch-id")
+	if errNonexistent == nil {
+		t.Fatal("expected error requeuing nonexistent batch, got nil")
+	}
+	if !errors.Is(errNonexistent, storage.ErrBatchNotFound) {
+		t.Errorf("expected errors.Is(err, storage.ErrBatchNotFound), got: %v", errNonexistent)
+	}
+
+	now := time.Now().UTC()
+	bPending := &types.TelemetryBatch{
+		BatchID:        "batch-requeue-pending",
+		NodeID:         "node-rq",
+		SequenceNumber: 10,
+		CollectedAt:    now,
+		Metrics: []types.MetricSample{
+			{Name: "mem_used", Value: 4096.0, Unit: "bytes", Timestamp: now},
+		},
+	}
+	if err := store.PersistBatch(ctx, bPending); err != nil {
+		t.Fatalf("PersistBatch bPending failed: %v", err)
+	}
+
+	// 2. Existing batch in PENDING status returns ErrInvalidBatchTransition via errors.Is
+	errPending := syncer.RequeueBatch(ctx, "batch-requeue-pending")
+	if errPending == nil {
+		t.Fatal("expected error requeuing PENDING batch, got nil")
+	}
+	if !errors.Is(errPending, storage.ErrInvalidBatchTransition) {
+		t.Errorf("expected errors.Is(err, storage.ErrInvalidBatchTransition), got: %v", errPending)
+	}
+
+	// 3. Existing batch in SYNCED status returns ErrInvalidBatchTransition via errors.Is
+	if err := store.MarkBatchSynced(ctx, "batch-requeue-pending", now); err != nil {
+		t.Fatalf("MarkBatchSynced failed: %v", err)
+	}
+	errSynced := syncer.RequeueBatch(ctx, "batch-requeue-pending")
+	if errSynced == nil {
+		t.Fatal("expected error requeuing SYNCED batch, got nil")
+	}
+	if !errors.Is(errSynced, storage.ErrInvalidBatchTransition) {
+		t.Errorf("expected errors.Is(err, storage.ErrInvalidBatchTransition), got: %v", errSynced)
+	}
+
+	// 4. Batch in FAILED status can be successfully requeued
+	bFailed := &types.TelemetryBatch{
+		BatchID:        "batch-requeue-failed",
+		NodeID:         "node-rq",
+		SequenceNumber: 11,
+		CollectedAt:    now,
+		Metrics: []types.MetricSample{
+			{Name: "voltage", Value: 3.3, Unit: "volts", Timestamp: now},
+			{Name: "temp_c", Value: 42.1, Unit: "celsius", Timestamp: now},
+		},
+	}
+	if err := store.PersistBatch(ctx, bFailed); err != nil {
+		t.Fatalf("PersistBatch bFailed failed: %v", err)
+	}
+	if err := store.MarkBatchQuarantined(ctx, "batch-requeue-failed", "permanent sync failure", now); err != nil {
+		t.Fatalf("MarkBatchQuarantined failed: %v", err)
+	}
+
+	// Verify it is currently FAILED
+	recBefore, err := store.GetBatch(ctx, "batch-requeue-failed")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if recBefore.SyncStatus != storage.SyncStatusFailed {
+		t.Fatalf("expected status FAILED, got %s", recBefore.SyncStatus)
+	}
+
+	// Requeue
+	if err := syncer.RequeueBatch(ctx, "batch-requeue-failed"); err != nil {
+		t.Fatalf("RequeueBatch failed on FAILED batch: %v", err)
+	}
+
+	// Verify post-requeue state and identity preservation
+	recAfter, err := store.GetBatch(ctx, "batch-requeue-failed")
+	if err != nil {
+		t.Fatalf("GetBatch after requeue failed: %v", err)
+	}
+	if recAfter.SyncStatus != storage.SyncStatusPending {
+		t.Errorf("expected status PENDING after requeue, got %s", recAfter.SyncStatus)
+	}
+	if recAfter.Attempt != 0 {
+		t.Errorf("expected attempt 0 after requeue, got %d", recAfter.Attempt)
+	}
+	if recAfter.FailedAt != nil {
+		t.Errorf("expected failed_at nil after requeue, got %v", recAfter.FailedAt)
+	}
+	if recAfter.ErrorReason != "" {
+		t.Errorf("expected error_reason empty after requeue, got %q", recAfter.ErrorReason)
+	}
+
+	// Identity preservation
+	if recAfter.BatchID != bFailed.BatchID {
+		t.Errorf("batch_id modified: %s vs %s", recAfter.BatchID, bFailed.BatchID)
+	}
+	if recAfter.NodeID != bFailed.NodeID {
+		t.Errorf("node_id modified: %s vs %s", recAfter.NodeID, bFailed.NodeID)
+	}
+	if recAfter.SequenceNumber != bFailed.SequenceNumber {
+		t.Errorf("sequence_number modified: %d vs %d", recAfter.SequenceNumber, bFailed.SequenceNumber)
+	}
+	if !recAfter.CollectedAt.Equal(bFailed.CollectedAt) {
+		t.Errorf("collected_at modified: %v vs %v", recAfter.CollectedAt, bFailed.CollectedAt)
+	}
+	if len(recAfter.Payload.Metrics) != 2 || recAfter.Payload.Metrics[0].Name != "voltage" || recAfter.Payload.Metrics[1].Name != "temp_c" {
+		t.Errorf("payload modified after requeue: %+v", recAfter.Payload)
 	}
 }
