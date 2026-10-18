@@ -68,15 +68,16 @@ type ConsumerConfig struct {
 //   - Process shutdown / context cancellation → Leave message unacknowledged so it can
 //     be retried by the next control-plane process instance.
 type TelemetryConsumer struct {
-	conn     *nats.Conn
-	handler  IngestionHandler
-	logger   *slog.Logger
-	config   ConsumerConfig
-	cons     jetstream.Consumer
-	ctx      context.Context
-	cancel   context.CancelFunc
-	running  atomic.Bool
-	consumed atomic.Int64
+	conn                *nats.Conn
+	handler             IngestionHandler
+	logger              *slog.Logger
+	config              ConsumerConfig
+	cons                jetstream.Consumer
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	running             atomic.Bool
+	consumed            atomic.Int64
+	exhaustedDeliveries atomic.Int64
 }
 
 // NewTelemetryConsumer creates a new consumer connected to the NATS JetStream stream.
@@ -357,6 +358,7 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 				slog.String("failure_category", "exhausted_delivery"),
 				slog.Any("error", err),
 			)
+			c.exhaustedDeliveries.Add(1)
 			_ = msg.Nak()
 			return
 		}
@@ -397,6 +399,17 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 // Consumed returns the total number of messages successfully consumed and ACKed.
 func (c *TelemetryConsumer) Consumed() int64 {
 	return c.consumed.Load()
+}
+
+// ExhaustedDeliveries returns the total count of transient delivery exhaustion events observed
+// by this consumer instance during its lifetime.
+//
+// NOTE: This counter is in-memory, thread-safe, and resets upon process restart. It reflects
+// the number of times a message delivery count reached or exceeded MaxDeliver on a transient
+// processing failure before being NAKed to cease redelivery. It is not a durable database metric
+// or a complete monitoring system integration.
+func (c *TelemetryConsumer) ExhaustedDeliveries() int64 {
+	return c.exhaustedDeliveries.Load()
 }
 
 // Stop gracefully stops the consumer.
