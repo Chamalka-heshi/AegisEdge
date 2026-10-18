@@ -1684,3 +1684,102 @@ func TestSyncer_RequeueBatch_ErrorPropagationAndStateTransitions(t *testing.T) {
 		t.Errorf("payload modified after requeue: %+v", recAfter.Payload)
 	}
 }
+
+// 17. Oversized NATS batch is quarantined immediately on attempt 1, allowing subsequent valid batch to sync.
+func TestSyncer_NATS_OversizedBatchQuarantinedImmediately(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "nats_oversized.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	// Batch 1 (seq 1): oversized batch (publisher returns ErrMessageTooLarge)
+	b1 := &types.TelemetryBatch{
+		BatchID:        "batch-nats-oversized",
+		NodeID:         "node-nats-size",
+		SequenceNumber: 1,
+		CollectedAt:    now,
+		Metrics: []types.MetricSample{
+			{Name: "sensor_burst", Value: 999.9, Unit: "raw", Timestamp: now},
+		},
+	}
+	if err := store.PersistBatch(ctx, b1); err != nil {
+		t.Fatalf("PersistBatch b1 failed: %v", err)
+	}
+
+	// Batch 2 (seq 2): healthy normal batch
+	b2 := &types.TelemetryBatch{
+		BatchID:        "batch-nats-valid-subsequent",
+		NodeID:         "node-nats-size",
+		SequenceNumber: 2,
+		CollectedAt:    now.Add(1 * time.Second),
+		Metrics: []types.MetricSample{
+			{Name: "sensor_burst", Value: 12.3, Unit: "raw", Timestamp: now.Add(1 * time.Second)},
+		},
+	}
+	if err := store.PersistBatch(ctx, b2); err != nil {
+		t.Fatalf("PersistBatch b2 failed: %v", err)
+	}
+
+	publisher := &mockPublisher{
+		publishFunc: func(ctx context.Context, batch *types.TelemetryBatch) error {
+			if batch.BatchID == "batch-nats-oversized" {
+				return fmt.Errorf("%w: payload size 1500000 exceeds limit 1048576", ErrMessageTooLarge)
+			}
+			return nil
+		},
+	}
+
+	syncer := NewSyncerWithPublisher(store, publisher, newDiscardLogger(), WithMaxSyncAttempts(10))
+
+	// Execute ONE sync cycle
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+
+	// Batch 1 must be quarantined immediately on attempt 1 (TotalQuarantined = 1)
+	if stats.TotalQuarantined != 1 {
+		t.Errorf("expected 1 quarantined batch, got %d", stats.TotalQuarantined)
+	}
+	// Batch 2 must be published successfully in the same cycle (TotalSynced = 1, unblocked)
+	if stats.TotalSynced != 1 {
+		t.Errorf("expected 1 synced batch (subsequent unblocked), got %d", stats.TotalSynced)
+	}
+	if stats.TotalFailed != 0 {
+		t.Errorf("expected 0 failed batches, got %d", stats.TotalFailed)
+	}
+
+	// Verify Batch 1 in storage
+	rec1, err := store.GetBatch(ctx, "batch-nats-oversized")
+	if err != nil {
+		t.Fatalf("GetBatch b1 failed: %v", err)
+	}
+	if rec1.SyncStatus != storage.SyncStatusFailed {
+		t.Errorf("expected b1 to be FAILED, got %s", rec1.SyncStatus)
+	}
+	if rec1.Attempt != 0 {
+		t.Errorf("expected b1 attempt to remain 0 on immediate permanent quarantine, got %d", rec1.Attempt)
+	}
+	if !strings.Contains(rec1.ErrorReason, "exceeds limit") {
+		t.Errorf("expected error_reason to mention size limit, got %q", rec1.ErrorReason)
+	}
+	if rec1.SequenceNumber != 1 || rec1.NodeID != "node-nats-size" {
+		t.Errorf("b1 metadata corrupted: seq=%d node=%s", rec1.SequenceNumber, rec1.NodeID)
+	}
+	if len(rec1.Payload.Metrics) != 1 || rec1.Payload.Metrics[0].Value != 999.9 {
+		t.Errorf("b1 payload corrupted: %+v", rec1.Payload)
+	}
+
+	// Verify Batch 2 in storage
+	rec2, err := store.GetBatch(ctx, "batch-nats-valid-subsequent")
+	if err != nil {
+		t.Fatalf("GetBatch b2 failed: %v", err)
+	}
+	if rec2.SyncStatus != storage.SyncStatusPublished {
+		t.Errorf("expected b2 to be PUBLISHED, got %s", rec2.SyncStatus)
+	}
+}
