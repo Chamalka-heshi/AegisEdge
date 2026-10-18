@@ -457,6 +457,29 @@ func (s *SQLiteStore) runMigrations() error {
 		}
 	}
 
+	// 13. Migration v11: error_reason and failed_at columns for telemetry batch quarantine (Phase 6.28)
+	if currentVersion < 11 {
+		addErrorReason := `ALTER TABLE telemetry_batches ADD COLUMN error_reason TEXT;`
+		if _, err := tx.ExecContext(ctx, addErrorReason); err != nil {
+			return fmt.Errorf("migration v11 add error_reason failed: %w", err)
+		}
+
+		addFailedAt := `ALTER TABLE telemetry_batches ADD COLUMN failed_at TEXT;`
+		if _, err := tx.ExecContext(ctx, addFailedAt); err != nil {
+			return fmt.Errorf("migration v11 add failed_at failed: %w", err)
+		}
+
+		createFailedIndex := `CREATE INDEX IF NOT EXISTS idx_telemetry_batches_failed ON telemetry_batches(sync_status, failed_at, sequence_number);`
+		if _, err := tx.ExecContext(ctx, createFailedIndex); err != nil {
+			return fmt.Errorf("migration v11 index failed: %w", err)
+		}
+
+		recordMigration := `INSERT INTO schema_migrations (version, applied_at) VALUES (11, ?);`
+		if _, err := tx.ExecContext(ctx, recordMigration, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("failed to record migration v11: %w", err)
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -556,7 +579,9 @@ func (s *SQLiteStore) GetBatch(ctx context.Context, batchID string) (*Record, er
 		attempt,
 		payload,
 		created_at,
-		sync_status
+		sync_status,
+		failed_at,
+		error_reason
 	FROM telemetry_batches
 	WHERE batch_id = ?;`
 
@@ -587,7 +612,9 @@ func (s *SQLiteStore) GetPendingBatches(ctx context.Context, limit int) ([]*Reco
 		attempt,
 		payload,
 		created_at,
-		sync_status
+		sync_status,
+		failed_at,
+		error_reason
 	FROM telemetry_batches
 	WHERE sync_status = ?
 	ORDER BY sequence_number ASC
@@ -670,7 +697,9 @@ func (s *SQLiteStore) GetPendingBatchesByNode(ctx context.Context, nodeID string
 		attempt,
 		payload,
 		created_at,
-		sync_status
+		sync_status,
+		failed_at,
+		error_reason
 	FROM telemetry_batches
 	WHERE sync_status = ? AND node_id = ?
 	ORDER BY sequence_number ASC
@@ -781,6 +810,142 @@ func (s *SQLiteStore) MarkBatchPublished(ctx context.Context, batchID string, pu
 	return nil
 }
 
+// MarkBatchQuarantined transitions a batch from PENDING to FAILED, recording the quarantine failure reason and timestamp.
+// Returns ErrBatchNotFound if the batch does not exist, or ErrInvalidBatchTransition if the batch is not in PENDING status.
+func (s *SQLiteStore) MarkBatchQuarantined(ctx context.Context, batchID string, reason string, failedAt time.Time) error {
+	if batchID == "" {
+		return errors.New("batch_id cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	failedAtStr := failedAt.UTC().Format(time.RFC3339Nano)
+	query := `UPDATE telemetry_batches SET sync_status = ?, error_reason = ?, failed_at = ? WHERE batch_id = ? AND sync_status = ?;`
+	res, err := s.db.ExecContext(ctx, query, string(SyncStatusFailed), reason, failedAtStr, batchID, string(SyncStatusPending))
+	if err != nil {
+		return fmt.Errorf("marking batch quarantined failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected failed: %w", err)
+	}
+	if rowsAffected == 0 {
+		var currentStatus string
+		checkQuery := `SELECT sync_status FROM telemetry_batches WHERE batch_id = ?;`
+		checkErr := s.db.QueryRowContext(ctx, checkQuery, batchID).Scan(&currentStatus)
+		if errors.Is(checkErr, sql.ErrNoRows) {
+			return ErrBatchNotFound
+		}
+		if checkErr != nil {
+			return fmt.Errorf("querying batch status failed: %w", checkErr)
+		}
+		return fmt.Errorf("%w: cannot quarantine batch in status %s", ErrInvalidBatchTransition, currentStatus)
+	}
+
+	return nil
+}
+
+// GetFailedBatches retrieves quarantined batches ordered by failed_at ASC, sequence_number ASC, batch_id ASC.
+func (s *SQLiteStore) GetFailedBatches(ctx context.Context, limit int) ([]*Record, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `
+	SELECT
+		batch_id,
+		node_id,
+		sequence_number,
+		collected_at,
+		sent_at,
+		attempt,
+		payload,
+		created_at,
+		sync_status,
+		failed_at,
+		error_reason
+	FROM telemetry_batches
+	WHERE sync_status = ?
+	ORDER BY failed_at ASC, sequence_number ASC, batch_id ASC
+	LIMIT ?;`
+
+	rows, err := s.db.QueryContext(ctx, query, string(SyncStatusFailed), limit)
+	if err != nil {
+		return nil, fmt.Errorf("querying failed batches failed: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]*Record, 0)
+	for rows.Next() {
+		rec, err := scanRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, rec)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating failed batches failed: %w", err)
+	}
+
+	return results, nil
+}
+
+// RequeueQuarantinedBatch resets a quarantined batch from FAILED back to PENDING, clearing error_reason and failed_at,
+// and resetting attempt counter to 0.
+// Returns ErrBatchNotFound if the batch does not exist, or ErrInvalidBatchTransition if the batch is not in FAILED status.
+func (s *SQLiteStore) RequeueQuarantinedBatch(ctx context.Context, batchID string) error {
+	if batchID == "" {
+		return errors.New("batch_id cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	query := `UPDATE telemetry_batches SET sync_status = ?, attempt = 0, error_reason = NULL, failed_at = NULL WHERE batch_id = ? AND sync_status = ?;`
+	res, err := s.db.ExecContext(ctx, query, string(SyncStatusPending), batchID, string(SyncStatusFailed))
+	if err != nil {
+		return fmt.Errorf("requeuing quarantined batch failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected failed: %w", err)
+	}
+	if rowsAffected == 0 {
+		var currentStatus string
+		checkQuery := `SELECT sync_status FROM telemetry_batches WHERE batch_id = ?;`
+		checkErr := s.db.QueryRowContext(ctx, checkQuery, batchID).Scan(&currentStatus)
+		if errors.Is(checkErr, sql.ErrNoRows) {
+			return ErrBatchNotFound
+		}
+		if checkErr != nil {
+			return fmt.Errorf("querying batch status failed: %w", checkErr)
+		}
+		return fmt.Errorf("%w: cannot requeue batch in status %s", ErrInvalidBatchTransition, currentStatus)
+	}
+
+	return nil
+}
+
+// GetLatestSequenceNumber returns the highest sequence number persisted for a given node.
 // If no batches exist, it returns -1.
 func (s *SQLiteStore) GetLatestSequenceNumber(ctx context.Context, nodeID string) (int64, error) {
 	s.mu.RLock()
@@ -890,15 +1055,17 @@ type scanner interface {
 
 func scanRecord(s scanner) (*Record, error) {
 	var (
-		batchID      string
-		nodeID       string
-		seqNo        int64
-		collectedStr string
-		sentAtStr    sql.NullString
-		attempt      int
-		payloadJSON  string
-		createdStr   string
-		syncStatus   string
+		batchID        string
+		nodeID         string
+		seqNo          int64
+		collectedStr   string
+		sentAtStr      sql.NullString
+		attempt        int
+		payloadJSON    string
+		createdStr     string
+		syncStatus     string
+		failedAtStr    sql.NullString
+		errorReasonStr sql.NullString
 	)
 
 	err := s.Scan(
@@ -911,6 +1078,8 @@ func scanRecord(s scanner) (*Record, error) {
 		&payloadJSON,
 		&createdStr,
 		&syncStatus,
+		&failedAtStr,
+		&errorReasonStr,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -930,11 +1099,24 @@ func scanRecord(s scanner) (*Record, error) {
 	}
 
 	var sentAt *time.Time
-	if sentAtStr.Valid {
+	if sentAtStr.Valid && sentAtStr.String != "" {
 		t, err := time.Parse(time.RFC3339Nano, sentAtStr.String)
 		if err == nil {
 			sentAt = &t
 		}
+	}
+
+	var failedAt *time.Time
+	if failedAtStr.Valid && failedAtStr.String != "" {
+		t, err := time.Parse(time.RFC3339Nano, failedAtStr.String)
+		if err == nil {
+			failedAt = &t
+		}
+	}
+
+	errorReason := ""
+	if errorReasonStr.Valid {
+		errorReason = errorReasonStr.String
 	}
 
 	var payload types.TelemetryBatch
@@ -952,11 +1134,16 @@ func scanRecord(s scanner) (*Record, error) {
 		Payload:        payload,
 		CreatedAt:      createdAt,
 		SyncStatus:     SyncStatus(syncStatus),
+		FailedAt:       failedAt,
+		ErrorReason:    errorReason,
 	}, nil
 }
 
-// Ensure SQLiteStore implements IncidentStore.
-var _ IncidentStore = (*SQLiteStore)(nil)
+// Ensure SQLiteStore implements Store and IncidentStore.
+var (
+	_ Store         = (*SQLiteStore)(nil)
+	_ IncidentStore = (*SQLiteStore)(nil)
+)
 
 // HasObservation checks if an AnomalyID has already been durably recorded.
 func (s *SQLiteStore) HasObservation(ctx context.Context, anomalyID string) (bool, error) {
