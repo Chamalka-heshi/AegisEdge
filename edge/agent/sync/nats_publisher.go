@@ -20,12 +20,18 @@ var (
 	ErrNATSNotConnected = errors.New("NATS connection is not established")
 	ErrInvalidNodeID    = errors.New("node_id contains invalid NATS subject characters")
 	ErrPublishNack      = errors.New("JetStream did not acknowledge publication")
+	ErrMessageTooLarge  = errors.New("telemetry batch size exceeds NATS maximum message size limit")
 )
+
+// DefaultNATSMaxPayloadSize is the default maximum message payload size (1MB) matching
+// the AEGISEDGE_TELEMETRY JetStream stream configuration and ADR-0005/ADR-0006.
+const DefaultNATSMaxPayloadSize = 1 << 20 // 1MB (1,048,576 bytes)
 
 // NATSPublisherConfig holds configuration for the NATS publisher.
 type NATSPublisherConfig struct {
 	URL            string
 	PublishTimeout time.Duration
+	MaxPayloadSize int // Maximum serialized message size in bytes (default: 1MB)
 }
 
 // NATSPublisher implements BatchPublisher using NATS JetStream.
@@ -51,6 +57,9 @@ func NewNATSPublisher(cfg NATSPublisherConfig, logger *slog.Logger) (*NATSPublis
 	}
 	if cfg.PublishTimeout <= 0 {
 		cfg.PublishTimeout = 5 * time.Second
+	}
+	if cfg.MaxPayloadSize <= 0 {
+		cfg.MaxPayloadSize = DefaultNATSMaxPayloadSize
 	}
 
 	nc, err := nats.Connect(cfg.URL,
@@ -90,6 +99,19 @@ func NewNATSPublisher(cfg NATSPublisherConfig, logger *slog.Logger) (*NATSPublis
 	}, nil
 }
 
+// ValidatePayloadSize verifies that serialized data does not exceed the maximum configured payload size.
+// Returns ErrMessageTooLarge wrapped with diagnostic length details if exceeded.
+func (p *NATSPublisher) ValidatePayloadSize(data []byte) error {
+	maxSize := p.config.MaxPayloadSize
+	if maxSize <= 0 {
+		maxSize = DefaultNATSMaxPayloadSize
+	}
+	if len(data) > maxSize {
+		return fmt.Errorf("%w: payload size %d exceeds limit %d", ErrMessageTooLarge, len(data), maxSize)
+	}
+	return nil
+}
+
 // PublishBatch publishes an already-persisted TelemetryBatch to NATS JetStream.
 //
 // The method:
@@ -122,6 +144,10 @@ func (p *NATSPublisher) PublishBatch(ctx context.Context, batch *types.Telemetry
 		return fmt.Errorf("failed to marshal telemetry event: %w", err)
 	}
 
+	if err := p.ValidatePayloadSize(data); err != nil {
+		return err
+	}
+
 	// 4. Build NATS message with dedup header
 	msg := &nats.Msg{
 		Subject: subject,
@@ -136,6 +162,9 @@ func (p *NATSPublisher) PublishBatch(ctx context.Context, batch *types.Telemetry
 
 	ack, err := p.js.PublishMsg(pubCtx, msg)
 	if err != nil {
+		if errors.Is(err, nats.ErrMaxPayload) || strings.Contains(err.Error(), "message size exceeds maximum allowed") {
+			return fmt.Errorf("%w: %v", ErrMessageTooLarge, err)
+		}
 		return fmt.Errorf("JetStream publish failed: %w", err)
 	}
 
