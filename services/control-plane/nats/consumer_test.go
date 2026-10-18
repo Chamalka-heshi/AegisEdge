@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -906,6 +907,11 @@ exhausted:
 	if consumer.Consumed() != 0 {
 		t.Errorf("expected 0 consumed on exhaustion, got %d", consumer.Consumed())
 	}
+
+	// 6. Confirm in-memory ExhaustedDeliveries metric was incremented
+	if consumer.ExhaustedDeliveries() != 1 {
+		t.Errorf("expected ExhaustedDeliveries to be 1, got %d", consumer.ExhaustedDeliveries())
+	}
 }
 
 // --- Test 11: Shutdown during processing does not prematurely acknowledge or intentionally terminate a message ---
@@ -1200,4 +1206,39 @@ verified:
 	if srv.Count() != 1 {
 		t.Errorf("expected server count=1, got %d", srv.Count())
 	}
+}
+
+// TestTelemetryConsumer_ExhaustedDeliveriesMetric verifies the thread-safe in-memory counter lifecycle.
+func TestTelemetryConsumer_ExhaustedDeliveriesMetric(t *testing.T) {
+	consumer := &TelemetryConsumer{
+		config: ConsumerConfig{
+			MaxDeliver: 3,
+		},
+		logger: silentLogger(),
+	}
+
+	// 1. Initial value must be 0
+	if consumer.ExhaustedDeliveries() != 0 {
+		t.Fatalf("expected initial ExhaustedDeliveries to be 0, got %d", consumer.ExhaustedDeliveries())
+	}
+
+	// 2. Increments accurately
+	consumer.exhaustedDeliveries.Add(1)
+	if consumer.ExhaustedDeliveries() != 1 {
+		t.Errorf("expected ExhaustedDeliveries to be 1, got %d", consumer.ExhaustedDeliveries())
+	}
+
+	// 3. Thread-safe concurrent access
+	const concurrency = 50
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = consumer.ExhaustedDeliveries()
+			}
+		}()
+	}
+	wg.Wait()
 }
