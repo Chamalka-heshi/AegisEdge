@@ -1833,3 +1833,186 @@ func TestServer_Durable_StartupRehydration_CorruptPayloadTolerant(t *testing.T) 
 		resp.Body.Close()
 	}
 }
+
+// TestServer_NodeActivityConsistency verifies Workstream 1:
+// 1. New batch updates LastSeen and sequence.
+// 2. Lower sequence does not regress metadata.
+// 3. Duplicate batch does not advance sequence or alter metadata.
+// 4. Unknown node does not fabricate a node record.
+// 5. Collection time differs from ingestion time (LastSeen reflects ingestion time).
+// 6. HTTP and NATS paths share the intended semantics.
+func TestServer_NodeActivityConsistency(t *testing.T) {
+	ctx := context.Background()
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Register node-act-1
+	regTime := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-act-1",
+		Hostname:     "host-act-1",
+		OS:           "linux",
+		Architecture: "amd64",
+		RegisteredAt: regTime,
+	}
+	regBody, _ := json.Marshal(reg)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regBody))
+	if err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on register, got %d", res.StatusCode)
+	}
+
+	nodeRec, ok := srv.GetNode("node-act-1")
+	if !ok {
+		t.Fatalf("GetNode failed: node-act-1 not found")
+	}
+	if nodeRec.SequenceNumber != 0 {
+		t.Errorf("initial sequence_number expected 0, got %d", nodeRec.SequenceNumber)
+	}
+
+	// 2. HTTP Ingestion: New batch updates LastSeen to ingestion time and advances SequenceNumber
+	// Historical CollectedAt from 10 days ago (offline operation)
+	collectedAt := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	b1 := sampleTestBatch("b-act-1", "node-act-1", 100)
+	b1.CollectedAt = collectedAt
+	beforeIngest := time.Now().UTC()
+	b1Body, _ := json.Marshal(b1)
+	res, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(b1Body))
+	if err != nil {
+		t.Fatalf("post b1 failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on b1, got %d", res.StatusCode)
+	}
+	afterIngest := time.Now().UTC()
+
+	nodeRec, _ = srv.GetNode("node-act-1")
+	if nodeRec.SequenceNumber != 100 {
+		t.Errorf("expected sequence_number 100, got %d", nodeRec.SequenceNumber)
+	}
+	// LastSeen must reflect control-plane ingestion time, NOT historical CollectedAt
+	if nodeRec.LastSeen.Before(beforeIngest) || nodeRec.LastSeen.After(afterIngest) {
+		t.Errorf("expected LastSeen between %v and %v, got %v", beforeIngest, afterIngest, nodeRec.LastSeen)
+	}
+	if nodeRec.LastSeen.Equal(collectedAt) {
+		t.Errorf("LastSeen must NOT equal CollectedAt: got %v", nodeRec.LastSeen)
+	}
+
+	// 3. Lower sequence (out-of-order delivery) does NOT regress SequenceNumber, but updates LastSeen
+	time.Sleep(10 * time.Millisecond)
+	beforeIngest2 := time.Now().UTC()
+	b2 := sampleTestBatch("b-act-2", "node-act-1", 50) // lower sequence: 50 < 100
+	b2Body, _ := json.Marshal(b2)
+	res, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(b2Body))
+	if err != nil {
+		t.Fatalf("post b2 failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on b2, got %d", res.StatusCode)
+	}
+
+	nodeRec, _ = srv.GetNode("node-act-1")
+	if nodeRec.SequenceNumber != 100 {
+		t.Errorf("expected sequence_number to remain 100 (monotonicity), got %d", nodeRec.SequenceNumber)
+	}
+	if nodeRec.LastSeen.Before(beforeIngest2) {
+		t.Errorf("expected LastSeen to advance to at or after %v, got %v", beforeIngest2, nodeRec.LastSeen)
+	}
+
+	// 4. Duplicate batch does NOT advance sequence number or alter metadata
+	lastSeenBeforeDup := nodeRec.LastSeen
+	res, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(b1Body)) // duplicate b1
+	if err != nil {
+		t.Fatalf("post duplicate b1 failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for duplicate batch, got %d", res.StatusCode)
+	}
+
+	nodeRec, _ = srv.GetNode("node-act-1")
+	if nodeRec.SequenceNumber != 100 {
+		t.Errorf("expected sequence_number to remain 100 after duplicate, got %d", nodeRec.SequenceNumber)
+	}
+	if !nodeRec.LastSeen.Equal(lastSeenBeforeDup) {
+		t.Errorf("expected LastSeen to remain unchanged on duplicate, got %v vs %v", nodeRec.LastSeen, lastSeenBeforeDup)
+	}
+
+	// 5. Unknown node does NOT fabricate a node record in s.nodes
+	bUnknown := sampleTestBatch("b-act-unknown", "node-unregistered", 10)
+	bUnknownBody, _ := json.Marshal(bUnknown)
+	res, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(bUnknownBody))
+	if err != nil {
+		t.Fatalf("post bUnknown failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for valid batch from unregistered node, got %d", res.StatusCode)
+	}
+
+	_, ok = srv.GetNode("node-unregistered")
+	if ok {
+		t.Errorf("expected node-unregistered not to exist in registry, but ok was true")
+	}
+
+	// 6. NATS path (IngestBatch) shares the exact same node activity semantics
+	// Register node-act-nats
+	regNATS := types.NodeRegistration{
+		NodeID:       "node-act-nats",
+		Hostname:     "host-act-nats",
+		OS:           "linux",
+		Architecture: "amd64",
+		RegisteredAt: regTime,
+	}
+	regNATSBody, _ := json.Marshal(regNATS)
+	res, _ = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regNATSBody))
+	res.Body.Close()
+
+	bNATS1 := sampleTestBatch("b-nats-1", "node-act-nats", 200)
+	beforeNATSIngest := time.Now().UTC()
+	if err := srv.IngestBatch(ctx, &bNATS1); err != nil {
+		t.Fatalf("IngestBatch bNATS1 failed: %v", err)
+	}
+	afterNATSIngest := time.Now().UTC()
+
+	nodeNATS, ok := srv.GetNode("node-act-nats")
+	if !ok {
+		t.Fatalf("GetNode node-act-nats failed")
+	}
+	if nodeNATS.SequenceNumber != 200 {
+		t.Errorf("expected sequence_number 200 via NATS IngestBatch, got %d", nodeNATS.SequenceNumber)
+	}
+	if nodeNATS.LastSeen.Before(beforeNATSIngest) || nodeNATS.LastSeen.After(afterNATSIngest) {
+		t.Errorf("expected NATS LastSeen between %v and %v, got %v", beforeNATSIngest, afterNATSIngest, nodeNATS.LastSeen)
+	}
+
+	// Duplicate NATS batch returns ErrDuplicateBatch and does NOT alter sequence or LastSeen
+	lastSeenNATSBeforeDup := nodeNATS.LastSeen
+	dupErr := srv.IngestBatch(ctx, &bNATS1)
+	if !errors.Is(dupErr, ErrDuplicateBatch) {
+		t.Errorf("expected ErrDuplicateBatch on duplicate IngestBatch, got %v", dupErr)
+	}
+	nodeNATS, _ = srv.GetNode("node-act-nats")
+	if nodeNATS.SequenceNumber != 200 {
+		t.Errorf("expected sequence_number 200 after duplicate NATS batch, got %d", nodeNATS.SequenceNumber)
+	}
+	if !nodeNATS.LastSeen.Equal(lastSeenNATSBeforeDup) {
+		t.Errorf("expected LastSeen unchanged after duplicate NATS batch, got %v vs %v", nodeNATS.LastSeen, lastSeenNATSBeforeDup)
+	}
+
+	// Out-of-order lower sequence via NATS IngestBatch preserves monotonicity
+	bNATS2 := sampleTestBatch("b-nats-2", "node-act-nats", 150)
+	if err := srv.IngestBatch(ctx, &bNATS2); err != nil {
+		t.Fatalf("IngestBatch bNATS2 failed: %v", err)
+	}
+	nodeNATS, _ = srv.GetNode("node-act-nats")
+	if nodeNATS.SequenceNumber != 200 {
+		t.Errorf("expected sequence_number to remain 200 (monotonicity) via NATS, got %d", nodeNATS.SequenceNumber)
+	}
+}
