@@ -47,6 +47,7 @@ var (
 	ErrDuplicateCheckpoint           = errors.New("checkpoint with the given checkpoint_id already exists")
 	ErrCheckpointNotFound            = errors.New("checkpoint not found")
 	ErrInvalidCheckpoint             = errors.New("cannot persist invalid checkpoint record")
+	ErrInvalidBatchTransition        = errors.New("invalid batch sync status transition")
 )
 
 // SyncStatus represents the synchronization lifecycle state of a locally stored batch.
@@ -81,6 +82,8 @@ type Record struct {
 	Payload        types.TelemetryBatch `json:"payload"`
 	CreatedAt      time.Time            `json:"created_at"`
 	SyncStatus     SyncStatus           `json:"sync_status"`
+	FailedAt       *time.Time           `json:"failed_at,omitempty"`
+	ErrorReason    string               `json:"error_reason,omitempty"`
 }
 
 // Store defines the local storage contract for the edge node.
@@ -117,6 +120,18 @@ type Store interface {
 	// This indicates a successful NATS JetStream PubAck was received.
 	// Returns ErrBatchNotFound if the batch does not exist.
 	MarkBatchPublished(ctx context.Context, batchID string, publishedAt time.Time) error
+
+	// MarkBatchQuarantined transitions a batch from PENDING to FAILED, recording the quarantine failure reason and timestamp.
+	// Returns ErrBatchNotFound if the batch does not exist, or ErrInvalidBatchTransition if the batch is not in PENDING status.
+	MarkBatchQuarantined(ctx context.Context, batchID string, reason string, failedAt time.Time) error
+
+	// GetFailedBatches retrieves quarantined batches ordered by failed_at ASC, sequence_number ASC, batch_id ASC.
+	GetFailedBatches(ctx context.Context, limit int) ([]*Record, error)
+
+	// RequeueQuarantinedBatch resets a quarantined batch from FAILED back to PENDING, clearing error_reason and failed_at,
+	// and resetting attempt counter to 0.
+	// Returns ErrBatchNotFound if the batch does not exist, or ErrInvalidBatchTransition if the batch is not in FAILED status.
+	RequeueQuarantinedBatch(ctx context.Context, batchID string) error
 
 	// GetLatestSequenceNumber returns the highest sequence number persisted for a given node.
 	// If no records exist for the node, it returns -1.
