@@ -173,6 +173,13 @@ The consumer uses explicit durability tuning parameters (configurable via `Consu
 >    * **Inspection**: Operators can inspect stream contents and read specific messages using the NATS CLI without affecting consumer state.
 >    * **Replay / Redrive Limitation**: **AegisEdge does not currently implement or verify automated message replay, redrive, or dead-letter queue extraction.** Reading a message with `nats msg get` is strictly a read-only operation and does **not** redeliver or replay the message to the consumer. Replaying an exhausted message requires manual operator re-publication or custom tooling outside the current control-plane scope.
 
+### In-Memory Delivery Exhaustion Observability (Phase 6.28 Stage 3)
+
+The control-plane `TelemetryConsumer` exposes an in-process thread-safe metric counter via `consumer.ExhaustedDeliveries() int64`:
+* **Tracking**: The counter increments by 1 whenever an in-flight message delivery count reaches or exceeds `MaxDeliver` on a transient processing failure before the consumer issues its terminal `Nak()`.
+* **In-Memory Lifecycle**: This counter is strictly in-memory and resets to 0 upon process restart. It is not persisted to SQLite or JetStream metadata and does not replace production monitoring integrations (e.g., Prometheus/OpenTelemetry).
+* **Delivery Replay Limitations**: The counter reflects delivery exhaustion events recognized by the running consumer instance. If an operator recreates the durable consumer or alters stream delivery configuration, JetStream may re-deliver messages, resulting in additional lifecycle counts.
+
 ### Operator Diagnostic Commands
 
 When investigating poison messages, transient delivery exhaustion, or advisory alerts, operators can use the standard NATS CLI for diagnostic inspection:
