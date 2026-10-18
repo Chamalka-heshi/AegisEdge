@@ -444,6 +444,7 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.appendHistoryLocked(record)
+	s.updateNodeTelemetryActivityLocked(batch.NodeID, batch.SequenceNumber, ingestedAt)
 	s.mu.Unlock()
 
 	s.logger.Info("telemetry batch accepted and ingested",
@@ -467,6 +468,23 @@ func (s *Server) appendHistoryLocked(record *IngestedBatch) {
 		s.history = newHistoryRingBuffer(DefaultMaxHistoryBatches)
 	}
 	s.history.push(record)
+}
+
+// updateNodeTelemetryActivityLocked updates an existing node's LastSeen to ingestedAt
+// and advances its SequenceNumber monotonically if the batch sequence number is greater.
+// Must be called with s.mu held. If the node is not registered, no record is fabricated.
+func (s *Server) updateNodeTelemetryActivityLocked(nodeID string, sequenceNumber int64, ingestedAt time.Time) {
+	if s.nodes == nil {
+		return
+	}
+	record, exists := s.nodes[nodeID]
+	if !exists || record == nil {
+		return
+	}
+	record.LastSeen = ingestedAt
+	if sequenceNumber > record.SequenceNumber {
+		record.SequenceNumber = sequenceNumber
+	}
 }
 
 // handleListBatches returns ingested batches currently retained in the history window (admin only when auth enabled).
@@ -583,6 +601,7 @@ func (s *Server) IngestBatch(ctx context.Context, batch *types.TelemetryBatch) e
 	}
 	s.mu.Lock()
 	s.appendHistoryLocked(record)
+	s.updateNodeTelemetryActivityLocked(batch.NodeID, batch.SequenceNumber, ingestedAt)
 	s.mu.Unlock()
 
 	s.logger.Info("telemetry batch ingested via NATS consumer",
