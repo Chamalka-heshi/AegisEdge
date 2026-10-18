@@ -103,6 +103,7 @@ func NewSyncerWithPublisher(store storage.Store, publisher BatchPublisher, logge
 // Permanent failures include:
 //   - HTTP 4xx validation failures (ErrClientValidation: 400 Bad Request, 405 Method Not Allowed, 413 Payload Too Large).
 //   - Invalid NATS subject/node ID characters (ErrInvalidNodeID).
+//   - Oversized NATS message payload (ErrMessageTooLarge).
 //
 // Unknown errors default to transient unless proven permanent.
 func isPermanentSyncError(err error) bool {
@@ -113,6 +114,9 @@ func isPermanentSyncError(err error) bool {
 		return true
 	}
 	if errors.Is(err, ErrInvalidNodeID) {
+		return true
+	}
+	if errors.Is(err, ErrMessageTooLarge) {
 		return true
 	}
 	return false
