@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -451,5 +452,48 @@ func TestSyncer_NATSUnavailable_BatchRemainsPending(t *testing.T) {
 	count, _ := store.CountBatches(ctx)
 	if count != 1 {
 		t.Errorf("expected batch count 1, got %d", count)
+	}
+}
+
+// TestNATSPublisher_ValidatePayloadSize verifies pre-publication deterministic size enforcement.
+func TestNATSPublisher_ValidatePayloadSize(t *testing.T) {
+	pub := &NATSPublisher{
+		config: NATSPublisherConfig{
+			MaxPayloadSize: 100, // 100 bytes limit
+		},
+	}
+
+	// 1. Below limit (50 bytes) -> nil error
+	dataBelow := make([]byte, 50)
+	if err := pub.ValidatePayloadSize(dataBelow); err != nil {
+		t.Errorf("expected nil error for payload below limit, got: %v", err)
+	}
+
+	// 2. Exactly at limit (100 bytes) -> nil error
+	dataExact := make([]byte, 100)
+	if err := pub.ValidatePayloadSize(dataExact); err != nil {
+		t.Errorf("expected nil error for payload exactly at limit, got: %v", err)
+	}
+
+	// 3. Above limit (101 bytes) -> ErrMessageTooLarge
+	dataAbove := make([]byte, 101)
+	errAbove := pub.ValidatePayloadSize(dataAbove)
+	if errAbove == nil {
+		t.Fatal("expected error for payload above limit, got nil")
+	}
+	if !errors.Is(errAbove, ErrMessageTooLarge) {
+		t.Errorf("expected errors.Is(err, ErrMessageTooLarge), got: %v", errAbove)
+	}
+
+	// 4. Default configuration (MaxPayloadSize <= 0) falls back to DefaultNATSMaxPayloadSize (1MB)
+	pubDefault := &NATSPublisher{}
+	data1MB := make([]byte, DefaultNATSMaxPayloadSize)
+	if err := pubDefault.ValidatePayloadSize(data1MB); err != nil {
+		t.Errorf("expected nil error for 1MB on default config, got: %v", err)
+	}
+	dataOver1MB := make([]byte, DefaultNATSMaxPayloadSize+1)
+	errOver1MB := pubDefault.ValidatePayloadSize(dataOver1MB)
+	if !errors.Is(errOver1MB, ErrMessageTooLarge) {
+		t.Errorf("expected ErrMessageTooLarge for >1MB on default config, got: %v", errOver1MB)
 	}
 }
