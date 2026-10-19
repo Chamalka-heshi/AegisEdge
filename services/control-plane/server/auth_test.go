@@ -342,9 +342,10 @@ func TestAuth_ConcurrentNonceReplay(t *testing.T) {
 			}
 			defer resp.Body.Close()
 
-			if resp.StatusCode == http.StatusCreated {
+			switch resp.StatusCode {
+case http.StatusCreated:
 				atomic.AddInt32(&successes, 1)
-			} else if resp.StatusCode == http.StatusUnauthorized {
+			case http.StatusUnauthorized:
 				atomic.AddInt32(&replays, 1)
 			}
 		}()

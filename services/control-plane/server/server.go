@@ -60,12 +60,7 @@ type IdempotencyKey struct {
 	BatchID string
 }
 
-func idempotencyKey(nodeID, batchID string) IdempotencyKey {
-	return IdempotencyKey{
-		NodeID:  nodeID,
-		BatchID: batchID,
-	}
-}
+
 
 // historyRingBuffer is an efficient, bounded circular ring buffer storing IngestedBatch payloads.
 // It maintains items in strict FIFO arrival order with O(1) insertions, avoiding per-append slice shifting.
