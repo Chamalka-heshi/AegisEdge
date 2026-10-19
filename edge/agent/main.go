@@ -34,6 +34,11 @@ const (
 type AnomalyHandler func(ctx context.Context, sig *types.AnomalySignal)
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "quarantine" {
+		exitCode := RunQuarantine(os.Args[2:], os.Stdout, os.Stderr)
+		os.Exit(exitCode)
+	}
+
 	cfg := config.LoadFromEnv()
 
 	var (
