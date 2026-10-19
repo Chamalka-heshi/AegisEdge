@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 )
@@ -270,14 +271,15 @@ func (s *Syncer) SyncPendingBatches(ctx context.Context, limitPerNode int) (*Syn
 					// 3. Record audit event
 					if s.auditStore != nil {
 						auditEvt := &storage.StoredAuditEvent{
-							EventID:    fmt.Sprintf("audit-quarantine-%s-%d", rec.BatchID, sentAt.UnixNano()),
-							EventType:  "TELEMETRY_BATCH_QUARANTINED",
-							Timestamp:  sentAt,
-							NodeID:     rec.NodeID,
-							IncidentID: fmt.Sprintf("quarantine-%s", rec.BatchID),
-							Actor:      "syncer",
-							Result:     "quarantined",
-							Reason:     reason,
+							EventID:       fmt.Sprintf("audit-quarantine-%s-%d", rec.BatchID, sentAt.UnixNano()),
+							EventType:     "TELEMETRY_BATCH_QUARANTINED",
+							Timestamp:     sentAt,
+							NodeID:        rec.NodeID,
+							IncidentID:    fmt.Sprintf("quarantine-%s", rec.BatchID),
+							CorrelationID: rec.BatchID,
+							Actor:         "syncer",
+							Result:        "quarantined",
+							Reason:        truncateReason(reason, storage.MaxAuditReasonLength),
 							Metadata: map[string]string{
 								"batch_id":        rec.BatchID,
 								"sequence_number": fmt.Sprintf("%d", rec.SequenceNumber),
@@ -350,14 +352,15 @@ func (s *Syncer) RequeueBatch(ctx context.Context, batchID string) error {
 
 		now := time.Now().UTC()
 		auditEvt := &storage.StoredAuditEvent{
-			EventID:    fmt.Sprintf("audit-requeue-%s-%d", batchID, now.UnixNano()),
-			EventType:  "TELEMETRY_BATCH_REQUEUED",
-			Timestamp:  now,
-			NodeID:     nodeID,
-			IncidentID: fmt.Sprintf("requeue-%s", batchID),
-			Actor:      "operator",
-			Result:     "requeued",
-			Reason:     "operator requested manual requeue of quarantined telemetry batch",
+			EventID:       fmt.Sprintf("audit-requeue-%s-%d", batchID, now.UnixNano()),
+			EventType:     "TELEMETRY_BATCH_REQUEUED",
+			Timestamp:     now,
+			NodeID:        nodeID,
+			IncidentID:    fmt.Sprintf("requeue-%s", batchID),
+			CorrelationID: batchID,
+			Actor:         "operator",
+			Result:        "requeued",
+			Reason:        truncateReason("operator requested manual requeue of quarantined telemetry batch", storage.MaxAuditReasonLength),
 			Metadata: map[string]string{
 				"batch_id":        batchID,
 				"sequence_number": fmt.Sprintf("%d", seqNum),
@@ -372,4 +375,38 @@ func (s *Syncer) RequeueBatch(ctx context.Context, batchID string) error {
 	}
 
 	return nil
+}
+
+// truncateReason safely bounds an audit reason string to maxBytes while preserving valid UTF-8.
+// If truncation occurs and space allows, a trailing "..." suffix is appended.
+// Handles nonpositive or small maxBytes safely.
+func truncateReason(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	const suffix = "..."
+	if maxBytes <= len(suffix) {
+		byteCount := 0
+		for _, r := range s {
+			runeLen := utf8.RuneLen(r)
+			if byteCount+runeLen > maxBytes {
+				break
+			}
+			byteCount += runeLen
+		}
+		return s[:byteCount]
+	}
+	limit := maxBytes - len(suffix)
+	byteCount := 0
+	for _, r := range s {
+		runeLen := utf8.RuneLen(r)
+		if byteCount+runeLen > limit {
+			break
+		}
+		byteCount += runeLen
+	}
+	return s[:byteCount] + suffix
 }
