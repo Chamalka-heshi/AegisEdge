@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Chamalka-heshi/AegisEdge/edge/agent/storage"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
@@ -1781,5 +1782,280 @@ func TestSyncer_NATS_OversizedBatchQuarantinedImmediately(t *testing.T) {
 	}
 	if rec2.SyncStatus != storage.SyncStatusPublished {
 		t.Errorf("expected b2 to be PUBLISHED, got %s", rec2.SyncStatus)
+	}
+}
+
+// 18. Audit correlation by batch ID: verifies that both quarantine and requeue events
+// share CorrelationID = batchID, queryable via ListAuditEventsByCorrelation.
+func TestSyncer_AuditCorrelation_BatchID(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "audit_corr.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	targetBatchID := "batch-corr-lifecycle-99"
+	b := newTestBatch(targetBatchID, "node-corr", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"permanent_schema_failure"}`))
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithAuditStore(store))
+
+	// 1. Trigger Quarantine
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+	if stats.TotalQuarantined != 1 {
+		t.Fatalf("expected 1 quarantined, got %d", stats.TotalQuarantined)
+	}
+
+	// 2. Trigger Requeue
+	if err := syncer.RequeueBatch(ctx, targetBatchID); err != nil {
+		t.Fatalf("RequeueBatch failed: %v", err)
+	}
+
+	// 3. Query audit events using ListAuditEventsByCorrelation(targetBatchID)
+	corrEvents, err := store.ListAuditEventsByCorrelation(ctx, targetBatchID, 50)
+	if err != nil {
+		t.Fatalf("ListAuditEventsByCorrelation failed: %v", err)
+	}
+	if len(corrEvents) != 2 {
+		t.Fatalf("expected exactly 2 correlated audit events for %s, got %d", targetBatchID, len(corrEvents))
+	}
+
+	// Event 1 must be TELEMETRY_BATCH_QUARANTINED
+	evt1 := corrEvents[0]
+	if evt1.EventType != "TELEMETRY_BATCH_QUARANTINED" {
+		t.Errorf("expected event 1 type TELEMETRY_BATCH_QUARANTINED, got %s", evt1.EventType)
+	}
+	if evt1.CorrelationID != targetBatchID {
+		t.Errorf("expected event 1 CorrelationID %s, got %s", targetBatchID, evt1.CorrelationID)
+	}
+	if evt1.IncidentID != fmt.Sprintf("quarantine-%s", targetBatchID) {
+		t.Errorf("expected event 1 IncidentID quarantine-%s, got %s", targetBatchID, evt1.IncidentID)
+	}
+
+	// Event 2 must be TELEMETRY_BATCH_REQUEUED
+	evt2 := corrEvents[1]
+	if evt2.EventType != "TELEMETRY_BATCH_REQUEUED" {
+		t.Errorf("expected event 2 type TELEMETRY_BATCH_REQUEUED, got %s", evt2.EventType)
+	}
+	if evt2.CorrelationID != targetBatchID {
+		t.Errorf("expected event 2 CorrelationID %s, got %s", targetBatchID, evt2.CorrelationID)
+	}
+	if evt2.IncidentID != fmt.Sprintf("requeue-%s", targetBatchID) {
+		t.Errorf("expected event 2 IncidentID requeue-%s, got %s", targetBatchID, evt2.IncidentID)
+	}
+}
+
+// 19. truncateReason bounds, ASCII, multibyte UTF-8, and emoji safety near boundary.
+func TestTruncateReason_BoundsAndUnicodeSafety(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxBytes int
+		wantMax  int
+		wantEnd  string
+	}{
+		{
+			name:     "short ascii within limit",
+			input:    "simple error",
+			maxBytes: 100,
+			wantMax:  100,
+			wantEnd:  "simple error",
+		},
+		{
+			name:     "exact limit ascii",
+			input:    "12345",
+			maxBytes: 5,
+			wantMax:  5,
+			wantEnd:  "12345",
+		},
+		{
+			name:     "long ascii exceeds limit",
+			input:    strings.Repeat("a", 1500),
+			maxBytes: 1024,
+			wantMax:  1024,
+			wantEnd:  "...",
+		},
+		{
+			name:     "zero limit returns empty",
+			input:    "some text",
+			maxBytes: 0,
+			wantMax:  0,
+			wantEnd:  "",
+		},
+		{
+			name:     "negative limit returns empty",
+			input:    "some text",
+			maxBytes: -5,
+			wantMax:  0,
+			wantEnd:  "",
+		},
+		{
+			name:     "small limit below suffix length",
+			input:    "abcdefgh",
+			maxBytes: 2,
+			wantMax:  2,
+			wantEnd:  "ab",
+		},
+		{
+			name: "japanese multibyte near boundary does not split rune",
+			// "エラー詳細：" (each kanji/fullwidth character is 3 bytes)
+			// 'エ'(3), 'ラ'(3), 'ー'(3), '詳'(3), '細'(3), '：'(3) = 18 bytes
+			input:    "エラー詳細：スキーマ不適合による恒久的是正が必要です",
+			maxBytes: 10, // limit = 10 - 3 = 7 -> fits 2 runes (6 bytes) + "..." = 9 bytes
+			wantMax:  10,
+			wantEnd:  "...",
+		},
+		{
+			name: "emoji 4-byte near boundary does not split rune",
+			// "Alert: 🚨🚨🚨" -> '🚨' is 4 bytes
+			input:    "Alert: 🚨🚨🚨",
+			maxBytes: 12, // limit = 12 - 3 = 9. "Alert: " is 7 bytes. 7 + 4 = 11 > 9, so stops at "Alert: " + "..." = 10 bytes
+			wantMax:  12,
+			wantEnd:  "...",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateReason(tc.input, tc.maxBytes)
+			if len(got) > tc.wantMax {
+				t.Errorf("len(got) = %d exceeds maxBytes %d", len(got), tc.wantMax)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("got invalid UTF-8 string: %q", got)
+			}
+			if tc.wantEnd != "" && !strings.HasSuffix(got, tc.wantEnd) {
+				t.Errorf("expected suffix %q, got %q", tc.wantEnd, got)
+			}
+		})
+	}
+}
+
+// 20. End-to-end quarantine with 2500-byte error reason:
+// reason is safely bounded to 1024 bytes and stored in AuditStore without validation failure.
+func TestSyncer_Quarantine_LongReasonBoundedAndPersisted(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "audit_long_reason.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	batchID := "batch-long-reason-01"
+	b := newTestBatch(batchID, "node-long-reason", 1, now)
+	if err := store.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+
+	// 2500-byte error message with Unicode characters
+	longErrMsg := "proxy upstream gateway rejection: " + strings.Repeat("詳細エラー項目_", 200)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(longErrMsg))
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient(ts.URL, WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(store, client, newDiscardLogger(), WithAuditStore(store))
+
+	stats, err := syncer.SyncPendingBatches(ctx, 10)
+	if err != nil {
+		t.Fatalf("SyncPendingBatches failed: %v", err)
+	}
+	if stats.TotalQuarantined != 1 {
+		t.Fatalf("expected 1 quarantined, got %d", stats.TotalQuarantined)
+	}
+
+	// Audit event must be recorded successfully (not dropped due to length validation)
+	events, err := store.ListAuditEventsByCorrelation(ctx, batchID, 10)
+	if err != nil {
+		t.Fatalf("ListAuditEventsByCorrelation failed: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 audit event for %s, got %d", batchID, len(events))
+	}
+
+	evt := events[0]
+	if len(evt.Reason) > storage.MaxAuditReasonLength {
+		t.Errorf("audit event reason length %d exceeds MaxAuditReasonLength %d", len(evt.Reason), storage.MaxAuditReasonLength)
+	}
+	if !utf8.ValidString(evt.Reason) {
+		t.Errorf("audit event reason is not valid UTF-8: %q", evt.Reason)
+	}
+	if !strings.HasSuffix(evt.Reason, "...") {
+		t.Errorf("expected truncated reason to end with '...', got: %s", evt.Reason)
+	}
+}
+
+// 21. Requeue audit-store failure is non-blocking and does not undo the requeue transition.
+func TestSyncer_Requeue_AuditStoreFailure_DoesNotUndoRequeue(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "requeue_audit_fail.db")
+	realStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer realStore.Close()
+
+	now := time.Now().UTC()
+	b := newTestBatch("batch-rq-audit-fail", "node-rq-fail", 1, now)
+	if err := realStore.PersistBatch(ctx, b); err != nil {
+		t.Fatalf("PersistBatch failed: %v", err)
+	}
+	if err := realStore.MarkBatchQuarantined(ctx, "batch-rq-audit-fail", "initial failure", now); err != nil {
+		t.Fatalf("MarkBatchQuarantined failed: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	sentinelAuditErr := errors.New("audit store disk I/O error during requeue")
+	mockAudit := &failingAuditStore{
+		AuditStore: realStore,
+		err:        sentinelAuditErr,
+	}
+
+	client := NewHTTPClient("http://127.0.0.1:59999", WithLogger(newDiscardLogger()))
+	syncer := NewSyncer(realStore, client, logger, WithAuditStore(mockAudit))
+
+	// Requeue should return nil (success in SQLite), despite audit store failure
+	if err := syncer.RequeueBatch(ctx, "batch-rq-audit-fail"); err != nil {
+		t.Fatalf("RequeueBatch failed unexpectedly: %v", err)
+	}
+
+	// Verify batch is in PENDING status in SQLite
+	rec, err := realStore.GetBatch(ctx, "batch-rq-audit-fail")
+	if err != nil {
+		t.Fatalf("GetBatch failed: %v", err)
+	}
+	if rec.SyncStatus != storage.SyncStatusPending {
+		t.Errorf("expected batch status PENDING, got %s", rec.SyncStatus)
+	}
+	if rec.Attempt != 0 {
+		t.Errorf("expected attempt 0, got %d", rec.Attempt)
+	}
+
+	// Verify error was logged
+	logged := logBuf.String()
+	if !strings.Contains(logged, "failed to record audit event for requeued batch") {
+		t.Errorf("expected log to contain audit error warning, got:\n%s", logged)
 	}
 }
