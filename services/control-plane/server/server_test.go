@@ -2016,3 +2016,394 @@ func TestServer_NodeActivityConsistency(t *testing.T) {
 		t.Errorf("expected sequence_number to remain 200 (monotonicity) via NATS, got %d", nodeNATS.SequenceNumber)
 	}
 }
+
+func TestServer_DurableNodeRegistry_RestartRehydration(t *testing.T) {
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, "control-plane-restart.db")
+
+	store1, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite 1 failed: %v", err)
+	}
+
+	srv1 := NewServer(newDiscardLogger(), WithIdempotencyStore(store1))
+	if err := srv1.InitError(); err != nil {
+		t.Fatalf("srv1 InitError: %v", err)
+	}
+	ts1 := httptest.NewServer(srv1.Routes())
+
+	// 1. Register node on Server 1
+	regTime := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-restart-1",
+		Hostname:     "worker-restart",
+		OS:           "linux",
+		Architecture: "amd64",
+		AgentVersion: "v1.5.0",
+		Capabilities: []string{"wifi", "ble"},
+		Labels:       map[string]string{"env": "prod", "rack": "a1"},
+		RegisteredAt: regTime,
+	}
+	regBody, _ := json.Marshal(reg)
+	res, err := http.Post(ts1.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regBody))
+	if err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on register, got %d", res.StatusCode)
+	}
+
+	// 2. Heartbeat on Server 1: status DEGRADED, seq 25
+	hb := types.Heartbeat{
+		NodeID:         "node-restart-1",
+		SequenceNumber: 25,
+		Timestamp:      time.Now().UTC(),
+		Status:         types.NodeStatusDegraded,
+	}
+	hbBody, _ := json.Marshal(hb)
+	res, err = http.Post(ts1.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(hbBody))
+	if err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on heartbeat, got %d", res.StatusCode)
+	}
+
+	// 3. Telemetry on Server 1: advance sequence to 100
+	b := sampleTestBatch("b-restart-1", "node-restart-1", 100)
+	bBody, _ := json.Marshal(b)
+	res, err = http.Post(ts1.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(bBody))
+	if err != nil {
+		t.Fatalf("telemetry post failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on telemetry, got %d", res.StatusCode)
+	}
+
+	// 4. Shutdown Server 1 and close store 1
+	ts1.Close()
+	if err := srv1.Close(); err != nil {
+		t.Fatalf("srv1 Close failed: %v", err)
+	}
+
+	// 5. Start Server 2 pointing to the same SQLite database file
+	store2, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite 2 failed: %v", err)
+	}
+
+	srv2 := NewServer(newDiscardLogger(), WithIdempotencyStore(store2))
+	if err := srv2.InitError(); err != nil {
+		t.Fatalf("srv2 InitError: %v", err)
+	}
+	ts2 := httptest.NewServer(srv2.Routes())
+	defer ts2.Close()
+	defer srv2.Close()
+
+	// 6. Verify in-memory state on Server 2 was completely rehydrated
+	rec, ok := srv2.GetNode("node-restart-1")
+	if !ok {
+		t.Fatalf("node-restart-1 not found in srv2 after restart rehydration")
+	}
+	if rec.NodeID != "node-restart-1" {
+		t.Errorf("expected node-restart-1, got %q", rec.NodeID)
+	}
+	if rec.Status != types.NodeStatusDegraded {
+		t.Errorf("expected status DEGRADED preserved after restart, got %q", rec.Status)
+	}
+	if rec.SequenceNumber != 100 {
+		t.Errorf("expected sequence number 100 preserved after restart, got %d", rec.SequenceNumber)
+	}
+	if rec.Hostname != "worker-restart" || rec.AgentVersion != "v1.5.0" {
+		t.Errorf("metadata mismatch after restart: host=%s, ver=%s", rec.Hostname, rec.AgentVersion)
+	}
+	if len(rec.Capabilities) != 2 || rec.Labels["env"] != "prod" {
+		t.Errorf("capabilities/labels mismatch after restart: %v / %v", rec.Capabilities, rec.Labels)
+	}
+
+	// 7. Verify HTTP GET /api/v1/nodes returns the node on Server 2
+	res, err = http.Get(ts2.URL + "/api/v1/nodes")
+	if err != nil {
+		t.Fatalf("GET /api/v1/nodes on srv2 failed: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", res.StatusCode)
+	}
+	var nodesList []*NodeRecord
+	if err := json.NewDecoder(res.Body).Decode(&nodesList); err != nil {
+		t.Fatalf("decode nodes list failed: %v", err)
+	}
+	if len(nodesList) != 1 || nodesList[0].NodeID != "node-restart-1" {
+		t.Fatalf("unexpected nodes list after restart: %v", nodesList)
+	}
+
+	// 8. Subsequent heartbeat on Server 2 succeeds without needing re-registration
+	hb2 := types.Heartbeat{
+		NodeID:         "node-restart-1",
+		SequenceNumber: 150,
+		Timestamp:      time.Now().UTC(),
+		Status:         types.NodeStatusHealthy,
+	}
+	hb2Body, _ := json.Marshal(hb2)
+	res, err = http.Post(ts2.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(hb2Body))
+	if err != nil {
+		t.Fatalf("heartbeat on srv2 failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for heartbeat on rehydrated node, got %d", res.StatusCode)
+	}
+
+	rec2, _ := srv2.GetNode("node-restart-1")
+	if rec2.SequenceNumber != 150 || rec2.Status != types.NodeStatusHealthy {
+		t.Errorf("expected sequence 150 and status HEALTHY on srv2, got seq=%d status=%s", rec2.SequenceNumber, rec2.Status)
+	}
+}
+
+func TestServer_DurableNodeRegistry_StartupRehydrationFailure(t *testing.T) {
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	// Intentionally close store before NewServer to force ListNodes to fail
+	_ = store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	if srv.InitError() == nil {
+		t.Fatalf("expected InitError on closed store, got nil")
+	}
+
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. GET /healthz returns 503
+	res, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 on healthz for uninitialized server, got %d", res.StatusCode)
+	}
+
+	// 2. POST /api/v1/nodes/register returns 503
+	reg := types.NodeRegistration{
+		NodeID:       "node-uninit-1",
+		Hostname:     "host-1",
+		RegisteredAt: time.Now().UTC(),
+	}
+	regBody, _ := json.Marshal(reg)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regBody))
+	if err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 on register for uninitialized server, got %d", res.StatusCode)
+	}
+
+	// 3. POST /api/v1/nodes/heartbeat returns 503
+	hb := types.Heartbeat{
+		NodeID:    "node-uninit-1",
+		Timestamp: time.Now().UTC(),
+		Status:    types.NodeStatusHealthy,
+	}
+	hbBody, _ := json.Marshal(hb)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(hbBody))
+	if err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 on heartbeat for uninitialized server, got %d", res.StatusCode)
+	}
+
+	// 4. GET /api/v1/nodes returns 503
+	res, err = http.Get(ts.URL + "/api/v1/nodes")
+	if err != nil {
+		t.Fatalf("GET /api/v1/nodes failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 on GET nodes for uninitialized server, got %d", res.StatusCode)
+	}
+
+	// 5. POST /api/v1/telemetry/batches returns 503
+	batch := sampleTestBatch("b-uninit-1", "node-uninit-1", 1)
+	bBody, _ := json.Marshal(batch)
+	res, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(bBody))
+	if err != nil {
+		t.Fatalf("batch post failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 on batch ingest for uninitialized server, got %d", res.StatusCode)
+	}
+}
+
+func TestServer_DurableNodeRegistry_StorageFailure_NoMemoryMutation(t *testing.T) {
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Register node-ok successfully
+	regOk := types.NodeRegistration{
+		NodeID:       "node-ok",
+		Hostname:     "host-ok",
+		RegisteredAt: time.Now().UTC(),
+	}
+	bOk, _ := json.Marshal(regOk)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bOk))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("regOk failed: status=%d, err=%v", res.StatusCode, err)
+	}
+	res.Body.Close()
+
+	// Close underlying store to force subsequent storage operations to fail
+	_ = store.Close()
+
+	// Attempt to register node-fail
+	regFail := types.NodeRegistration{
+		NodeID:       "node-fail",
+		Hostname:     "host-fail",
+		RegisteredAt: time.Now().UTC(),
+	}
+	bFail, _ := json.Marshal(regFail)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bFail))
+	if err != nil {
+		t.Fatalf("post failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500 Internal Server Error when store fails, got %d", res.StatusCode)
+	}
+
+	// node-fail must NOT exist in memory
+	if _, ok := srv.GetNode("node-fail"); ok {
+		t.Errorf("node-fail was added to in-memory map despite storage failure")
+	}
+
+	// Attempt heartbeat on node-ok with closed store
+	hb := types.Heartbeat{
+		NodeID:         "node-ok",
+		SequenceNumber: 999,
+		Status:         types.NodeStatusDegraded,
+		Timestamp:      time.Now().UTC(),
+	}
+	bHb, _ := json.Marshal(hb)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb))
+	if err != nil {
+		t.Fatalf("heartbeat post failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500 Internal Server Error when store fails during heartbeat, got %d", res.StatusCode)
+	}
+
+	// Memory state for node-ok must NOT have updated to sequence 999
+	recOk, _ := srv.GetNode("node-ok")
+	if recOk.SequenceNumber == 999 {
+		t.Errorf("node-ok in-memory sequence was mutated despite storage failure")
+	}
+}
+
+func TestServer_DurableNodeRegistry_ConcurrentInterleavedOps(t *testing.T) {
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Register initial node
+	reg := types.NodeRegistration{
+		NodeID:       "node-conc-server",
+		Hostname:     "host-conc",
+		RegisteredAt: time.Now().UTC(),
+	}
+	bReg, _ := json.Marshal(reg)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("initial register failed: %v", err)
+	}
+	res.Body.Close()
+
+	const iterations = 15
+	var wg sync.WaitGroup
+	wg.Add(iterations * 3)
+
+	// 1. Concurrent duplicate registrations
+	for i := 0; i < iterations; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			r := types.NodeRegistration{
+				NodeID:       "node-conc-server",
+				Hostname:     fmt.Sprintf("host-conc-%d", idx),
+				RegisteredAt: time.Now().UTC(),
+			}
+			b, _ := json.Marshal(r)
+			resp, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b))
+			if err == nil {
+				resp.Body.Close()
+			}
+		}(i)
+	}
+
+	// 2. Concurrent heartbeats
+	for i := 0; i < iterations; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			seq := int64((idx + 1) * 2)
+			hb := types.Heartbeat{
+				NodeID:         "node-conc-server",
+				SequenceNumber: seq,
+				Timestamp:      time.Now().UTC(),
+				Status:         types.NodeStatusHealthy,
+			}
+			b, _ := json.Marshal(hb)
+			resp, err := http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(b))
+			if err == nil {
+				resp.Body.Close()
+			}
+		}(i)
+	}
+
+	// 3. Concurrent telemetry batch ingestions
+	for i := 0; i < iterations; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			seq := int64((idx + 1) * 5)
+			batch := sampleTestBatch(fmt.Sprintf("b-conc-%d", idx), "node-conc-server", seq)
+			b, _ := json.Marshal(batch)
+			resp, err := http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(b))
+			if err == nil {
+				resp.Body.Close()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	rec, ok := srv.GetNode("node-conc-server")
+	if !ok {
+		t.Fatalf("node-conc-server missing from memory after concurrent ops")
+	}
+
+	// Max sequence number submitted was iterations * 5 = 75
+	expectedMaxSeq := int64(iterations * 5)
+	if rec.SequenceNumber != expectedMaxSeq {
+		t.Errorf("expected sequence number to reach %d, got %d", expectedMaxSeq, rec.SequenceNumber)
+	}
+}
