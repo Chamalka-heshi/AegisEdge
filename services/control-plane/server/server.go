@@ -60,8 +60,6 @@ type IdempotencyKey struct {
 	BatchID string
 }
 
-
-
 // historyRingBuffer is an efficient, bounded circular ring buffer storing IngestedBatch payloads.
 // It maintains items in strict FIFO arrival order with O(1) insertions, avoiding per-append slice shifting.
 type historyRingBuffer struct {
@@ -196,6 +194,7 @@ type Server struct {
 	maxPayloadSize int64
 	authConfig     AuthConfig
 	replayCache    *ReplayCache
+	initErr        error
 }
 
 // NewServer initializes a control-plane HTTP ingestion server with optional configuration.
@@ -229,6 +228,21 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 		}
 	}
 
+	// Rehydrate registered edge nodes from durable store before serving traffic
+	if s.store != nil {
+		nodes, err := s.store.ListNodes(context.Background())
+		if err != nil {
+			s.initErr = fmt.Errorf("failed to rehydrate node registry from durable store: %w", err)
+			s.logger.Error("failed to rehydrate node registry from durable store", slog.Any("error", err))
+		} else {
+			for _, n := range nodes {
+				s.nodes[n.NodeID] = n
+				s.nodesList = append(s.nodesList, n)
+			}
+			s.logger.Info("rehydrated node registry from durable store", slog.Int("node_count", len(nodes)))
+		}
+	}
+
 	// Warm in-memory history ring buffer from durable recent payloads if available
 	if s.store != nil {
 		recent, err := s.store.GetRecentBatches(context.Background(), s.history.cap())
@@ -252,6 +266,13 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 		}
 	}
 	return s
+}
+
+// InitError returns any initialization error encountered during startup rehydration.
+func (s *Server) InitError() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.initErr
 }
 
 // Close gracefully closes the server's underlying persistent storage.
@@ -317,6 +338,13 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if s.initErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unhealthy",
+			"error":  s.initErr.Error(),
+		})
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"status": "healthy",
 	})
@@ -324,6 +352,13 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // handleTelemetryBatches processes batch ingestion (POST) and batch queries (GET).
 func (s *Server) handleTelemetryBatches(w http.ResponseWriter, r *http.Request) {
+	if s.initErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_uninitialized",
+			Message: fmt.Sprintf("server failed initialization: %v", s.initErr),
+		})
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		s.handleIngestBatch(w, r)
@@ -619,20 +654,8 @@ func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, data any) {
 }
 
 // NodeRecord represents an edge node registered in the control plane.
-type NodeRecord struct {
-	NodeID          string            `json:"node_id"`
-	Status          types.NodeStatus  `json:"status"`
-	LastSeen        time.Time         `json:"last_seen"`
-	RegisteredAt    time.Time         `json:"registered_at"`
-	AgentVersion    string            `json:"agent_version,omitempty"`
-	ProtocolVersion string            `json:"protocol_version,omitempty"`
-	Hostname        string            `json:"hostname,omitempty"`
-	OS              string            `json:"os,omitempty"`
-	Architecture    string            `json:"architecture,omitempty"`
-	Capabilities    []string          `json:"capabilities,omitempty"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	SequenceNumber  int64             `json:"sequence_number,omitempty"`
-}
+// Aliased from storage.NodeRecord for durable persistence and domain consistency.
+type NodeRecord = storage.NodeRecord
 
 // RegistrationResponse represents the JSON response for node enrollment.
 type RegistrationResponse struct {
@@ -686,6 +709,13 @@ func (s *Server) writeAuthError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
+	if s.initErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_uninitialized",
+			Message: fmt.Sprintf("server failed initialization: %v", s.initErr),
+		})
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
@@ -758,66 +788,96 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now().UTC()
+	record := &storage.NodeRecord{
+		NodeID:          reg.NodeID,
+		Status:          types.NodeStatusHealthy,
+		LastSeen:        now,
+		RegisteredAt:    now,
+		AgentVersion:    reg.AgentVersion,
+		ProtocolVersion: "v1",
+		Hostname:        reg.Hostname,
+		OS:              reg.OS,
+		Architecture:    reg.Architecture,
+		Capabilities:    reg.Capabilities,
+		Labels:          reg.Labels,
+	}
+
+	// 1. Persist to durable store first (without holding s.mu across disk I/O)
+	var isNew bool
+	if s.store != nil {
+		var err error
+		isNew, err = s.store.RegisterNode(r.Context(), record)
+		if err != nil {
+			s.logger.Error("failed to persist node registration in durable store",
+				slog.String("node_id", reg.NodeID),
+				slog.Any("error", err),
+			)
+			s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+				Error:   "internal_server_error",
+				Message: "failed to persist node registration",
+			})
+			return
+		}
+	} else {
+		isNew = true
+	}
+
+	// 2. Reconcile in-memory state under lock (only after successful durable storage)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now().UTC()
-	if existing, exists := s.nodes[reg.NodeID]; exists {
-		// Idempotent duplicate registration: update last seen & metadata
-		existing.LastSeen = now
-		if reg.Hostname != "" {
-			existing.Hostname = reg.Hostname
-		}
-		if reg.AgentVersion != "" {
-			existing.AgentVersion = reg.AgentVersion
-		}
-		if len(reg.Capabilities) > 0 {
-			existing.Capabilities = reg.Capabilities
-		}
-		if len(reg.Labels) > 0 {
-			existing.Labels = reg.Labels
-		}
+	if isNew {
+		s.nodes[reg.NodeID] = record
+		s.nodesList = append(s.nodesList, record)
 
-		s.logger.Info("duplicate node registration received (idempotent update)",
+		s.logger.Info("edge node successfully registered",
 			slog.String("node_id", reg.NodeID),
+			slog.Time("registered_at", record.RegisteredAt),
 		)
-		s.writeJSON(w, http.StatusOK, RegistrationResponse{
-			Status:       "already_registered",
+		s.writeJSON(w, http.StatusCreated, RegistrationResponse{
+			Status:       "registered",
 			NodeID:       reg.NodeID,
-			RegisteredAt: existing.RegisteredAt,
+			RegisteredAt: record.RegisteredAt,
 		})
 		return
 	}
 
-	record := &NodeRecord{
-		NodeID:       reg.NodeID,
-		Status:       types.NodeStatusHealthy,
-		LastSeen:     now,
-		RegisteredAt: now,
-		AgentVersion: reg.AgentVersion,
-		Hostname:     reg.Hostname,
-		OS:           reg.OS,
-		Architecture: reg.Architecture,
-		Capabilities: reg.Capabilities,
-		Labels:       reg.Labels,
+	// Duplicate registration: update existing in-memory copy with merged values from record
+	existing, exists := s.nodes[reg.NodeID]
+	if exists && existing != nil {
+		existing.LastSeen = record.LastSeen
+		existing.Hostname = record.Hostname
+		existing.AgentVersion = record.AgentVersion
+		existing.Capabilities = record.Capabilities
+		existing.Labels = record.Labels
+		if record.SequenceNumber > existing.SequenceNumber {
+			existing.SequenceNumber = record.SequenceNumber
+		}
+	} else {
+		s.nodes[reg.NodeID] = record
+		s.nodesList = append(s.nodesList, record)
+		existing = record
 	}
 
-	s.nodes[reg.NodeID] = record
-	s.nodesList = append(s.nodesList, record)
-
-	s.logger.Info("edge node successfully registered",
+	s.logger.Info("duplicate node registration received (idempotent update)",
 		slog.String("node_id", reg.NodeID),
-		slog.Time("registered_at", now),
 	)
-
-	s.writeJSON(w, http.StatusCreated, RegistrationResponse{
-		Status:       "registered",
+	s.writeJSON(w, http.StatusOK, RegistrationResponse{
+		Status:       "already_registered",
 		NodeID:       reg.NodeID,
-		RegisteredAt: now,
+		RegisteredAt: existing.RegisteredAt,
 	})
 }
 
 func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if s.initErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_uninitialized",
+			Message: fmt.Sprintf("server failed initialization: %v", s.initErr),
+		})
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
@@ -882,27 +942,69 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now().UTC()
+
+	// 1. Persist to durable store first (without holding s.mu across disk I/O)
+	if s.store != nil {
+		err := s.store.UpdateNodeHeartbeat(r.Context(), hb.NodeID, hb.Status, hb.SequenceNumber, now)
+		if err != nil {
+			if errors.Is(err, storage.ErrNodeNotFound) {
+				s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+					Error:   "node_not_found",
+					Message: fmt.Sprintf("node %q is not registered with control plane", hb.NodeID),
+				})
+				return
+			}
+			s.logger.Error("failed to update node heartbeat in durable store",
+				slog.String("node_id", hb.NodeID),
+				slog.Any("error", err),
+			)
+			s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+				Error:   "internal_server_error",
+				Message: "failed to persist node heartbeat",
+			})
+			return
+		}
+	} else {
+		s.mu.RLock()
+		_, exists := s.nodes[hb.NodeID]
+		s.mu.RUnlock()
+		if !exists {
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+				Error:   "node_not_found",
+				Message: fmt.Sprintf("node %q is not registered with control plane", hb.NodeID),
+			})
+			return
+		}
+	}
+
+	// 2. Reconcile in-memory state under lock (only after successful durable storage)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	record, exists := s.nodes[hb.NodeID]
 	if !exists {
-		s.writeJSON(w, http.StatusNotFound, ErrorResponse{
-			Error:   "node_not_found",
-			Message: fmt.Sprintf("node %q is not registered with control plane", hb.NodeID),
-		})
-		return
+		record = &storage.NodeRecord{
+			NodeID:         hb.NodeID,
+			Status:         hb.Status,
+			LastSeen:       now,
+			RegisteredAt:   now,
+			SequenceNumber: hb.SequenceNumber,
+		}
+		s.nodes[hb.NodeID] = record
+		s.nodesList = append(s.nodesList, record)
+	} else {
+		record.LastSeen = now
+		record.Status = hb.Status
+		if hb.SequenceNumber > record.SequenceNumber {
+			record.SequenceNumber = hb.SequenceNumber
+		}
 	}
-
-	now := time.Now().UTC()
-	record.LastSeen = now
-	record.Status = hb.Status
-	record.SequenceNumber = hb.SequenceNumber
 
 	s.logger.Debug("node heartbeat acknowledged",
 		slog.String("node_id", hb.NodeID),
 		slog.String("status", string(hb.Status)),
-		slog.Int64("sequence_number", hb.SequenceNumber),
+		slog.Int64("sequence_number", record.SequenceNumber),
 	)
 
 	s.writeJSON(w, http.StatusOK, HeartbeatResponse{
@@ -913,6 +1015,13 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+	if s.initErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_uninitialized",
+			Message: fmt.Sprintf("server failed initialization: %v", s.initErr),
+		})
+		return
+	}
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
