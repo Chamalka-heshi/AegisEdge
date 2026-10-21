@@ -751,3 +751,637 @@ func TestSQLiteStore_QueryFailure_DistinguishedFromCorruption(t *testing.T) {
 		t.Errorf("closed store error must not be classified as ErrCorruptPayload")
 	}
 }
+
+func TestSQLiteStore_Node_RegisterAndGet(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	record := &NodeRecord{
+		NodeID:          "node-reg-1",
+		Status:          types.NodeStatusHealthy,
+		LastSeen:        now,
+		RegisteredAt:    now,
+		AgentVersion:    "v1.0.0",
+		ProtocolVersion: "v1",
+		Hostname:        "worker-alpha",
+		OS:              "linux",
+		Architecture:    "amd64",
+		Capabilities:    []string{"gpu", "tpu"},
+		Labels:          map[string]string{"zone": "us-east-1", "tier": "edge"},
+		SequenceNumber:  0,
+	}
+
+	isNew, err := store.RegisterNode(ctx, record)
+	if err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+	if !isNew {
+		t.Fatalf("expected isNew=true on first registration")
+	}
+
+	retrieved, err := store.GetNode(ctx, "node-reg-1")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+
+	if retrieved.NodeID != record.NodeID {
+		t.Errorf("expected NodeID %q, got %q", record.NodeID, retrieved.NodeID)
+	}
+	if retrieved.Status != types.NodeStatusHealthy {
+		t.Errorf("expected Status %q, got %q", types.NodeStatusHealthy, retrieved.Status)
+	}
+	if retrieved.Hostname != "worker-alpha" {
+		t.Errorf("expected Hostname 'worker-alpha', got %q", retrieved.Hostname)
+	}
+	if retrieved.OS != "linux" || retrieved.Architecture != "amd64" {
+		t.Errorf("expected linux/amd64, got %s/%s", retrieved.OS, retrieved.Architecture)
+	}
+	if len(retrieved.Capabilities) != 2 || retrieved.Capabilities[0] != "gpu" || retrieved.Capabilities[1] != "tpu" {
+		t.Errorf("unexpected capabilities: %v", retrieved.Capabilities)
+	}
+	if retrieved.Labels["zone"] != "us-east-1" || retrieved.Labels["tier"] != "edge" {
+		t.Errorf("unexpected labels: %v", retrieved.Labels)
+	}
+	if !retrieved.RegisteredAt.Equal(now) {
+		t.Errorf("expected RegisteredAt %v, got %v", now, retrieved.RegisteredAt)
+	}
+}
+
+func TestSQLiteStore_Node_DuplicateRegistration_Semantics(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	t0 := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Millisecond)
+	initial := &NodeRecord{
+		NodeID:          "node-dup-1",
+		Status:          types.NodeStatusHealthy,
+		LastSeen:        t0,
+		RegisteredAt:    t0,
+		AgentVersion:    "v1.0.0",
+		ProtocolVersion: "v1",
+		Hostname:        "orig-host",
+		OS:              "linux",
+		Architecture:    "arm64",
+		Capabilities:    []string{"camera"},
+		Labels:          map[string]string{"rack": "r1"},
+		SequenceNumber:  50,
+	}
+
+	isNew, err := store.RegisterNode(ctx, initial)
+	if err != nil || !isNew {
+		t.Fatalf("initial register failed: isNew=%v, err=%v", isNew, err)
+	}
+
+	// Change status via heartbeat to DEGRADED
+	t1 := t0.Add(10 * time.Minute)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-dup-1", types.NodeStatusDegraded, 75, t1); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat failed: %v", err)
+	}
+
+	// Re-register with empty optional fields
+	t2 := time.Now().UTC().Truncate(time.Millisecond)
+	dupEmpty := &NodeRecord{
+		NodeID:          "node-dup-1",
+		Status:          types.NodeStatusHealthy, // request says healthy, but existing is degraded
+		LastSeen:        t2,
+		RegisteredAt:    t2,  // new timestamp in payload, but must NOT overwrite original
+		AgentVersion:    "",  // empty: must not erase "v1.0.0"
+		ProtocolVersion: "",  // empty: must not erase "v1"
+		Hostname:        "",  // empty: must not erase "orig-host"
+		OS:              "",  // empty: must not erase "linux"
+		Architecture:    "",  // empty: must not erase "arm64"
+		Capabilities:    nil, // nil: must not erase ["camera"]
+		Labels:          nil, // nil: must not erase {"rack": "r1"}
+		SequenceNumber:  10,  // lower sequence: must not regress 75
+	}
+
+	isNewDup, err := store.RegisterNode(ctx, dupEmpty)
+	if err != nil {
+		t.Fatalf("RegisterNode duplicate failed: %v", err)
+	}
+	if isNewDup {
+		t.Fatalf("expected isNewDup=false on duplicate registration")
+	}
+
+	// Verify existing metadata preserved
+	afterDup, err := store.GetNode(ctx, "node-dup-1")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if !afterDup.RegisteredAt.Equal(t0) {
+		t.Errorf("RegisteredAt was mutated: expected %v, got %v", t0, afterDup.RegisteredAt)
+	}
+	if afterDup.Status != types.NodeStatusDegraded {
+		t.Errorf("Status was reset: expected DEGRADED, got %v", afterDup.Status)
+	}
+	if afterDup.SequenceNumber != 75 {
+		t.Errorf("SequenceNumber regressed: expected 75, got %d", afterDup.SequenceNumber)
+	}
+	if afterDup.Hostname != "orig-host" {
+		t.Errorf("Hostname erased: expected 'orig-host', got %q", afterDup.Hostname)
+	}
+	if afterDup.AgentVersion != "v1.0.0" {
+		t.Errorf("AgentVersion erased: expected 'v1.0.0', got %q", afterDup.AgentVersion)
+	}
+	if len(afterDup.Capabilities) != 1 || afterDup.Capabilities[0] != "camera" {
+		t.Errorf("Capabilities erased: got %v", afterDup.Capabilities)
+	}
+	if afterDup.Labels["rack"] != "r1" {
+		t.Errorf("Labels erased: got %v", afterDup.Labels)
+	}
+	if !afterDup.LastSeen.Equal(t2) {
+		t.Errorf("LastSeen not updated: expected %v, got %v", t2, afterDup.LastSeen)
+	}
+
+	// Re-register with explicit new non-empty metadata
+	t3 := t2.Add(5 * time.Minute)
+	dupUpdated := &NodeRecord{
+		NodeID:         "node-dup-1",
+		LastSeen:       t3,
+		RegisteredAt:   t3,
+		Hostname:       "new-host",
+		AgentVersion:   "v2.0.0",
+		Capabilities:   []string{"camera", "radar"},
+		Labels:         map[string]string{"rack": "r2", "env": "prod"},
+		SequenceNumber: 80,
+	}
+	isNewDup2, err := store.RegisterNode(ctx, dupUpdated)
+	if err != nil || isNewDup2 {
+		t.Fatalf("re-register with new metadata failed: isNew=%v, err=%v", isNewDup2, err)
+	}
+
+	afterDup2, _ := store.GetNode(ctx, "node-dup-1")
+	if afterDup2.Hostname != "new-host" {
+		t.Errorf("expected updated Hostname 'new-host', got %q", afterDup2.Hostname)
+	}
+	if afterDup2.AgentVersion != "v2.0.0" {
+		t.Errorf("expected updated AgentVersion 'v2.0.0', got %q", afterDup2.AgentVersion)
+	}
+	if len(afterDup2.Capabilities) != 2 || afterDup2.Capabilities[1] != "radar" {
+		t.Errorf("expected updated Capabilities, got %v", afterDup2.Capabilities)
+	}
+	if afterDup2.Labels["env"] != "prod" {
+		t.Errorf("expected updated Labels, got %v", afterDup2.Labels)
+	}
+	if afterDup2.SequenceNumber != 80 {
+		t.Errorf("expected SequenceNumber 80, got %d", afterDup2.SequenceNumber)
+	}
+	if !afterDup2.RegisteredAt.Equal(t0) {
+		t.Errorf("RegisteredAt must still be original t0: expected %v, got %v", t0, afterDup2.RegisteredAt)
+	}
+}
+
+func TestSQLiteStore_Node_List_DeterministicOrdering(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	t0 := time.Now().UTC().Truncate(time.Millisecond)
+	nodes := []*NodeRecord{
+		{NodeID: "node-c", RegisteredAt: t0.Add(20 * time.Second), LastSeen: t0},
+		{NodeID: "node-a", RegisteredAt: t0.Add(10 * time.Second), LastSeen: t0},
+		{NodeID: "node-b", RegisteredAt: t0.Add(30 * time.Second), LastSeen: t0},
+		// Same timestamp to test tie-breaker by node_id ASC
+		{NodeID: "node-z", RegisteredAt: t0, LastSeen: t0},
+		{NodeID: "node-m", RegisteredAt: t0, LastSeen: t0},
+	}
+
+	for _, n := range nodes {
+		if _, err := store.RegisterNode(ctx, n); err != nil {
+			t.Fatalf("RegisterNode %s failed: %v", n.NodeID, err)
+		}
+	}
+
+	list, err := store.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListNodes failed: %v", err)
+	}
+	if len(list) != 5 {
+		t.Fatalf("expected 5 nodes, got %d", len(list))
+	}
+
+	// Expected order:
+	// 1. t0: node-m (alphabetical tie-breaker)
+	// 2. t0: node-z
+	// 3. t0+10s: node-a
+	// 4. t0+20s: node-c
+	// 5. t0+30s: node-b
+	expectedOrder := []string{"node-m", "node-z", "node-a", "node-c", "node-b"}
+	for i, exp := range expectedOrder {
+		if list[i].NodeID != exp {
+			t.Errorf("position %d: expected %q, got %q", i, exp, list[i].NodeID)
+		}
+	}
+}
+
+func TestSQLiteStore_Node_Heartbeat_SuccessAndUnchanged(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	_, err = store.RegisterNode(ctx, &NodeRecord{
+		NodeID:       "node-hb-1",
+		Status:       types.NodeStatusHealthy,
+		RegisteredAt: now,
+		LastSeen:     now,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+
+	// 1. Successful heartbeat
+	hbTime1 := now.Add(5 * time.Second)
+	err = store.UpdateNodeHeartbeat(ctx, "node-hb-1", types.NodeStatusHealthy, 10, hbTime1)
+	if err != nil {
+		t.Fatalf("UpdateNodeHeartbeat failed: %v", err)
+	}
+
+	rec, _ := store.GetNode(ctx, "node-hb-1")
+	if rec.SequenceNumber != 10 || !rec.LastSeen.Equal(hbTime1) {
+		t.Errorf("heartbeat 1 verification failed: seq=%d, lastSeen=%v", rec.SequenceNumber, rec.LastSeen)
+	}
+
+	// 2. Unchanged heartbeat: same status and sequence number!
+	// Must NOT return ErrNodeNotFound (protects against RowsAffected() == 0 bug)
+	hbTime2 := hbTime1.Add(5 * time.Second)
+	err = store.UpdateNodeHeartbeat(ctx, "node-hb-1", types.NodeStatusHealthy, 10, hbTime2)
+	if err != nil {
+		t.Fatalf("identical heartbeat failed: %v", err)
+	}
+
+	rec2, _ := store.GetNode(ctx, "node-hb-1")
+	if !rec2.LastSeen.Equal(hbTime2) {
+		t.Errorf("expected LastSeen %v on unchanged heartbeat, got %v", hbTime2, rec2.LastSeen)
+	}
+}
+
+func TestSQLiteStore_Node_Heartbeat_MissingNode(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	err = store.UpdateNodeHeartbeat(ctx, "missing-node", types.NodeStatusHealthy, 1, time.Now().UTC())
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("expected ErrNodeNotFound, got %v", err)
+	}
+}
+
+func TestSQLiteStore_Node_Heartbeat_MonotonicSequence(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	_, _ = store.RegisterNode(ctx, &NodeRecord{
+		NodeID:         "node-hb-mono",
+		RegisteredAt:   now,
+		SequenceNumber: 100,
+	})
+
+	// Delayed heartbeat with lower sequence number (50 < 100)
+	later := now.Add(10 * time.Second)
+	err = store.UpdateNodeHeartbeat(ctx, "node-hb-mono", types.NodeStatusHealthy, 50, later)
+	if err != nil {
+		t.Fatalf("UpdateNodeHeartbeat failed: %v", err)
+	}
+
+	rec, _ := store.GetNode(ctx, "node-hb-mono")
+	if rec.SequenceNumber != 100 {
+		t.Errorf("SequenceNumber regressed: expected 100, got %d", rec.SequenceNumber)
+	}
+	if !rec.LastSeen.Equal(later) {
+		t.Errorf("LastSeen must advance to %v, got %v", later, rec.LastSeen)
+	}
+}
+
+func TestSQLiteStore_Node_TelemetryActivity_AtomicWithBatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	regTime := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	_, err = store.RegisterNode(ctx, &NodeRecord{
+		NodeID:         "node-act-atomic",
+		RegisteredAt:   regTime,
+		LastSeen:       regTime,
+		SequenceNumber: 10,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+
+	// 1. Ingest new batch
+	batch := sampleBatch("node-act-atomic", "b-atom-1", 50)
+	ingestedAt := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	isNew, err := store.RecordBatch(ctx, batch, ingestedAt)
+	if err != nil || !isNew {
+		t.Fatalf("RecordBatch failed: isNew=%v, err=%v", isNew, err)
+	}
+
+	rec, _ := store.GetNode(ctx, "node-act-atomic")
+	if rec.SequenceNumber != 50 {
+		t.Errorf("expected sequence number 50 in cp_nodes, got %d", rec.SequenceNumber)
+	}
+	if !rec.LastSeen.Equal(ingestedAt) {
+		t.Errorf("expected LastSeen %v, got %v", ingestedAt, rec.LastSeen)
+	}
+
+	// 2. Duplicate batch: must NOT update LastSeen or sequence number
+	ingestedAtDup := ingestedAt.Add(1 * time.Hour)
+	isNewDup, err := store.RecordBatch(ctx, batch, ingestedAtDup)
+	if err != nil {
+		t.Fatalf("duplicate RecordBatch failed: %v", err)
+	}
+	if isNewDup {
+		t.Fatalf("expected isNewDup=false for duplicate batch")
+	}
+
+	recDup, _ := store.GetNode(ctx, "node-act-atomic")
+	if recDup.SequenceNumber != 50 {
+		t.Errorf("duplicate batch modified sequence number: expected 50, got %d", recDup.SequenceNumber)
+	}
+	if !recDup.LastSeen.Equal(ingestedAt) {
+		t.Errorf("duplicate batch modified LastSeen: expected %v, got %v", ingestedAt, recDup.LastSeen)
+	}
+}
+
+func TestSQLiteStore_Node_TelemetryActivity_UnknownNode_NoFabrication(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// Ingest batch for unregistered node
+	batch := sampleBatch("ghost-node", "b-ghost-1", 100)
+	ingestedAt := time.Now().UTC()
+	isNew, err := store.RecordBatch(ctx, batch, ingestedAt)
+	if err != nil || !isNew {
+		t.Fatalf("RecordBatch failed for unknown node: isNew=%v, err=%v", isNew, err)
+	}
+
+	// Batch must be safely persisted
+	has, err := store.HasBatch(ctx, "ghost-node", "b-ghost-1")
+	if err != nil || !has {
+		t.Fatalf("expected batch to be persisted: has=%v, err=%v", has, err)
+	}
+
+	// But no synthetic node should exist in cp_nodes
+	_, err = store.GetNode(ctx, "ghost-node")
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Errorf("expected ErrNodeNotFound for unknown node, got %v", err)
+	}
+
+	list, err := store.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListNodes failed: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("expected 0 nodes in registry, got %d", len(list))
+	}
+}
+
+func TestSQLiteStore_Node_TelemetryActivity_RollbackOnFailure(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	_, _ = store.RegisterNode(ctx, &NodeRecord{
+		NodeID:         "node-rollback-1",
+		RegisteredAt:   time.Now().UTC(),
+		SequenceNumber: 5,
+	})
+
+	// Inject error after payload insert
+	store.HookAfterPayloadInsert = func() error {
+		return errors.New("simulated disk error before commit")
+	}
+
+	batch := sampleBatch("node-rollback-1", "b-rollback-1", 99)
+	isNew, err := store.RecordBatch(ctx, batch, time.Now().UTC())
+	if err == nil {
+		t.Fatalf("expected RecordBatch to fail on injected hook, got nil error")
+	}
+	if isNew {
+		t.Fatalf("expected isNew=false on failure")
+	}
+
+	// Verify complete transaction rollback:
+	// 1. Batch metadata NOT stored
+	has, _ := store.HasBatch(ctx, "node-rollback-1", "b-rollback-1")
+	if has {
+		t.Errorf("batch metadata was persisted despite rollback")
+	}
+
+	// 2. Payload NOT stored
+	_, err = store.GetPayload(ctx, "node-rollback-1", "b-rollback-1")
+	if !errors.Is(err, ErrBatchNotFound) {
+		t.Errorf("payload was persisted despite rollback")
+	}
+
+	// 3. Node activity NOT mutated
+	rec, _ := store.GetNode(ctx, "node-rollback-1")
+	if rec.SequenceNumber != 5 {
+		t.Errorf("node sequence was mutated despite rollback: expected 5, got %d", rec.SequenceNumber)
+	}
+}
+
+func TestSQLiteStore_Node_PersistenceReopen(t *testing.T) {
+	ctx := context.Background()
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, "node_persistence.db")
+
+	store1, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite 1 failed: %v", err)
+	}
+
+	t0 := time.Date(2026, 9, 15, 8, 30, 0, 0, time.UTC)
+	_, err = store1.RegisterNode(ctx, &NodeRecord{
+		NodeID:          "node-disk-1",
+		Status:          types.NodeStatusHealthy,
+		RegisteredAt:    t0,
+		LastSeen:        t0,
+		Hostname:        "disk-host-alpha",
+		AgentVersion:    "v1.2.3",
+		ProtocolVersion: "v1",
+		OS:              "linux",
+		Architecture:    "amd64",
+		Capabilities:    []string{"nvme", "gpu"},
+		Labels:          map[string]string{"env": "staging"},
+		SequenceNumber:  42,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode on store1 failed: %v", err)
+	}
+
+	if err := store1.Close(); err != nil {
+		t.Fatalf("store1 Close failed: %v", err)
+	}
+
+	// Reopen database from same file path
+	store2, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite 2 failed: %v", err)
+	}
+	defer store2.Close()
+
+	rec, err := store2.GetNode(ctx, "node-disk-1")
+	if err != nil {
+		t.Fatalf("GetNode on store2 failed: %v", err)
+	}
+
+	if rec.NodeID != "node-disk-1" {
+		t.Errorf("expected node-disk-1, got %q", rec.NodeID)
+	}
+	if rec.Hostname != "disk-host-alpha" || rec.AgentVersion != "v1.2.3" {
+		t.Errorf("unexpected metadata after reopen: %s / %s", rec.Hostname, rec.AgentVersion)
+	}
+	if rec.SequenceNumber != 42 {
+		t.Errorf("expected sequence 42 after reopen, got %d", rec.SequenceNumber)
+	}
+	if len(rec.Capabilities) != 2 || rec.Capabilities[0] != "nvme" {
+		t.Errorf("unexpected capabilities after reopen: %v", rec.Capabilities)
+	}
+	if rec.Labels["env"] != "staging" {
+		t.Errorf("unexpected labels after reopen: %v", rec.Labels)
+	}
+	if !rec.RegisteredAt.Equal(t0) {
+		t.Errorf("expected RegisteredAt %v after reopen, got %v", t0, rec.RegisteredAt)
+	}
+
+	list, err := store2.ListNodes(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListNodes on store2 failed: count=%d, err=%v", len(list), err)
+	}
+}
+
+func TestSQLiteStore_Node_CorruptJSON_Handling(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	_, _ = store.RegisterNode(ctx, &NodeRecord{
+		NodeID:       "node-corrupt-1",
+		RegisteredAt: now,
+		LastSeen:     now,
+	})
+
+	// Manually corrupt capabilities_json in database
+	_, err = store.db.Exec(`UPDATE cp_nodes SET capabilities_json = 'not-valid-json' WHERE node_id = 'node-corrupt-1';`)
+	if err != nil {
+		t.Fatalf("raw DB corruption failed: %v", err)
+	}
+
+	// 1. GetNode on corrupted record
+	rec, err := store.GetNode(ctx, "node-corrupt-1")
+	if err == nil {
+		t.Fatalf("expected error on corrupt node record, got nil")
+	}
+	if !errors.Is(err, ErrCorruptNodeRecord) {
+		t.Errorf("expected error to unwrap to ErrCorruptNodeRecord, got %v", err)
+	}
+	if rec == nil || rec.NodeID != "node-corrupt-1" {
+		t.Errorf("expected partially recovered record, got %v", rec)
+	}
+
+	// 2. ListNodes on table containing corrupted record
+	list, err := store.ListNodes(ctx)
+	if err == nil {
+		t.Fatalf("expected ListNodes to return error on corrupt JSON, got nil")
+	}
+	if !errors.Is(err, ErrCorruptNodeRecord) {
+		t.Errorf("expected error to unwrap to ErrCorruptNodeRecord, got %v", err)
+	}
+	if len(list) != 1 || list[0].NodeID != "node-corrupt-1" {
+		t.Errorf("expected ListNodes to return the node despite corrupt JSON, got %v", list)
+	}
+}
+
+func TestSQLiteStore_Node_ConcurrentUpdates(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	_, err = store.RegisterNode(ctx, &NodeRecord{
+		NodeID:         "node-conc-1",
+		RegisteredAt:   now,
+		LastSeen:       now,
+		SequenceNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+
+	const goroutines = 25
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+
+	// Goroutines updating heartbeat
+	for i := 0; i < goroutines; i++ {
+		seq := int64((i + 1) * 2)
+		go func(s int64) {
+			defer wg.Done()
+			_ = store.UpdateNodeHeartbeat(ctx, "node-conc-1", types.NodeStatusHealthy, s, time.Now().UTC())
+		}(seq)
+	}
+
+	// Goroutines updating telemetry activity
+	for i := 0; i < goroutines; i++ {
+		seq := int64((i + 1) * 3)
+		go func(s int64) {
+			defer wg.Done()
+			_, _ = store.UpdateNodeTelemetryActivity(ctx, "node-conc-1", s, time.Now().UTC())
+		}(seq)
+	}
+
+	wg.Wait()
+
+	rec, err := store.GetNode(ctx, "node-conc-1")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+
+	// Max sequence sent is goroutines * 3 = 75
+	expectedMax := int64(goroutines * 3)
+	if rec.SequenceNumber != expectedMax {
+		t.Errorf("expected sequence number to reach %d under concurrent monotonic updates, got %d", expectedMax, rec.SequenceNumber)
+	}
+}
