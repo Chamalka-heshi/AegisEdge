@@ -218,6 +218,10 @@ func main() {
 		server.WithIdempotencyStore(store),
 		server.WithMaxHistory(cfg.MaxHistoryBatches),
 	)
+	if err := srvInstance.InitError(); err != nil {
+		logger.Error("failed to rehydrate node registry from durable storage", slog.Any("error", err))
+		os.Exit(1)
+	}
 	srvInstance.SetAuthConfig(authConfig)
 
 	httpServer := &http.Server{
