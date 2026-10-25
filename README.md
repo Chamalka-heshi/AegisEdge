@@ -117,6 +117,7 @@ A local NATS/JetStream development environment is available (see [`docs/developm
   * `edge/agent/recovery`: Persistent runtime state and safe restart recovery coordinator (`Manager`, `Tracker`) enforcing the core invariant: **RESTART MUST NEVER BY ITSELF AUTHORIZE ACTION EXECUTION**. Bounded recovery states (`RECOVERY_NOT_REQUIRED`, `RECOVERY_LOADING`, `RECOVERY_RECONCILING`, `RECOVERY_BLOCKED`, `RECOVERY_COMPLETE`, `RECOVERY_FAILED`), SQLite WAL checkpoints (Migration v9), fail-closed reconciliation of in-flight mitigations (`EXECUTING -> UNKNOWN_RECONCILIATION_REQUIRED`), blocked readiness on ambiguous actions (`503`), reconciliation of `PENDING` actions to `SKIPPED`, expiration of stale verifications to `TIMED_OUT`, required health check `recovery`, structured recovery audit events, and Prometheus recovery metrics without arbitrary shell commands or real host mutation (Phase 6.13, see [`ADR-0015`](docs/decisions/ADR-0015-persistent-runtime-state-and-safe-restart-recovery.md)).
   * `edge/agent/coordination`: Bounded, offline-first Edge ↔ Control-Plane coordination layer (`Coordinator`, `Tracker`, `HTTPClient`) enforcing the invariant: **EDGE OPERATES AUTONOMOUSLY OFFLINE $\longrightarrow$ CONTROL PLANE AVAILABLE $\longrightarrow$ EDGE REGISTERS / HEARTBEATS $\longrightarrow$ COORDINATION WHEN AVAILABLE $\longrightarrow$ EDGE REMAINS SAFE AND AUTONOMOUS IF LOST**. Persists durable node identity via SQLite WAL Migration v10 (`node_identity`), registers inventory and capabilities at `POST /api/v1/nodes/register`, broadcasts liveness and monotonic sequence numbers at `POST /api/v1/nodes/heartbeat`, tracks bounded connection lifecycle (`DISCONNECTED`, `CONNECTING`, `CONNECTED`, `DEGRADED`, `STOPPING`), implements exponential backoff reconnection (1s to 30s), registers non-critical health check `health.CheckControlPlane` (`required = false` preserving offline `/readyz` 200 OK), recovers in-memory control-plane restarts via automatic re-registration, records 8 dedicated audit events, and exposes 6 operational Prometheus metrics (`aegisedge_control_plane_*`) with graceful teardown at order 30 (Phase 6.14, see [`ADR-0016`](docs/decisions/ADR-0016-edge-control-plane-coordination.md)).
   * `shared/types`, `services/control-plane`, `edge/agent`: Secure Edge–Control-Plane communication layer enforcing **EDGE OPERATES AUTONOMOUSLY OFFLINE $\longrightarrow$ PERSISTS LOCALLY $\longrightarrow$ AUTHENTICATES WHEN AVAILABLE $\longrightarrow$ COORDINATES SECURELY $\longrightarrow$ REMAINS SAFE IF CP IS UNAVAILABLE**. Implements HMAC-SHA256 request signing over canonical strings binding HTTP method, route, timestamp, nonce, and payload digest. Provides constant-time verification, per-node credential isolation with secure JSON file loading (`-node-secrets-file` and `NODE_SECRETS_FILE`) with duplicate key rejection and fail-closed validation, sliding-window anti-replay (5m clock skew window + thread-safe memory-bounded `ReplayCache`), granular authorization tiers (public, node-authenticated with anti-impersonation, admin Bearer token), fail-closed TLS configuration validation, auth failure metric `aegisedge_control_plane_auth_failures_total`, and `CONTROL_PLANE_AUTH_FAILED` audit logging without compromising offline edge readiness or autonomy (Phase 6.15 & 6.15.1, see [`ADR-0017`](docs/decisions/ADR-0017-secure-edge-control-plane-communication.md)).
+  * `services/control-plane`: Operational storage readiness and decoupled lifecycle health checking (`Ping`, `/healthz`, `/readyz`). Implements bounded SQLite storage health probes (`SELECT 1` with 2-second timeout), explicit graceful shutdown signaling (`MarkShuttingDown()`, `Server.Close()`), and decoupled liveness probing preventing storage lock contention from triggering process kill signals (Phase 6.29 Stage 6).
 * **DESIGNED**:
   * Autonomous Incident Response Architecture: Full response lifecycle model, operator approval ticketing, and automated telemetry verification (Phase 6.1 Design Only, see [ADR-0012](docs/decisions/ADR-0012-autonomous-incident-response.md)).
   * ML Model Distribution & Autonomous Rollback Architecture: Staged deployment, network transport, and autonomous policy-based rollback (Phase 5.5D Design Only; crash-consistent filesystem activation is not implemented, see [ADR-0009 §31](docs/decisions/ADR-0009-edge-anomaly-detection.md#31-phase-55d--ml-model-distribution--deployment-architecture)).
@@ -124,6 +125,135 @@ A local NATS/JetStream development environment is available (see [`docs/developm
   * Real host actuators, production remediation, authenticated operator identities, cryptographic approval signatures, non-repudiation, tamper-proof audit logging, approval UI/API, and identity federation.
   * Ed25519 cryptographic signing, central model registry service, model distribution network transport, automated policy-driven rollback engine.
   * External operator notification infrastructure.
+
+---
+
+## Control-Plane Operational Health & Lifecycle Probes (`/healthz` and `/readyz`)
+
+The control-plane HTTP server provides two decoupled health endpoints to distinguish process vitality from service readiness:
+
+| Endpoint | Role | Evaluation Scope | Healthy Status | Unhealthy Status | Supported HTTP Methods |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| **`/healthz`** | **Liveness Probe** | Process and event loop vitality. Returns `200 OK` unless startup initialization failed. | `200 OK` | `503 Service Unavailable` | `GET` only (others return `405 Method Not Allowed`, `Allow: GET`) |
+| **`/readyz`** | **Readiness Probe** | Ingress traffic readiness. Verifies initialization, storage responsiveness, and active lifecycle state. | `200 OK` | `503 Service Unavailable` | `GET`, `HEAD` (others return `405 Method Not Allowed`, `Allow: GET, HEAD`) |
+
+### Endpoint Details & Behavioral Contracts
+
+#### 1. Liveness (`GET /healthz`)
+* **Purpose**: Confirms that the control-plane process is alive and handling HTTP requests.
+* **Isolation from Storage**: `/healthz` **never** executes database queries or storage probes. A transient database lock or slow query will **not** cause `/healthz` to fail.
+* **Startup Failure**: If startup rehydration encounters an unrecoverable failure (`s.initErr != nil`), `/healthz` returns `HTTP 503 Service Unavailable`:
+  ```json
+  {
+    "status": "unhealthy",
+    "error": "failed to rehydrate node registry from durable store: ..."
+  }
+  ```
+* **Normal Operation**: Returns `HTTP 200 OK`:
+  ```json
+  {
+    "status": "healthy"
+  }
+  ```
+
+#### 2. Readiness (`GET /readyz`, `HEAD /readyz`)
+* **Purpose**: Confirms that the control-plane instance is prepared to accept edge node registrations, heartbeats, and telemetry batch submissions.
+* **Bounded Storage Probe**:
+  * Executes a context-bounded storage health probe via `IdempotencyStore.Ping(ctx)`.
+  * The probe duration is bounded by a per-request timeout defaulting to **`2 * time.Second`** (`DefaultStorageProbeTimeout`), preventing slow I/O or SQLite locks from hanging the readiness check.
+  * The SQLite implementation issues a lightweight `SELECT 1;` query against the database connection.
+  * **Important Scope Limitation**: The `SELECT 1` probe verifies basic database connection and engine responsiveness only; it **does not** guarantee future write transaction success, physical disk space availability, or successful ingestion.
+* **Graceful Shutdown Integration**:
+  * Upon receiving an OS termination signal (`SIGINT` / `SIGTERM`) or when `Server.Close()` is called, the server executes `MarkShuttingDown()`.
+  * Once marked, `/readyz` immediately returns `HTTP 503 Service Unavailable`, allowing upstream proxies, load balancers, or edge clients to divert or pause traffic before the HTTP listener drains active connections.
+* **Responses & Status Codes**:
+  * **Ready (`HTTP 200 OK`)**: Initialization succeeded, shutdown has not begun, and the storage probe succeeded:
+    ```json
+    {
+      "status": "ready",
+      "checks": {
+        "storage": "healthy"
+      }
+    }
+    ```
+  * **Storage Unavailable (`HTTP 503 Service Unavailable`)**: The storage probe failed, timed out, or the database connection was closed:
+    ```json
+    {
+      "status": "not_ready",
+      "checks": {
+        "storage": "unhealthy"
+      },
+      "error": "storage_unavailable"
+    }
+    ```
+  * **Server Uninitialized (`HTTP 503 Service Unavailable`)**: Startup rehydration failed or no store was configured:
+    ```json
+    {
+      "status": "not_ready",
+      "checks": {
+        "storage": "unhealthy"
+      },
+      "error": "server_uninitialized"
+    }
+    ```
+  * **Server Shutting Down (`HTTP 503 Service Unavailable`)**: Graceful shutdown has been initiated:
+    ```json
+    {
+      "status": "not_ready",
+      "checks": {
+        "storage": "healthy"
+      },
+      "error": "server_shutting_down"
+    }
+    ```
+* **`HEAD` Requests**: For `HEAD /readyz`, the server returns identical HTTP status codes (`200` or `503`) and `Content-Type: application/json` headers without transmitting a response body.
+
+#### 3. Decoupling Liveness from Readiness
+A readiness failure does **not** automatically imply a liveness failure:
+* When storage experiences transient busy locks, checkpointing pauses, or slow disk writes, `/readyz` returns `503` so upstream traffic routers hold or redirect incoming edge traffic.
+* If `/healthz` were coupled to storage probes, process supervisors would misinterpret transient storage latency as process failure and terminate the control plane (`SIGKILL`), interrupting in-flight SQLite WAL commits, escalating contention, and risking data loss across premature restarts.
+
+### Practical Local Verification Examples (PowerShell)
+
+In the local development environment, query the running control plane (e.g. `http://localhost:8080`) using `Invoke-WebRequest`:
+
+#### A. Querying Liveness (`/healthz`)
+```powershell
+# Check process vitality (returns 200 OK under normal operation)
+$liveness = Invoke-WebRequest -Uri "http://localhost:8080/healthz" -UseBasicParsing
+Write-Host "Liveness Status:" $liveness.StatusCode
+Write-Host "Liveness Body:"   $liveness.Content
+```
+
+#### B. Querying Readiness (`/readyz`)
+```powershell
+# Check traffic readiness (returns 200 OK when ready, 503 when degraded or draining)
+try {
+    $readiness = Invoke-WebRequest -Uri "http://localhost:8080/readyz" -UseBasicParsing
+    Write-Host "Readiness Status:" $readiness.StatusCode
+    Write-Host "Readiness Body:"   $readiness.Content
+} catch {
+    $resp = $_.Exception.Response
+    $statusCode = [int]$resp.StatusCode
+    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $body = $reader.ReadToEnd()
+    Write-Host "Readiness Not Ready (HTTP $statusCode): $body"
+}
+```
+
+#### C. Querying Readiness via `HEAD` Method
+```powershell
+# Lightweight probe returning HTTP status and headers with zero payload body
+$head = Invoke-WebRequest -Uri "http://localhost:8080/readyz" -Method HEAD -UseBasicParsing
+Write-Host "HEAD Status:" $head.StatusCode
+```
+
+#### Interpreting Responses in Local Development
+* **`HTTP 200 OK`**: The control-plane process is fully initialized, SQLite storage is responsive, and the instance is accepting edge registrations, heartbeats, and telemetry batches.
+* **`HTTP 503 Service Unavailable`**: The instance should not receive incoming requests. Inspect the JSON `"error"` field:
+  * `"storage_unavailable"`: Database probe failed or exceeded 2s timeout (e.g., file lock or closed pool).
+  * `"server_uninitialized"`: Startup rehydration failed during launch.
+  * `"server_shutting_down"`: Control plane received `SIGINT`/`SIGTERM` or `Close()` was called; instance is draining in-flight requests.
 
 ### Running Tests
 
