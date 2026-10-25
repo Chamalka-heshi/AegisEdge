@@ -47,15 +47,17 @@ var (
 
 // NodeRegistration contains device identity and capability metadata sent during enrollment.
 type NodeRegistration struct {
-	NodeID       string            `json:"node_id"`
-	Hostname     string            `json:"hostname"`
-	OS           string            `json:"os"`
-	Architecture string            `json:"architecture"`
-	IPAddress    string            `json:"ip_address,omitempty"`
-	AgentVersion string            `json:"agent_version,omitempty"`
-	Capabilities []string          `json:"capabilities,omitempty"`
-	Labels       map[string]string `json:"labels,omitempty"`
-	RegisteredAt time.Time         `json:"registered_at"`
+	NodeID          string            `json:"node_id"`
+	Hostname        string            `json:"hostname"`
+	OS              string            `json:"os"`
+	Architecture    string            `json:"architecture"`
+	IPAddress       string            `json:"ip_address,omitempty"`
+	AgentVersion    string            `json:"agent_version,omitempty"`
+	Capabilities    []string          `json:"capabilities,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	RegisteredAt    time.Time         `json:"registered_at"`
+	UpdatedAt       *time.Time        `json:"updated_at,omitempty"`
+	MetadataVersion int64             `json:"metadata_version,omitempty"`
 }
 
 // Validate verifies the NodeRegistration payload.
@@ -68,6 +70,12 @@ func (n *NodeRegistration) Validate() error {
 	}
 	if n.RegisteredAt.IsZero() {
 		return ErrInvalidTimestamp
+	}
+	if n.UpdatedAt != nil && n.UpdatedAt.IsZero() {
+		return ErrInvalidTimestamp
+	}
+	if n.MetadataVersion < 0 {
+		return ErrInvalidSequence
 	}
 	return nil
 }

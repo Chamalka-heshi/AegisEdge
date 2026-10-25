@@ -33,6 +33,10 @@ type SQLiteStore struct {
 	// after payload is inserted into cp_telemetry_payloads but before node activity is updated.
 	// Returning an error aborts the transaction and rolls back, simulating node activity update failure.
 	HookAfterPayloadInsert func() error
+
+	// HookAfterHeartbeatUpdate is an optional test hook called inside UpdateNodeHeartbeat
+	// after node existence and freshness checks are completed, before transaction commit.
+	HookAfterHeartbeatUpdate func(nodeID string) error
 }
 
 // OpenSQLite initializes a SQLite database connection, applies WAL pragmas,
@@ -137,20 +141,23 @@ func (s *SQLiteStore) initSchema() error {
 		ON cp_telemetry_payloads(ingested_at ASC);
 
 	CREATE TABLE IF NOT EXISTS cp_nodes (
-		node_id           TEXT PRIMARY KEY NOT NULL,
-		status            TEXT NOT NULL,
-		last_seen         TEXT NOT NULL,
-		registered_at     TEXT NOT NULL,
-		agent_version     TEXT NOT NULL DEFAULT '',
-		protocol_version  TEXT NOT NULL DEFAULT '',
-		hostname          TEXT NOT NULL DEFAULT '',
-		os                TEXT NOT NULL DEFAULT '',
-		architecture      TEXT NOT NULL DEFAULT '',
-		capabilities_json TEXT NOT NULL DEFAULT '[]',
-		labels_json       TEXT NOT NULL DEFAULT '{}',
-		sequence_number   INTEGER NOT NULL DEFAULT 0,
-		created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		updated_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		node_id              TEXT PRIMARY KEY NOT NULL,
+		status               TEXT NOT NULL,
+		last_seen            TEXT NOT NULL,
+		registered_at        TEXT NOT NULL,
+		agent_version        TEXT NOT NULL DEFAULT '',
+		protocol_version     TEXT NOT NULL DEFAULT '',
+		hostname             TEXT NOT NULL DEFAULT '',
+		os                   TEXT NOT NULL DEFAULT '',
+		architecture         TEXT NOT NULL DEFAULT '',
+		capabilities_json    TEXT NOT NULL DEFAULT '[]',
+		labels_json          TEXT NOT NULL DEFAULT '{}',
+		sequence_number      INTEGER NOT NULL DEFAULT 0,
+		heartbeat_sequence   INTEGER NOT NULL DEFAULT 0,
+		metadata_version     INTEGER NOT NULL DEFAULT 0,
+		metadata_updated_at  TEXT NOT NULL DEFAULT '',
+		created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_cp_nodes_reg_order
@@ -162,6 +169,48 @@ func (s *SQLiteStore) initSchema() error {
 
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("failed to execute schema initialization: %w", err)
+	}
+
+	// Safe, idempotent migration for existing databases lacking separate sequence or metadata columns
+	cols := make(map[string]bool)
+	rows, err := s.db.Query(`PRAGMA table_info(cp_nodes);`)
+	if err != nil {
+		return fmt.Errorf("failed to check cp_nodes schema: %w", err)
+	}
+	for rows.Next() {
+		var (
+			cid           int
+			name, colType string
+			notNull, pk   int
+			dfltVal       interface{}
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err == nil {
+			cols[name] = true
+		}
+	}
+	rows.Close()
+
+	if !cols["heartbeat_sequence"] {
+		if _, err := s.db.Exec(`ALTER TABLE cp_nodes ADD COLUMN heartbeat_sequence INTEGER NOT NULL DEFAULT 0;`); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("failed to migrate cp_nodes for heartbeat_sequence: %w", err)
+			}
+		}
+	}
+	if !cols["metadata_version"] {
+		if _, err := s.db.Exec(`ALTER TABLE cp_nodes ADD COLUMN metadata_version INTEGER NOT NULL DEFAULT 0;`); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("failed to migrate cp_nodes for metadata_version: %w", err)
+			}
+		}
+	}
+	if !cols["metadata_updated_at"] {
+		if _, err := s.db.Exec(`ALTER TABLE cp_nodes ADD COLUMN metadata_updated_at TEXT NOT NULL DEFAULT '';`); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("failed to migrate cp_nodes for metadata_updated_at: %w", err)
+			}
+		}
+		_, _ = s.db.Exec(`UPDATE cp_nodes SET metadata_updated_at = registered_at WHERE metadata_updated_at = '';`)
 	}
 	return nil
 }
@@ -196,8 +245,8 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 	}
 	defer tx.Rollback() // Safe: no-op if tx.Commit() succeeds
 
-	collectedAtStr := batch.CollectedAt.UTC().Format(time.RFC3339Nano)
-	ingestedAtStr := ingestedAt.UTC().Format(time.RFC3339Nano)
+	collectedAtStr := formatTimestamp(batch.CollectedAt)
+	ingestedAtStr := formatTimestamp(ingestedAt)
 
 	// Step 1: Insert idempotency metadata into cp_ingested_batches
 	queryMeta := `
@@ -259,23 +308,44 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 	}
 
 	// Step 4: Atomically update registered-node activity within the same transaction.
-	// If the node is not registered, the WHERE clause matches 0 rows and leaves cp_nodes untouched (no synthetic node created).
-	queryNodeActivity := `
-	UPDATE cp_nodes
-	SET last_seen = ?,
-	    sequence_number = CASE WHEN ? > sequence_number THEN ? ELSE sequence_number END,
-	    updated_at = ?
-	WHERE node_id = ?;
-	`
-	_, err = tx.ExecContext(ctx, queryNodeActivity,
-		ingestedAtStr,
-		batch.SequenceNumber,
-		batch.SequenceNumber,
-		ingestedAtStr,
-		batch.NodeID,
-	)
-	if err != nil {
-		return false, fmt.Errorf("failed to update node activity in batch transaction: %w", err)
+	// If the node is not registered, leave cp_nodes untouched (no synthetic node created).
+	var existLastSeenStr string
+	var existSeq int64
+	err = tx.QueryRowContext(ctx, `SELECT last_seen, sequence_number FROM cp_nodes WHERE node_id = ?;`, batch.NodeID).Scan(&existLastSeenStr, &existSeq)
+	if err == nil {
+		existLastSeen, parseErr := parseStoredTimestamp(existLastSeenStr)
+		if parseErr != nil {
+			return false, &CorruptNodeRecordError{
+				NodeID: batch.NodeID,
+				Err:    fmt.Errorf("invalid last_seen timestamp %q: %w", existLastSeenStr, parseErr),
+			}
+		}
+		targetLastSeenStr := existLastSeenStr
+		if !ingestedAt.Before(existLastSeen) {
+			targetLastSeenStr = formatTimestamp(ingestedAt)
+		}
+		targetSeq := existSeq
+		if batch.SequenceNumber > existSeq {
+			targetSeq = batch.SequenceNumber
+		}
+		queryNodeActivity := `
+		UPDATE cp_nodes
+		SET last_seen = ?,
+		    sequence_number = ?,
+		    updated_at = ?
+		WHERE node_id = ?;
+		`
+		_, err = tx.ExecContext(ctx, queryNodeActivity,
+			targetLastSeenStr,
+			targetSeq,
+			targetLastSeenStr,
+			batch.NodeID,
+		)
+		if err != nil {
+			return false, fmt.Errorf("failed to update node activity in batch transaction: %w", err)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("failed to query node activity for batch transaction: %w", err)
 	}
 
 	// Step 5: Commit batch metadata, payload, and node activity atomically in a single fsync
@@ -459,6 +529,14 @@ func isDuplicateKeyError(err error) bool {
 		strings.Contains(errStr, "PRIMARY KEY constraint failed")
 }
 
+// TimestampFormat defines the canonical zero-padded fixed-width UTC timestamp layout (30 characters)
+// ensuring chronological sorting alignment across SQLite text columns.
+const TimestampFormat = "2006-01-02T15:04:05.000000000Z"
+
+func formatTimestamp(t time.Time) string {
+	return t.UTC().Format(TimestampFormat)
+}
+
 // parseStoredTimestamp parses an RFC3339Nano or RFC3339 formatted timestamp string.
 func parseStoredTimestamp(s string) (time.Time, error) {
 	t, err := time.Parse(time.RFC3339Nano, s)
@@ -504,15 +582,16 @@ func (s *SQLiteStore) RegisterNode(ctx context.Context, record *NodeRecord) (boo
 
 	// Check if node already exists
 	queryCheck := `
-	SELECT status, registered_at, sequence_number, hostname, agent_version, protocol_version, os, architecture, capabilities_json, labels_json
+	SELECT last_seen, status, registered_at, sequence_number, heartbeat_sequence, metadata_version, metadata_updated_at,
+	       hostname, agent_version, protocol_version, os, architecture, capabilities_json, labels_json
 	FROM cp_nodes WHERE node_id = ?;
 	`
 	var (
-		existStatus, existRegAtStr, existHost, existAgentVer, existProtoVer, existOS, existArch, existCapsJSON, existLabelsJSON string
-		existSeq                                                                                                                int64
+		existLastSeenStr, existStatus, existRegAtStr, existMetaTimeStr, existHost, existAgentVer, existProtoVer, existOS, existArch, existCapsJSON, existLabelsJSON string
+		existSeq, existHbSeq, existMetaVer                                                                                                                          int64
 	)
 	err = tx.QueryRowContext(ctx, queryCheck, record.NodeID).Scan(
-		&existStatus, &existRegAtStr, &existSeq,
+		&existLastSeenStr, &existStatus, &existRegAtStr, &existSeq, &existHbSeq, &existMetaVer, &existMetaTimeStr,
 		&existHost, &existAgentVer, &existProtoVer, &existOS, &existArch,
 		&existCapsJSON, &existLabelsJSON,
 	)
@@ -541,16 +620,23 @@ func (s *SQLiteStore) RegisterNode(ctx context.Context, record *NodeRecord) (boo
 			statusStr = string(types.NodeStatusHealthy)
 			record.Status = types.NodeStatusHealthy
 		}
-		regAtStr := record.RegisteredAt.UTC().Format(time.RFC3339Nano)
-		lastSeenStr := record.LastSeen.UTC().Format(time.RFC3339Nano)
+		regAtStr := formatTimestamp(record.RegisteredAt)
+		lastSeenStr := formatTimestamp(record.LastSeen)
+		metaTime := record.UpdatedAt
+		if metaTime.IsZero() {
+			metaTime = record.RegisteredAt
+		}
+		metaTimeStr := formatTimestamp(metaTime)
+		record.UpdatedAt = metaTime
 
 		queryInsert := `
 		INSERT INTO cp_nodes (
 			node_id, status, last_seen, registered_at,
 			agent_version, protocol_version, hostname, os, architecture,
-			capabilities_json, labels_json, sequence_number,
+			capabilities_json, labels_json, sequence_number, heartbeat_sequence,
+			metadata_version, metadata_updated_at,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 		`
 		_, err = tx.ExecContext(ctx, queryInsert,
 			record.NodeID,
@@ -565,6 +651,9 @@ func (s *SQLiteStore) RegisterNode(ctx context.Context, record *NodeRecord) (boo
 			capsJSON,
 			labelsJSON,
 			record.SequenceNumber,
+			record.HeartbeatSequence,
+			record.MetadataVersion,
+			metaTimeStr,
 			regAtStr,
 			lastSeenStr,
 		)
@@ -581,85 +670,160 @@ func (s *SQLiteStore) RegisterNode(ctx context.Context, record *NodeRecord) (boo
 	}
 
 	// Existing node duplicate registration:
-	// Rules:
-	// 1. Preserve original RegisteredAt
-	// 2. Preserve original Status
-	// 3. Preserve sequence_number (never regress)
-	// 4. Update last_seen
-	// 5. Update optional fields only if non-empty / non-zero
 	existRegAt, parseErr := parseStoredTimestamp(existRegAtStr)
-	if parseErr == nil {
-		record.RegisteredAt = existRegAt
+	if parseErr != nil {
+		return false, &CorruptNodeRecordError{
+			NodeID: record.NodeID,
+			Err:    fmt.Errorf("invalid registered_at timestamp %q: %w", existRegAtStr, parseErr),
+		}
 	}
+	record.RegisteredAt = existRegAt
+
+	existLastSeen, parseErr := parseStoredTimestamp(existLastSeenStr)
+	if parseErr != nil {
+		return false, &CorruptNodeRecordError{
+			NodeID: record.NodeID,
+			Err:    fmt.Errorf("invalid last_seen timestamp %q: %w", existLastSeenStr, parseErr),
+		}
+	}
+
+	existMetaTime, parseErr := parseStoredTimestamp(existMetaTimeStr)
+	if parseErr != nil {
+		existMetaTime = existRegAt
+	}
+
 	record.Status = types.NodeStatus(existStatus)
 	if existSeq > record.SequenceNumber {
 		record.SequenceNumber = existSeq
 	}
+	if existHbSeq > record.HeartbeatSequence {
+		record.HeartbeatSequence = existHbSeq
+	}
+
+	reqMetaTime := record.UpdatedAt
+	if reqMetaTime.IsZero() {
+		reqMetaTime = record.RegisteredAt
+	}
+	reqMetaVer := record.MetadataVersion
+
+	var shouldAdvanceMetadata bool
+	if reqMetaVer > existMetaVer {
+		shouldAdvanceMetadata = true
+	} else if reqMetaVer < existMetaVer {
+		shouldAdvanceMetadata = false
+	} else {
+		if reqMetaTime.After(existMetaTime) {
+			shouldAdvanceMetadata = true
+		} else if reqMetaTime.Before(existMetaTime) {
+			shouldAdvanceMetadata = false
+		} else {
+			// Equal version and equal timestamp: idempotent merge of non-empty fields
+			shouldAdvanceMetadata = true
+		}
+	}
+
+	targetLastSeenStr := existLastSeenStr
+	if record.LastSeen.After(existLastSeen) {
+		targetLastSeenStr = formatTimestamp(record.LastSeen)
+	} else {
+		record.LastSeen = existLastSeen
+	}
+
+	targetMetaVer := existMetaVer
+	targetMetaTimeStr := existMetaTimeStr
+	if targetMetaTimeStr == "" {
+		targetMetaTimeStr = formatTimestamp(existMetaTime)
+	}
 
 	mergedHostname := existHost
-	if record.Hostname != "" {
-		mergedHostname = record.Hostname
-	} else {
-		record.Hostname = existHost
-	}
-
 	mergedAgentVer := existAgentVer
-	if record.AgentVersion != "" {
-		mergedAgentVer = record.AgentVersion
-	} else {
-		record.AgentVersion = existAgentVer
-	}
-
 	mergedProtoVer := existProtoVer
-	if record.ProtocolVersion != "" {
-		mergedProtoVer = record.ProtocolVersion
-	} else {
-		record.ProtocolVersion = existProtoVer
-	}
-
 	mergedOS := existOS
-	if record.OS != "" {
-		mergedOS = record.OS
-	} else {
-		record.OS = existOS
-	}
-
 	mergedArch := existArch
-	if record.Architecture != "" {
-		mergedArch = record.Architecture
-	} else {
-		record.Architecture = existArch
-	}
-
 	mergedCapsJSON := existCapsJSON
-	if len(record.Capabilities) > 0 {
-		b, err := json.Marshal(record.Capabilities)
-		if err != nil {
-			return false, fmt.Errorf("failed to marshal capabilities: %w", err)
+	mergedLabelsJSON := existLabelsJSON
+
+	if shouldAdvanceMetadata {
+		targetMetaVer = reqMetaVer
+		targetMetaTimeStr = formatTimestamp(reqMetaTime)
+		record.MetadataVersion = targetMetaVer
+		record.UpdatedAt = reqMetaTime
+
+		if record.Hostname != "" {
+			mergedHostname = record.Hostname
+		} else {
+			record.Hostname = existHost
 		}
-		mergedCapsJSON = string(b)
+		if record.AgentVersion != "" {
+			mergedAgentVer = record.AgentVersion
+		} else {
+			record.AgentVersion = existAgentVer
+		}
+		if record.ProtocolVersion != "" {
+			mergedProtoVer = record.ProtocolVersion
+		} else {
+			record.ProtocolVersion = existProtoVer
+		}
+		if record.OS != "" {
+			mergedOS = record.OS
+		} else {
+			record.OS = existOS
+		}
+		if record.Architecture != "" {
+			mergedArch = record.Architecture
+		} else {
+			record.Architecture = existArch
+		}
+		if len(record.Capabilities) > 0 {
+			b, err := json.Marshal(record.Capabilities)
+			if err != nil {
+				return false, fmt.Errorf("failed to marshal capabilities: %w", err)
+			}
+			mergedCapsJSON = string(b)
+		} else {
+			var caps []string
+			if err := json.Unmarshal([]byte(existCapsJSON), &caps); err == nil {
+				record.Capabilities = caps
+			}
+		}
+		if len(record.Labels) > 0 {
+			b, err := json.Marshal(record.Labels)
+			if err != nil {
+				return false, fmt.Errorf("failed to marshal labels: %w", err)
+			}
+			mergedLabelsJSON = string(b)
+		} else {
+			var labels map[string]string
+			if err := json.Unmarshal([]byte(existLabelsJSON), &labels); err == nil {
+				record.Labels = labels
+			}
+		}
 	} else {
+		record.MetadataVersion = existMetaVer
+		record.UpdatedAt = existMetaTime
+		record.Hostname = existHost
+		record.AgentVersion = existAgentVer
+		record.ProtocolVersion = existProtoVer
+		record.OS = existOS
+		record.Architecture = existArch
 		var caps []string
 		if err := json.Unmarshal([]byte(existCapsJSON), &caps); err == nil {
 			record.Capabilities = caps
 		}
-	}
-
-	mergedLabelsJSON := existLabelsJSON
-	if len(record.Labels) > 0 {
-		b, err := json.Marshal(record.Labels)
-		if err != nil {
-			return false, fmt.Errorf("failed to marshal labels: %w", err)
-		}
-		mergedLabelsJSON = string(b)
-	} else {
 		var labels map[string]string
 		if err := json.Unmarshal([]byte(existLabelsJSON), &labels); err == nil {
 			record.Labels = labels
 		}
 	}
 
-	lastSeenStr := record.LastSeen.UTC().Format(time.RFC3339Nano)
+	targetSeq := existSeq
+	if record.SequenceNumber > existSeq {
+		targetSeq = record.SequenceNumber
+	}
+	targetHbSeq := existHbSeq
+	if record.HeartbeatSequence > existHbSeq {
+		targetHbSeq = record.HeartbeatSequence
+	}
 
 	queryUpdate := `
 	UPDATE cp_nodes SET
@@ -671,12 +835,15 @@ func (s *SQLiteStore) RegisterNode(ctx context.Context, record *NodeRecord) (boo
 		architecture = ?,
 		capabilities_json = ?,
 		labels_json = ?,
-		sequence_number = CASE WHEN ? > sequence_number THEN ? ELSE sequence_number END,
+		sequence_number = ?,
+		heartbeat_sequence = ?,
+		metadata_version = ?,
+		metadata_updated_at = ?,
 		updated_at = ?
 	WHERE node_id = ?;
 	`
 	_, err = tx.ExecContext(ctx, queryUpdate,
-		lastSeenStr,
+		targetLastSeenStr,
 		mergedHostname,
 		mergedAgentVer,
 		mergedProtoVer,
@@ -684,9 +851,11 @@ func (s *SQLiteStore) RegisterNode(ctx context.Context, record *NodeRecord) (boo
 		mergedArch,
 		mergedCapsJSON,
 		mergedLabelsJSON,
-		record.SequenceNumber,
-		record.SequenceNumber,
-		lastSeenStr,
+		targetSeq,
+		targetHbSeq,
+		targetMetaVer,
+		targetMetaTimeStr,
+		targetLastSeenStr,
 		record.NodeID,
 	)
 	if err != nil {
@@ -717,13 +886,14 @@ func (s *SQLiteStore) GetNode(ctx context.Context, nodeID string) (*NodeRecord, 
 	query := `
 	SELECT node_id, status, last_seen, registered_at,
 	       agent_version, protocol_version, hostname, os, architecture,
-	       capabilities_json, labels_json, sequence_number
+	       capabilities_json, labels_json, sequence_number, heartbeat_sequence,
+	       metadata_version, metadata_updated_at
 	FROM cp_nodes
 	WHERE node_id = ?;
 	`
 	var (
-		rec                                                    NodeRecord
-		statusStr, lastSeenStr, regAtStr, capsJSON, labelsJSON string
+		rec                                                                 NodeRecord
+		statusStr, lastSeenStr, regAtStr, capsJSON, labelsJSON, metaTimeStr string
 	)
 	err := s.db.QueryRowContext(ctx, query, nodeID).Scan(
 		&rec.NodeID,
@@ -738,6 +908,9 @@ func (s *SQLiteStore) GetNode(ctx context.Context, nodeID string) (*NodeRecord, 
 		&capsJSON,
 		&labelsJSON,
 		&rec.SequenceNumber,
+		&rec.HeartbeatSequence,
+		&rec.MetadataVersion,
+		&metaTimeStr,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -747,10 +920,22 @@ func (s *SQLiteStore) GetNode(ctx context.Context, nodeID string) (*NodeRecord, 
 	}
 
 	rec.Status = types.NodeStatus(statusStr)
-	rec.LastSeen, _ = parseStoredTimestamp(lastSeenStr)
-	rec.RegisteredAt, _ = parseStoredTimestamp(regAtStr)
-
 	var unmarshalErrs []error
+	var parseErr error
+	rec.LastSeen, parseErr = parseStoredTimestamp(lastSeenStr)
+	if parseErr != nil {
+		unmarshalErrs = append(unmarshalErrs, fmt.Errorf("invalid last_seen timestamp %q: %w", lastSeenStr, parseErr))
+	}
+	rec.RegisteredAt, parseErr = parseStoredTimestamp(regAtStr)
+	if parseErr != nil {
+		unmarshalErrs = append(unmarshalErrs, fmt.Errorf("invalid registered_at timestamp %q: %w", regAtStr, parseErr))
+	}
+	if metaTimeStr != "" {
+		rec.UpdatedAt, _ = parseStoredTimestamp(metaTimeStr)
+	} else {
+		rec.UpdatedAt = rec.RegisteredAt
+	}
+
 	if err := json.Unmarshal([]byte(capsJSON), &rec.Capabilities); err != nil {
 		unmarshalErrs = append(unmarshalErrs, fmt.Errorf("capabilities: %w", err))
 	}
@@ -779,7 +964,8 @@ func (s *SQLiteStore) ListNodes(ctx context.Context) ([]*NodeRecord, error) {
 	query := `
 	SELECT node_id, status, last_seen, registered_at,
 	       agent_version, protocol_version, hostname, os, architecture,
-	       capabilities_json, labels_json, sequence_number
+	       capabilities_json, labels_json, sequence_number, heartbeat_sequence,
+	       metadata_version, metadata_updated_at
 	FROM cp_nodes
 	ORDER BY registered_at ASC, node_id ASC;
 	`
@@ -794,8 +980,8 @@ func (s *SQLiteStore) ListNodes(ctx context.Context) ([]*NodeRecord, error) {
 
 	for rows.Next() {
 		var (
-			rec                                                    NodeRecord
-			statusStr, lastSeenStr, regAtStr, capsJSON, labelsJSON string
+			rec                                                                 NodeRecord
+			statusStr, lastSeenStr, regAtStr, capsJSON, labelsJSON, metaTimeStr string
 		)
 		if err := rows.Scan(
 			&rec.NodeID,
@@ -810,17 +996,40 @@ func (s *SQLiteStore) ListNodes(ctx context.Context) ([]*NodeRecord, error) {
 			&capsJSON,
 			&labelsJSON,
 			&rec.SequenceNumber,
+			&rec.HeartbeatSequence,
+			&rec.MetadataVersion,
+			&metaTimeStr,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan node record row: %w", err)
 		}
 
 		rec.Status = types.NodeStatus(statusStr)
-		rec.LastSeen, _ = parseStoredTimestamp(lastSeenStr)
-		rec.RegisteredAt, _ = parseStoredTimestamp(regAtStr)
-
 		var rowErr error
+		var parseErr error
+		rec.LastSeen, parseErr = parseStoredTimestamp(lastSeenStr)
+		if parseErr != nil {
+			rowErr = fmt.Errorf("invalid last_seen timestamp %q: %w", lastSeenStr, parseErr)
+		}
+		rec.RegisteredAt, parseErr = parseStoredTimestamp(regAtStr)
+		if parseErr != nil {
+			if rowErr != nil {
+				rowErr = errors.Join(rowErr, fmt.Errorf("invalid registered_at timestamp %q: %w", regAtStr, parseErr))
+			} else {
+				rowErr = fmt.Errorf("invalid registered_at timestamp %q: %w", regAtStr, parseErr)
+			}
+		}
+		if metaTimeStr != "" {
+			rec.UpdatedAt, _ = parseStoredTimestamp(metaTimeStr)
+		} else {
+			rec.UpdatedAt = rec.RegisteredAt
+		}
+
 		if err := json.Unmarshal([]byte(capsJSON), &rec.Capabilities); err != nil {
-			rowErr = fmt.Errorf("corrupt capabilities JSON: %w", err)
+			if rowErr != nil {
+				rowErr = errors.Join(rowErr, fmt.Errorf("corrupt capabilities JSON: %w", err))
+			} else {
+				rowErr = fmt.Errorf("corrupt capabilities JSON: %w", err)
+			}
 		}
 		if err := json.Unmarshal([]byte(labelsJSON), &rec.Labels); err != nil {
 			if rowErr != nil {
@@ -851,9 +1060,9 @@ func (s *SQLiteStore) ListNodes(ctx context.Context) ([]*NodeRecord, error) {
 	return nodes, nil
 }
 
-// UpdateNodeHeartbeat updates an existing node's status, last_seen, and advances sequence_number monotonically.
+// UpdateNodeHeartbeat updates an existing node's status, last_seen, and advances heartbeat_sequence monotonically.
 // Returns ErrNodeNotFound if the node is not registered.
-func (s *SQLiteStore) UpdateNodeHeartbeat(ctx context.Context, nodeID string, status types.NodeStatus, seqNum int64, heartbeatTime time.Time) error {
+func (s *SQLiteStore) UpdateNodeHeartbeat(ctx context.Context, nodeID string, status types.NodeStatus, hbSeq int64, heartbeatTime time.Time) error {
 	if strings.TrimSpace(nodeID) == "" {
 		return fmt.Errorf("%w: node_id cannot be empty", ErrInvalidMeta)
 	}
@@ -875,8 +1084,9 @@ func (s *SQLiteStore) UpdateNodeHeartbeat(ctx context.Context, nodeID string, st
 	defer tx.Rollback()
 
 	// Check existence via SELECT so unchanged heartbeat (status & sequence identical) is NOT misidentified as missing node
-	var dummy int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM cp_nodes WHERE node_id = ?;`, nodeID).Scan(&dummy)
+	var existLastSeenStr, existStatus string
+	var existHbSeq int64
+	err = tx.QueryRowContext(ctx, `SELECT last_seen, status, heartbeat_sequence FROM cp_nodes WHERE node_id = ?;`, nodeID).Scan(&existLastSeenStr, &existStatus, &existHbSeq)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNodeNotFound
@@ -884,21 +1094,60 @@ func (s *SQLiteStore) UpdateNodeHeartbeat(ctx context.Context, nodeID string, st
 		return fmt.Errorf("failed to verify node existence: %w", err)
 	}
 
-	heartbeatTimeStr := heartbeatTime.UTC().Format(time.RFC3339Nano)
+	existLastSeen, parseErr := parseStoredTimestamp(existLastSeenStr)
+	if parseErr != nil {
+		return &CorruptNodeRecordError{
+			NodeID: nodeID,
+			Err:    fmt.Errorf("invalid last_seen timestamp %q: %w", existLastSeenStr, parseErr),
+		}
+	}
+
+	// Ordering policy within heartbeat sequence domain:
+	// 1. Strictly newer timestamp (heartbeatTime.After(existLastSeen)): advance last_seen and status.
+	// 2. Older timestamp (heartbeatTime.Before(existLastSeen)): do not regress last_seen or status.
+	// 3. Equal timestamps (heartbeatTime.Equal(existLastSeen)):
+	//    - If hbSeq >= existHbSeq: advance status.
+	//    - If hbSeq < existHbSeq: do not regress status.
+	var advanceStatusAndLastSeen bool
+	if heartbeatTime.After(existLastSeen) {
+		advanceStatusAndLastSeen = true
+	} else if heartbeatTime.Equal(existLastSeen) && hbSeq >= existHbSeq {
+		advanceStatusAndLastSeen = true
+	}
+
+	targetLastSeenStr := existLastSeenStr
+	targetStatus := existStatus
+	if advanceStatusAndLastSeen {
+		targetLastSeenStr = formatTimestamp(heartbeatTime)
+		targetStatus = string(status)
+	}
+
+	targetHbSeq := existHbSeq
+	if hbSeq > existHbSeq {
+		targetHbSeq = hbSeq
+	}
+
+	// Optional test hook for simulating concurrency or failure after heartbeat read/check
+	if s.HookAfterHeartbeatUpdate != nil {
+		if err := s.HookAfterHeartbeatUpdate(nodeID); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("injected test failure in heartbeat hook: %w", err)
+		}
+	}
+
 	query := `
 	UPDATE cp_nodes
 	SET status = ?,
 	    last_seen = ?,
-	    sequence_number = CASE WHEN ? > sequence_number THEN ? ELSE sequence_number END,
+	    heartbeat_sequence = ?,
 	    updated_at = ?
 	WHERE node_id = ?;
 	`
 	_, err = tx.ExecContext(ctx, query,
-		string(status),
-		heartbeatTimeStr,
-		seqNum,
-		seqNum,
-		heartbeatTimeStr,
+		targetStatus,
+		targetLastSeenStr,
+		targetHbSeq,
+		targetLastSeenStr,
 		nodeID,
 	)
 	if err != nil {
@@ -931,8 +1180,9 @@ func (s *SQLiteStore) UpdateNodeTelemetryActivity(ctx context.Context, nodeID st
 	}
 	defer tx.Rollback()
 
-	var dummy int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM cp_nodes WHERE node_id = ?;`, nodeID).Scan(&dummy)
+	var existLastSeenStr string
+	var existSeq int64
+	err = tx.QueryRowContext(ctx, `SELECT last_seen, sequence_number FROM cp_nodes WHERE node_id = ?;`, nodeID).Scan(&existLastSeenStr, &existSeq)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Node is not registered: return (false, nil) without fabricating a node
@@ -941,27 +1191,39 @@ func (s *SQLiteStore) UpdateNodeTelemetryActivity(ctx context.Context, nodeID st
 		return false, fmt.Errorf("failed to verify node existence: %w", err)
 	}
 
-	ingestedAtStr := ingestedAt.UTC().Format(time.RFC3339Nano)
+	existLastSeen, parseErr := parseStoredTimestamp(existLastSeenStr)
+	if parseErr != nil {
+		return false, &CorruptNodeRecordError{
+			NodeID: nodeID,
+			Err:    fmt.Errorf("invalid last_seen timestamp %q: %w", existLastSeenStr, parseErr),
+		}
+	}
+	targetLastSeenStr := existLastSeenStr
+	if !ingestedAt.Before(existLastSeen) {
+		targetLastSeenStr = formatTimestamp(ingestedAt)
+	}
+
+	targetSeq := existSeq
+	if seqNum > existSeq {
+		targetSeq = seqNum
+	}
+
 	query := `
 	UPDATE cp_nodes
 	SET last_seen = ?,
-	    sequence_number = CASE WHEN ? > sequence_number THEN ? ELSE sequence_number END,
+	    sequence_number = ?,
 	    updated_at = ?
 	WHERE node_id = ?;
 	`
 	_, err = tx.ExecContext(ctx, query,
-		ingestedAtStr,
-		seqNum,
-		seqNum,
-		ingestedAtStr,
+		targetLastSeenStr,
+		targetSeq,
+		targetLastSeenStr,
 		nodeID,
 	)
 	if err != nil {
 		return false, fmt.Errorf("failed to update node telemetry activity: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("failed to commit telemetry activity update: %w", err)
-	}
-	return true, nil
+	return true, tx.Commit()
 }

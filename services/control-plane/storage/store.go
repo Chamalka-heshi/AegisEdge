@@ -87,18 +87,21 @@ type StoredBatch struct {
 
 // NodeRecord represents an edge node registered in the control plane.
 type NodeRecord struct {
-	NodeID          string            `json:"node_id"`
-	Status          types.NodeStatus  `json:"status"`
-	LastSeen        time.Time         `json:"last_seen"`
-	RegisteredAt    time.Time         `json:"registered_at"`
-	AgentVersion    string            `json:"agent_version,omitempty"`
-	ProtocolVersion string            `json:"protocol_version,omitempty"`
-	Hostname        string            `json:"hostname,omitempty"`
-	OS              string            `json:"os,omitempty"`
-	Architecture    string            `json:"architecture,omitempty"`
-	Capabilities    []string          `json:"capabilities,omitempty"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	SequenceNumber  int64             `json:"sequence_number,omitempty"`
+	NodeID            string            `json:"node_id"`
+	Status            types.NodeStatus  `json:"status"`
+	LastSeen          time.Time         `json:"last_seen"`
+	RegisteredAt      time.Time         `json:"registered_at"`
+	AgentVersion      string            `json:"agent_version,omitempty"`
+	ProtocolVersion   string            `json:"protocol_version,omitempty"`
+	Hostname          string            `json:"hostname,omitempty"`
+	OS                string            `json:"os,omitempty"`
+	Architecture      string            `json:"architecture,omitempty"`
+	Capabilities      []string          `json:"capabilities,omitempty"`
+	Labels            map[string]string `json:"labels,omitempty"`
+	SequenceNumber    int64             `json:"sequence_number,omitempty"`
+	HeartbeatSequence int64             `json:"heartbeat_sequence,omitempty"`
+	MetadataVersion   int64             `json:"metadata_version,omitempty"`
+	UpdatedAt         time.Time         `json:"updated_at,omitempty"`
 }
 
 // IdempotencyStore defines the contract for persistent control-plane deduplication, payload storage,

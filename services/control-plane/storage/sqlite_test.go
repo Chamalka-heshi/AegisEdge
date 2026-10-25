@@ -883,8 +883,11 @@ func TestSQLiteStore_Node_DuplicateRegistration_Semantics(t *testing.T) {
 	if afterDup.Status != types.NodeStatusDegraded {
 		t.Errorf("Status was reset: expected DEGRADED, got %v", afterDup.Status)
 	}
-	if afterDup.SequenceNumber != 75 {
-		t.Errorf("SequenceNumber regressed: expected 75, got %d", afterDup.SequenceNumber)
+	if afterDup.HeartbeatSequence != 75 {
+		t.Errorf("HeartbeatSequence regressed: expected 75, got %d", afterDup.HeartbeatSequence)
+	}
+	if afterDup.SequenceNumber != 50 {
+		t.Errorf("SequenceNumber regressed: expected 50, got %d", afterDup.SequenceNumber)
 	}
 	if afterDup.Hostname != "orig-host" {
 		t.Errorf("Hostname erased: expected 'orig-host', got %q", afterDup.Hostname)
@@ -1013,8 +1016,8 @@ func TestSQLiteStore_Node_Heartbeat_SuccessAndUnchanged(t *testing.T) {
 	}
 
 	rec, _ := store.GetNode(ctx, "node-hb-1")
-	if rec.SequenceNumber != 10 || !rec.LastSeen.Equal(hbTime1) {
-		t.Errorf("heartbeat 1 verification failed: seq=%d, lastSeen=%v", rec.SequenceNumber, rec.LastSeen)
+	if rec.HeartbeatSequence != 10 || !rec.LastSeen.Equal(hbTime1) {
+		t.Errorf("heartbeat 1 verification failed: hbSeq=%d, lastSeen=%v", rec.HeartbeatSequence, rec.LastSeen)
 	}
 
 	// 2. Unchanged heartbeat: same status and sequence number!
@@ -1055,9 +1058,10 @@ func TestSQLiteStore_Node_Heartbeat_MonotonicSequence(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	_, _ = store.RegisterNode(ctx, &NodeRecord{
-		NodeID:         "node-hb-mono",
-		RegisteredAt:   now,
-		SequenceNumber: 100,
+		NodeID:            "node-hb-mono",
+		RegisteredAt:      now,
+		SequenceNumber:    100,
+		HeartbeatSequence: 100,
 	})
 
 	// Delayed heartbeat with lower sequence number (50 < 100)
@@ -1068,6 +1072,9 @@ func TestSQLiteStore_Node_Heartbeat_MonotonicSequence(t *testing.T) {
 	}
 
 	rec, _ := store.GetNode(ctx, "node-hb-mono")
+	if rec.HeartbeatSequence != 100 {
+		t.Errorf("HeartbeatSequence regressed: expected 100, got %d", rec.HeartbeatSequence)
+	}
 	if rec.SequenceNumber != 100 {
 		t.Errorf("SequenceNumber regressed: expected 100, got %d", rec.SequenceNumber)
 	}
@@ -1379,9 +1386,413 @@ func TestSQLiteStore_Node_ConcurrentUpdates(t *testing.T) {
 		t.Fatalf("GetNode failed: %v", err)
 	}
 
-	// Max sequence sent is goroutines * 3 = 75
-	expectedMax := int64(goroutines * 3)
-	if rec.SequenceNumber != expectedMax {
-		t.Errorf("expected sequence number to reach %d under concurrent monotonic updates, got %d", expectedMax, rec.SequenceNumber)
+	expectedMaxTel := int64(goroutines * 3)
+	expectedMaxHb := int64(goroutines * 2)
+	if rec.SequenceNumber != expectedMaxTel {
+		t.Errorf("expected sequence number to reach %d, got %d", expectedMaxTel, rec.SequenceNumber)
+	}
+	if rec.HeartbeatSequence != expectedMaxHb {
+		t.Errorf("expected heartbeat sequence to reach %d, got %d", expectedMaxHb, rec.HeartbeatSequence)
+	}
+}
+
+// TestSQLiteStore_F02_TimestampOrdering_SubSecondAndBoundary verifies chronologically correct
+// timestamp comparison across exact-second, fractional-second, and second-boundary transitions.
+func TestSQLiteStore_F02_TimestampOrdering_SubSecondAndBoundary(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Exact-second initial registration: 12:00:00.000000000Z
+	tExact := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	rec := &NodeRecord{
+		NodeID:       "node-f02-subsec",
+		Status:       types.NodeStatusHealthy,
+		LastSeen:     tExact,
+		RegisteredAt: tExact,
+		Hostname:     "host-init",
+	}
+	if _, err := store.RegisterNode(ctx, rec); err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+
+	// 2. Sub-second update (500ms later): 12:00:00.500000000Z
+	// Must advance status and last_seen despite earlier timestamp ending in '00Z'
+	t500ms := time.Date(2026, 10, 25, 12, 0, 0, 500000000, time.UTC)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f02-subsec", types.NodeStatusDegraded, 10, t500ms); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat 500ms failed: %v", err)
+	}
+
+	node, err := store.GetNode(ctx, "node-f02-subsec")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if node.Status != types.NodeStatusDegraded {
+		t.Errorf("DEFECT F-02: status failed to advance to DEGRADED on fractional second: got %s", node.Status)
+	}
+	if !node.LastSeen.Equal(t500ms) {
+		t.Errorf("DEFECT F-02: LastSeen failed to advance to 500ms: expected %v, got %v", t500ms, node.LastSeen)
+	}
+
+	// 3. Stale update with fewer fractional digits: 12:00:00.100000000Z (.1Z vs .5Z)
+	// Must NOT regress status or last_seen
+	t100ms := time.Date(2026, 10, 25, 12, 0, 0, 100000000, time.UTC)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f02-subsec", types.NodeStatusHealthy, 5, t100ms); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat 100ms failed: %v", err)
+	}
+
+	nodeAfterStale, _ := store.GetNode(ctx, "node-f02-subsec")
+	if nodeAfterStale.Status != types.NodeStatusDegraded {
+		t.Errorf("DEFECT F-02: status regressed on stale sub-second heartbeat: got %s, expected DEGRADED", nodeAfterStale.Status)
+	}
+	if !nodeAfterStale.LastSeen.Equal(t500ms) {
+		t.Errorf("DEFECT F-02: LastSeen regressed on stale sub-second heartbeat: got %v, expected %v", nodeAfterStale.LastSeen, t500ms)
+	}
+
+	// 4. Stale update crossing second boundary: 11:59:59.900000000Z
+	// Must NOT regress status or last_seen
+	tBoundaryStale := time.Date(2026, 10, 25, 11, 59, 59, 900000000, time.UTC)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f02-subsec", types.NodeStatusHealthy, 2, tBoundaryStale); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat boundary stale failed: %v", err)
+	}
+
+	nodeAfterBoundary, _ := store.GetNode(ctx, "node-f02-subsec")
+	if nodeAfterBoundary.Status != types.NodeStatusDegraded {
+		t.Errorf("DEFECT F-02: status regressed on boundary stale heartbeat: got %s", nodeAfterBoundary.Status)
+	}
+
+	// 5. Subsequent update crossing into next second: 12:00:01.050000000Z
+	// Must advance status and last_seen
+	tNextSec := time.Date(2026, 10, 25, 12, 0, 1, 50000000, time.UTC)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f02-subsec", types.NodeStatusHealthy, 20, tNextSec); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat next second failed: %v", err)
+	}
+
+	nodeNextSec, _ := store.GetNode(ctx, "node-f02-subsec")
+	if nodeNextSec.Status != types.NodeStatusHealthy || !nodeNextSec.LastSeen.Equal(tNextSec) {
+		t.Errorf("failed to advance to next second: status=%s, lastSeen=%v", nodeNextSec.Status, nodeNextSec.LastSeen)
+	}
+}
+
+// TestSQLiteStore_F02_LegacyVariablePrecisionRows verifies that rows persisted with legacy variable-precision
+// RFC3339 format (e.g. without fractional seconds) are safely parsed and correctly compared without regression.
+func TestSQLiteStore_F02_LegacyVariablePrecisionRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// Direct raw SQL insert simulating a database created by an older version with unpadded timestamps
+	queryRawInsert := `
+	INSERT INTO cp_nodes (
+		node_id, status, last_seen, registered_at,
+		agent_version, protocol_version, hostname, os, architecture,
+		capabilities_json, labels_json, sequence_number,
+		created_at, updated_at
+	) VALUES (
+		'node-legacy-1', 'HEALTHY', '2026-10-25T12:00:00Z', '2026-10-25T12:00:00Z',
+		'v1.0.0', 'v1', 'host-legacy', 'linux', 'amd64',
+		'[]', '{}', 10,
+		'2026-10-25T12:00:00Z', '2026-10-25T12:00:00Z'
+	);
+	`
+	if _, err := store.db.Exec(queryRawInsert); err != nil {
+		t.Fatalf("raw insert of legacy node failed: %v", err)
+	}
+
+	// 1. Advance with sub-second heartbeat: 12:00:00.25Z
+	tNewer := time.Date(2026, 10, 25, 12, 0, 0, 250000000, time.UTC)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-legacy-1", types.NodeStatusDegraded, 20, tNewer); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat on legacy row failed: %v", err)
+	}
+
+	node, err := store.GetNode(ctx, "node-legacy-1")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if node.Status != types.NodeStatusDegraded || !node.LastSeen.Equal(tNewer) {
+		t.Errorf("DEFECT F-02: legacy row failed to advance to sub-second timestamp: status=%s, lastSeen=%v", node.Status, node.LastSeen)
+	}
+
+	// 2. Reject stale heartbeat against legacy row: 11:59:59Z
+	tOlder := time.Date(2026, 10, 25, 11, 59, 59, 0, time.UTC)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-legacy-1", types.NodeStatusHealthy, 5, tOlder); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat stale on legacy row failed: %v", err)
+	}
+
+	nodeAfterStale, _ := store.GetNode(ctx, "node-legacy-1")
+	if nodeAfterStale.Status != types.NodeStatusDegraded || !nodeAfterStale.LastSeen.Equal(tNewer) {
+		t.Errorf("DEFECT F-02: legacy row regressed on older timestamp: status=%s, lastSeen=%v", nodeAfterStale.Status, nodeAfterStale.LastSeen)
+	}
+}
+
+func TestSQLiteStore_F05_SeparateSequenceDomains(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	t0 := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	rec := &NodeRecord{
+		NodeID:            "node-f05-seq",
+		Status:            types.NodeStatusHealthy,
+		LastSeen:          t0,
+		RegisteredAt:      t0,
+		SequenceNumber:    0,
+		HeartbeatSequence: 0,
+	}
+	if _, err := store.RegisterNode(ctx, rec); err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+
+	// 1. Ingestion: Telemetry advances sequence_number to 100
+	t1 := t0.Add(10 * time.Second)
+	updated, err := store.UpdateNodeTelemetryActivity(ctx, "node-f05-seq", 100, t1)
+	if err != nil || !updated {
+		t.Fatalf("UpdateNodeTelemetryActivity failed: updated=%v, err=%v", updated, err)
+	}
+	node, err := store.GetNode(ctx, "node-f05-seq")
+	if err != nil || node.SequenceNumber != 100 || node.HeartbeatSequence != 0 {
+		t.Fatalf("expected seq=100, hbSeq=0, got seq=%d, hbSeq=%d", node.SequenceNumber, node.HeartbeatSequence)
+	}
+
+	// 2. Heartbeat with seq 50 and newer timestamp T2 arrives
+	t2 := t1.Add(10 * time.Second)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f05-seq", types.NodeStatusHealthy, 50, t2); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat failed: %v", err)
+	}
+	node, err = store.GetNode(ctx, "node-f05-seq")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if node.Status != types.NodeStatusHealthy || node.SequenceNumber != 100 || node.HeartbeatSequence != 50 {
+		t.Errorf("unexpected node state after hb 50: status=%s, seq=%d (want 100), hbSeq=%d (want 50)",
+			node.Status, node.SequenceNumber, node.HeartbeatSequence)
+	}
+
+	// 3. Heartbeat with seq 80 and the SAME timestamp T2 arrives with DEGRADED status
+	// F-05 scenario: Under independent counters, hbSeq 80 >= hbSeq 50 resolves freshness and updates status to DEGRADED
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f05-seq", types.NodeStatusDegraded, 80, t2); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat seq 80 failed: %v", err)
+	}
+	node, err = store.GetNode(ctx, "node-f05-seq")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if node.Status != types.NodeStatusDegraded {
+		t.Errorf("DEFECT F-05: heartbeat seq 80 failed to update status to DEGRADED on equal timestamp: got %s", node.Status)
+	}
+	if node.SequenceNumber != 100 {
+		t.Errorf("DEFECT F-05: telemetry sequence regressed or coupled by heartbeat: got %d, want 100", node.SequenceNumber)
+	}
+	if node.HeartbeatSequence != 80 {
+		t.Errorf("DEFECT F-05: heartbeat sequence not updated: got %d, want 80", node.HeartbeatSequence)
+	}
+
+	// 4. Out-of-order heartbeat with seq 60 and same timestamp T2 arrives -> must NOT regress status or sequence
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f05-seq", types.NodeStatusHealthy, 60, t2); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat out-of-order failed: %v", err)
+	}
+	node, _ = store.GetNode(ctx, "node-f05-seq")
+	if node.Status != types.NodeStatusDegraded || node.HeartbeatSequence != 80 || node.SequenceNumber != 100 {
+		t.Errorf("out-of-order heartbeat corrupted state: status=%s (want DEGRADED), hbSeq=%d (want 80), seq=%d (want 100)",
+			node.Status, node.HeartbeatSequence, node.SequenceNumber)
+	}
+
+	// 5. Subsequent telemetry activity advances sequence_number to 150 independently
+	t3 := t2.Add(5 * time.Second)
+	updated, err = store.UpdateNodeTelemetryActivity(ctx, "node-f05-seq", 150, t3)
+	if err != nil || !updated {
+		t.Fatalf("UpdateNodeTelemetryActivity to 150 failed: %v", err)
+	}
+	node, _ = store.GetNode(ctx, "node-f05-seq")
+	if node.SequenceNumber != 150 || node.HeartbeatSequence != 80 {
+		t.Errorf("telemetry sequence advancement failed: seq=%d (want 150), hbSeq=%d (want 80)",
+			node.SequenceNumber, node.HeartbeatSequence)
+	}
+}
+
+func TestSQLiteStore_F06_CorruptTimestampRollback(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	t0 := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	rec := &NodeRecord{
+		NodeID:       "node-f06-corrupt",
+		Status:       types.NodeStatusHealthy,
+		LastSeen:     t0,
+		RegisteredAt: t0,
+	}
+	if _, err := store.RegisterNode(ctx, rec); err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+
+	// Inject corrupt timestamp into last_seen directly via raw SQL
+	_, err = store.db.Exec(`UPDATE cp_nodes SET last_seen = 'CORRUPTED_TIMESTAMP_STRING' WHERE node_id = 'node-f06-corrupt';`)
+	if err != nil {
+		t.Fatalf("raw update failed: %v", err)
+	}
+
+	// 1. Heartbeat on corrupt record must return ErrCorruptNodeRecord and rollback
+	hbErr := store.UpdateNodeHeartbeat(ctx, "node-f06-corrupt", types.NodeStatusHealthy, 10, time.Now().UTC())
+	if hbErr == nil {
+		t.Fatal("expected error on corrupt timestamp, got nil")
+	}
+	if !errors.Is(hbErr, ErrCorruptNodeRecord) {
+		t.Errorf("DEFECT F-06: expected error to wrap ErrCorruptNodeRecord, got: %v", hbErr)
+	}
+
+	// Verify database content was NOT silently modified/replaced
+	var dbLastSeen string
+	_ = store.db.QueryRow(`SELECT last_seen FROM cp_nodes WHERE node_id = 'node-f06-corrupt';`).Scan(&dbLastSeen)
+	if dbLastSeen != "CORRUPTED_TIMESTAMP_STRING" {
+		t.Errorf("DEFECT F-06: corrupt timestamp was silently overwritten: %q", dbLastSeen)
+	}
+
+	// 2. Telemetry activity on corrupt record must also fail safely
+	telUpdated, telErr := store.UpdateNodeTelemetryActivity(ctx, "node-f06-corrupt", 20, time.Now().UTC())
+	if telErr == nil || telUpdated {
+		t.Errorf("expected error from telemetry update on corrupt record, got updated=%v, err=%v", telUpdated, telErr)
+	}
+	if !errors.Is(telErr, ErrCorruptNodeRecord) {
+		t.Errorf("expected telemetry error to wrap ErrCorruptNodeRecord, got: %v", telErr)
+	}
+
+	// 3. GetNode on corrupt record must return ErrCorruptNodeRecord
+	_, getErr := store.GetNode(ctx, "node-f06-corrupt")
+	if !errors.Is(getErr, ErrCorruptNodeRecord) {
+		t.Errorf("expected GetNode error to wrap ErrCorruptNodeRecord, got: %v", getErr)
+	}
+
+	// 4. Missing record is correctly distinguished with ErrNodeNotFound
+	missingErr := store.UpdateNodeHeartbeat(ctx, "truly-missing-node", types.NodeStatusHealthy, 1, time.Now().UTC())
+	if !errors.Is(missingErr, ErrNodeNotFound) {
+		t.Errorf("expected ErrNodeNotFound for missing node, got: %v", missingErr)
+	}
+}
+
+func TestSQLiteStore_F07_DuplicateRegistration_MetadataFreshness(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	t0 := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	rec := &NodeRecord{
+		NodeID:          "node-f07-meta",
+		Status:          types.NodeStatusHealthy,
+		LastSeen:        t0,
+		RegisteredAt:    t0,
+		UpdatedAt:       t0,
+		MetadataVersion: 0,
+		Hostname:        "host-initial",
+		AgentVersion:    "1.0.0",
+		ProtocolVersion: "v1",
+		OS:              "linux",
+		Architecture:    "amd64",
+		Capabilities:    []string{"cpu", "mem"},
+		Labels:          map[string]string{"env": "prod"},
+	}
+	isNew, err := store.RegisterNode(ctx, rec)
+	if err != nil || !isNew {
+		t.Fatalf("initial registration failed: isNew=%v, err=%v", isNew, err)
+	}
+
+	// Simulate node sending heartbeats for several minutes, advancing last_seen to T5
+	t5 := t0.Add(5 * time.Minute)
+	if err := store.UpdateNodeHeartbeat(ctx, "node-f07-meta", types.NodeStatusHealthy, 30, t5); err != nil {
+		t.Fatalf("UpdateNodeHeartbeat failed: %v", err)
+	}
+	nodeAfterHB, _ := store.GetNode(ctx, "node-f07-meta")
+	if !nodeAfterHB.LastSeen.Equal(t5) {
+		t.Fatalf("expected last_seen=%v, got %v", t5, nodeAfterHB.LastSeen)
+	}
+
+	// 1. Legitimate re-registration retaining immutable original RegisteredAt: T0, but fresh UpdatedAt: T6
+	t6 := t0.Add(6 * time.Minute)
+	recReReg := &NodeRecord{
+		NodeID:          "node-f07-meta",
+		RegisteredAt:    t0, // Immutable original enrollment time
+		UpdatedAt:       t6, // Fresh metadata update timestamp
+		MetadataVersion: 1,
+		Hostname:        "host-renamed",
+		AgentVersion:    "1.1.0",
+		Capabilities:    []string{"cpu", "mem", "gpu"},
+		Labels:          map[string]string{"env": "prod", "tier": "edge"},
+	}
+	isNew, err = store.RegisterNode(ctx, recReReg)
+	if err != nil || isNew {
+		t.Fatalf("duplicate registration failed: isNew=%v, err=%v", isNew, err)
+	}
+
+	nodeUpdated, err := store.GetNode(ctx, "node-f07-meta")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if !nodeUpdated.RegisteredAt.Equal(t0) {
+		t.Errorf("DEFECT F-07: registered_at mutated: got %v, want %v", nodeUpdated.RegisteredAt, t0)
+	}
+	if nodeUpdated.AgentVersion != "1.1.0" || nodeUpdated.Hostname != "host-renamed" {
+		t.Errorf("DEFECT F-07: legitimate metadata update rejected: agent_ver=%s, host=%s",
+			nodeUpdated.AgentVersion, nodeUpdated.Hostname)
+	}
+	if len(nodeUpdated.Capabilities) != 3 {
+		t.Errorf("capabilities not updated: got %v", nodeUpdated.Capabilities)
+	}
+
+	// 2. Stale re-registration with older metadata timestamp T4 and version 0 must be REJECTED
+	t4 := t0.Add(4 * time.Minute)
+	recStale := &NodeRecord{
+		NodeID:          "node-f07-meta",
+		RegisteredAt:    t0,
+		UpdatedAt:       t4,
+		MetadataVersion: 0,
+		AgentVersion:    "0.9.0", // Stale metadata
+		Hostname:        "host-stale",
+	}
+	isNew, err = store.RegisterNode(ctx, recStale)
+	if err != nil || isNew {
+		t.Fatalf("stale registration call failed: %v", err)
+	}
+	nodeAfterStale, _ := store.GetNode(ctx, "node-f07-meta")
+	if nodeAfterStale.AgentVersion != "1.1.0" || nodeAfterStale.Hostname != "host-renamed" {
+		t.Errorf("DEFECT F-07: stale metadata overwrote newer accepted metadata: agent_ver=%s, host=%s",
+			nodeAfterStale.AgentVersion, nodeAfterStale.Hostname)
+	}
+
+	// 3. Duplicate re-registration with empty optional fields must not erase valid metadata
+	recEmpty := &NodeRecord{
+		NodeID:          "node-f07-meta",
+		RegisteredAt:    t0,
+		UpdatedAt:       t6.Add(time.Minute),
+		MetadataVersion: 2,
+		Hostname:        "host-renamed",
+		AgentVersion:    "",  // Empty optional field
+		Capabilities:    nil, // Empty optional field
+		Labels:          nil, // Empty optional field
+	}
+	_, err = store.RegisterNode(ctx, recEmpty)
+	if err != nil {
+		t.Fatalf("empty fields registration failed: %v", err)
+	}
+	nodeAfterEmpty, _ := store.GetNode(ctx, "node-f07-meta")
+	if nodeAfterEmpty.AgentVersion != "1.1.0" {
+		t.Errorf("empty agent_version erased valid metadata: got %q, want 1.1.0", nodeAfterEmpty.AgentVersion)
+	}
+	if len(nodeAfterEmpty.Capabilities) != 3 {
+		t.Errorf("empty capabilities erased valid metadata: got %v", nodeAfterEmpty.Capabilities)
 	}
 }
