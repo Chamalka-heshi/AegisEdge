@@ -146,6 +146,11 @@ type IdempotencyStore interface {
 	// Returns (true, nil) if an existing node record was updated, (false, nil) if the node is not registered.
 	UpdateNodeTelemetryActivity(ctx context.Context, nodeID string, seqNum int64, ingestedAt time.Time) (bool, error)
 
+	// Ping verifies that the underlying storage is responsive and available.
+	// Returns ErrStoreClosed if the store has been closed.
+	// Returns context errors (e.g. context.Canceled, context.DeadlineExceeded) if ctx is done.
+	Ping(ctx context.Context) error
+
 	// Close flushes and releases underlying storage resources.
 	Close() error
 }

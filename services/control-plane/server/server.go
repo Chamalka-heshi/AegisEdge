@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/storage"
@@ -165,6 +166,20 @@ func WithMaxHistory(maxHistory int) ServerOption {
 	}
 }
 
+// DefaultStorageProbeTimeout is the default maximum duration for the storage readiness probe.
+const DefaultStorageProbeTimeout = 2 * time.Second
+
+// WithStorageProbeTimeout configures the maximum duration for storage readiness probes.
+func WithStorageProbeTimeout(d time.Duration) ServerOption {
+	return func(s *Server) error {
+		if d <= 0 {
+			return errors.New("storage probe timeout must be positive")
+		}
+		s.storageProbeTimeout = d
+		return nil
+	}
+}
+
 // WithIdempotencyStore configures the persistent idempotency store for deduplication.
 func WithIdempotencyStore(store storage.IdempotencyStore) ServerOption {
 	return func(s *Server) error {
@@ -185,17 +200,19 @@ func WithIdempotencyStore(store storage.IdempotencyStore) ServerOption {
 // Telemetry payload history (for listing batches) is stored in a genuine, thread-safe, bounded circular
 // ring buffer (default 1,000 batches), completely decoupled from the persistent deduplication records.
 type Server struct {
-	mu             sync.RWMutex
-	store          storage.IdempotencyStore
-	history        *historyRingBuffer
-	nodes          map[string]*NodeRecord
-	nodesList      []*NodeRecord
-	logger         *slog.Logger
-	maxPayloadSize int64
-	authConfig     AuthConfig
-	replayCache    *ReplayCache
-	initErr        error
-	nodeLocks      *nodeLockManager
+	mu                  sync.RWMutex
+	store               storage.IdempotencyStore
+	history             *historyRingBuffer
+	nodes               map[string]*NodeRecord
+	nodesList           []*NodeRecord
+	logger              *slog.Logger
+	maxPayloadSize      int64
+	authConfig          AuthConfig
+	replayCache         *ReplayCache
+	initErr             error
+	nodeLocks           *nodeLockManager
+	storageProbeTimeout time.Duration
+	shuttingDown        atomic.Bool
 }
 
 // nodeLock tracks active and pending operations for a specific node ID.
@@ -264,14 +281,15 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 		}))
 	}
 	s := &Server{
-		history:        newHistoryRingBuffer(DefaultMaxHistoryBatches),
-		nodes:          make(map[string]*NodeRecord),
-		nodesList:      make([]*NodeRecord, 0),
-		logger:         logger,
-		maxPayloadSize: 1024 * 1024, // 1MB payload limit
-		authConfig:     DefaultAuthConfig(),
-		replayCache:    NewReplayCache(DefaultMaxReplayKeys),
-		nodeLocks:      newNodeLockManager(),
+		history:             newHistoryRingBuffer(DefaultMaxHistoryBatches),
+		nodes:               make(map[string]*NodeRecord),
+		nodesList:           make([]*NodeRecord, 0),
+		logger:              logger,
+		maxPayloadSize:      1024 * 1024, // 1MB payload limit
+		authConfig:          DefaultAuthConfig(),
+		replayCache:         NewReplayCache(DefaultMaxReplayKeys),
+		nodeLocks:           newNodeLockManager(),
+		storageProbeTimeout: DefaultStorageProbeTimeout,
 	}
 	for _, opt := range opts {
 		if err := opt(s); err != nil {
@@ -335,7 +353,10 @@ func (s *Server) InitError() error {
 }
 
 // Close gracefully closes the server's underlying persistent storage.
+// It invokes MarkShuttingDown() before closing storage so readiness endpoints (/readyz)
+// immediately transition to not-ready during programmatic shutdown.
 func (s *Server) Close() error {
+	s.MarkShuttingDown()
 	if s.store != nil {
 		return s.store.Close()
 	}
@@ -375,10 +396,21 @@ func (s *Server) AuthConfig() AuthConfig {
 	return s.authConfig
 }
 
+// MarkShuttingDown flags the server as shutting down, causing /readyz to return HTTP 503.
+func (s *Server) MarkShuttingDown() {
+	s.shuttingDown.Store(true)
+}
+
+// IsShuttingDown reports whether the server has begun graceful shutdown.
+func (s *Server) IsShuttingDown() bool {
+	return s.shuttingDown.Load()
+}
+
 // Routes constructs and returns the HTTP request multiplexer.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/api/v1/telemetry/batches", s.handleTelemetryBatches)
 	mux.HandleFunc("/api/v1/nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("/api/v1/nodes/heartbeat", s.handleNodeHeartbeat)
@@ -387,7 +419,10 @@ func (s *Server) Routes() http.Handler {
 	return mux
 }
 
-// handleHealthz responds with basic service health status.
+// handleHealthz responds with basic service liveness status.
+// Liveness indicates whether the control-plane process is alive and running.
+// Unlike readiness (/readyz), /healthz does not execute deep database probes
+// and will not report unhealthy on transient storage locks or slow connections.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -407,6 +442,104 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"status": "healthy",
 	})
+}
+
+// ReadinessResponse represents the structured health payload returned by /readyz.
+type ReadinessResponse struct {
+	Status string            `json:"status"` // "ready" or "not_ready"
+	Checks map[string]string `json:"checks"` // e.g. {"storage": "healthy"} or {"storage": "unhealthy"}
+	Error  string            `json:"error,omitempty"`
+}
+
+// handleReadyz responds with service readiness status.
+// Readiness indicates whether the control plane is prepared to accept registrations,
+// heartbeats, and telemetry batches. It verifies that startup initialization succeeded,
+// graceful shutdown has not started, and the underlying storage probe succeeds within
+// a bounded context timeout.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Error:   "method_not_allowed",
+			Message: "readiness endpoint accepts GET and HEAD only",
+		})
+		return
+	}
+
+	// 1. Startup initialization check
+	if s.initErr != nil {
+		s.writeReadiness(w, r.Method, http.StatusServiceUnavailable, ReadinessResponse{
+			Status: "not_ready",
+			Checks: map[string]string{
+				"storage": "unhealthy",
+			},
+			Error: "server_uninitialized",
+		})
+		return
+	}
+
+	// 2. Graceful shutdown check (shed new traffic promptly)
+	if s.shuttingDown.Load() {
+		s.writeReadiness(w, r.Method, http.StatusServiceUnavailable, ReadinessResponse{
+			Status: "not_ready",
+			Checks: map[string]string{
+				"storage": "healthy",
+			},
+			Error: "server_shutting_down",
+		})
+		return
+	}
+
+	// 3. Storage availability check
+	if s.store == nil {
+		s.writeReadiness(w, r.Method, http.StatusServiceUnavailable, ReadinessResponse{
+			Status: "not_ready",
+			Checks: map[string]string{
+				"storage": "unhealthy",
+			},
+			Error: "storage_unavailable",
+		})
+		return
+	}
+
+	// 4. Bounded storage probe
+	timeout := s.storageProbeTimeout
+	if timeout <= 0 {
+		timeout = DefaultStorageProbeTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	if err := s.store.Ping(probeCtx); err != nil {
+		s.logger.Warn("readiness storage probe failed", slog.Any("error", err))
+		s.writeReadiness(w, r.Method, http.StatusServiceUnavailable, ReadinessResponse{
+			Status: "not_ready",
+			Checks: map[string]string{
+				"storage": "unhealthy",
+			},
+			Error: "storage_unavailable",
+		})
+		return
+	}
+
+	// 5. All readiness checks passed
+	s.writeReadiness(w, r.Method, http.StatusOK, ReadinessResponse{
+		Status: "ready",
+		Checks: map[string]string{
+			"storage": "healthy",
+		},
+	})
+}
+
+func (s *Server) writeReadiness(w http.ResponseWriter, method string, statusCode int, resp ReadinessResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if method == http.MethodHead {
+		return
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		s.logger.Error("failed to write readiness response", slog.Any("error", err))
+	}
 }
 
 // handleTelemetryBatches processes batch ingestion (POST) and batch queries (GET).

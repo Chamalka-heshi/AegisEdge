@@ -3594,3 +3594,449 @@ func TestServer_F07_DuplicateRegistration_MetadataFreshness_HTTPIntegration(t *t
 			recMemAfterStale.AgentVersion, recMemAfterStale.Hostname)
 	}
 }
+
+type probeTestStore struct {
+	storage.IdempotencyStore
+	pingFn  func(ctx context.Context) error
+	closeFn func() error
+}
+
+func (p *probeTestStore) Ping(ctx context.Context) error {
+	if p.pingFn != nil {
+		return p.pingFn(ctx)
+	}
+	if p.IdempotencyStore != nil {
+		return p.IdempotencyStore.Ping(ctx)
+	}
+	return nil
+}
+
+func (p *probeTestStore) Close() error {
+	if p.closeFn != nil {
+		return p.closeFn()
+	}
+	if p.IdempotencyStore != nil {
+		return p.IdempotencyStore.Close()
+	}
+	return nil
+}
+
+// 1. Readiness returns 200 with a healthy store
+func TestServer_Readyz_HealthyStore(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /readyz, got %d", resp.StatusCode)
+	}
+
+	var body ReadinessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode /readyz response: %v", err)
+	}
+
+	if body.Status != "ready" {
+		t.Errorf("expected status 'ready', got %q", body.Status)
+	}
+	if body.Checks["storage"] != "healthy" {
+		t.Errorf("expected storage check 'healthy', got %q", body.Checks["storage"])
+	}
+	if body.Error != "" {
+		t.Errorf("expected empty error on healthy readiness, got %q", body.Error)
+	}
+}
+
+// 2. Readiness returns 503 when the store's Ping returns an error
+func TestServer_Readyz_StoragePingFailure(t *testing.T) {
+	baseStore, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open sqlite store: %v", err)
+	}
+	defer baseStore.Close()
+
+	probeStore := &probeTestStore{
+		IdempotencyStore: baseStore,
+		pingFn: func(ctx context.Context) error {
+			return errors.New("simulated disk i/o failure on ping")
+		},
+	}
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(probeStore))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable for failed storage ping, got %d", resp.StatusCode)
+	}
+
+	var body ReadinessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode /readyz response: %v", err)
+	}
+
+	if body.Status != "not_ready" {
+		t.Errorf("expected status 'not_ready', got %q", body.Status)
+	}
+	if body.Checks["storage"] != "unhealthy" {
+		t.Errorf("expected storage check 'unhealthy', got %q", body.Checks["storage"])
+	}
+	if body.Error != "storage_unavailable" {
+		t.Errorf("expected error 'storage_unavailable', got %q", body.Error)
+	}
+}
+
+type failingInitStore struct {
+	storage.IdempotencyStore
+}
+
+func (f *failingInitStore) ListNodes(ctx context.Context) ([]*storage.NodeRecord, error) {
+	return nil, errors.New("simulated startup rehydration failure")
+}
+
+// 3. Readiness returns 503 when startup initialization has failed
+func TestServer_Readyz_StartupInitFailure(t *testing.T) {
+	baseStore, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer baseStore.Close()
+
+	initFailStore := &failingInitStore{IdempotencyStore: baseStore}
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(initFailStore))
+	// Verify initErr was captured
+	if srv.InitError() == nil {
+		t.Fatalf("expected server initErr to be non-nil")
+	}
+
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when server failed initialization, got %d", resp.StatusCode)
+	}
+
+	var body ReadinessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if body.Status != "not_ready" {
+		t.Errorf("expected status 'not_ready', got %q", body.Status)
+	}
+	if body.Checks["storage"] != "unhealthy" {
+		t.Errorf("expected storage check 'unhealthy', got %q", body.Checks["storage"])
+	}
+	if body.Error != "server_uninitialized" {
+		t.Errorf("expected error 'server_uninitialized', got %q", body.Error)
+	}
+}
+
+// 4. Readiness returns 503 after shutdown has been signaled
+func TestServer_Readyz_ShutdownSignaled(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Prior to shutdown, readiness is 200
+	resp1, err := http.Get(ts.URL + "/readyz")
+	if err != nil || resp1.StatusCode != http.StatusOK {
+		t.Fatalf("initial readyz expected 200, got status=%v err=%v", resp1.StatusCode, err)
+	}
+	resp1.Body.Close()
+
+	// Signal graceful shutdown begins
+	srv.MarkShuttingDown()
+	if !srv.IsShuttingDown() {
+		t.Fatalf("expected IsShuttingDown to report true")
+	}
+
+	// Immediately after shutdown is signaled, readiness returns 503
+	resp2, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz after shutdown signal failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable after shutdown signaled, got %d", resp2.StatusCode)
+	}
+
+	var body ReadinessResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode /readyz response: %v", err)
+	}
+	if body.Status != "not_ready" {
+		t.Errorf("expected status 'not_ready', got %q", body.Status)
+	}
+	if body.Error != "server_shutting_down" {
+		t.Errorf("expected error 'server_shutting_down', got %q", body.Error)
+	}
+}
+
+// 4B. Server.Close() marks the server as shutting down, transitions readiness to 503, and preserves idempotency
+func TestServer_Close_ConsistentShutdownLifecycle(t *testing.T) {
+	// A. Normal server close with in-memory SQLite store
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	if srv.IsShuttingDown() {
+		t.Fatalf("expected initial IsShuttingDown to report false")
+	}
+
+	// Initial readiness probe should report 200 OK
+	resp1, err := http.Get(ts.URL + "/readyz")
+	if err != nil || resp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected initial 200 OK, got code=%v err=%v", resp1.StatusCode, err)
+	}
+	resp1.Body.Close()
+
+	// 1. Programmatically close the server
+	if err := srv.Close(); err != nil {
+		t.Fatalf("first srv.Close() failed: %v", err)
+	}
+
+	// Server must be marked as shutting down
+	if !srv.IsShuttingDown() {
+		t.Errorf("expected IsShuttingDown to report true after srv.Close()")
+	}
+
+	// 2. Readiness probe must return 503 Service Unavailable with server_shutting_down error
+	resp2, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz after srv.Close() failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 Service Unavailable after srv.Close(), got %d", resp2.StatusCode)
+	}
+
+	var body ReadinessResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode readiness response: %v", err)
+	}
+	if body.Status != "not_ready" {
+		t.Errorf("expected status 'not_ready', got %q", body.Status)
+	}
+	if body.Error != "server_shutting_down" {
+		t.Errorf("expected error 'server_shutting_down', got %q", body.Error)
+	}
+
+	// 3. Repeated close calls must be safe and idempotent
+	if err := srv.Close(); err != nil {
+		t.Errorf("repeated srv.Close() failed: %v", err)
+	}
+	if !srv.IsShuttingDown() {
+		t.Errorf("expected IsShuttingDown to remain true after repeated srv.Close()")
+	}
+
+	// 4. Storage error propagation on close: ensure MarkShuttingDown runs even if store.Close returns error
+	baseStore, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer baseStore.Close()
+
+	closeErr := errors.New("simulated store close failure")
+	storeWithErr := &probeTestStore{
+		IdempotencyStore: baseStore,
+		closeFn: func() error {
+			return closeErr
+		},
+	}
+	srvWithError := NewServer(newDiscardLogger(), WithIdempotencyStore(storeWithErr))
+	err = srvWithError.Close()
+	if !errors.Is(err, closeErr) {
+		t.Errorf("expected close error %v, got %v", closeErr, err)
+	}
+	if !srvWithError.IsShuttingDown() {
+		t.Errorf("expected srvWithError to be marked shutting down despite store close error")
+	}
+}
+
+// 5. Unsupported methods follow the server's method-handling conventions (and HEAD is supported)
+func TestServer_Readyz_MethodConventions(t *testing.T) {
+	srv := NewServer(newDiscardLogger())
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// POST /readyz -> 405 Method Not Allowed
+	postResp, err := http.Post(ts.URL+"/readyz", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /readyz failed: %v", err)
+	}
+	defer postResp.Body.Close()
+
+	if postResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 Method Not Allowed on POST /readyz, got %d", postResp.StatusCode)
+	}
+	allowHeader := postResp.Header.Get("Allow")
+	if !strings.Contains(allowHeader, "GET") || !strings.Contains(allowHeader, "HEAD") {
+		t.Errorf("expected Allow header to include GET and HEAD, got %q", allowHeader)
+	}
+
+	// HEAD /readyz -> 200 OK with empty body
+	headResp, err := http.Head(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("HEAD /readyz failed: %v", err)
+	}
+	defer headResp.Body.Close()
+
+	if headResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK on HEAD /readyz, got %d", headResp.StatusCode)
+	}
+	bodyBytes, _ := io.ReadAll(headResp.Body)
+	if len(bodyBytes) != 0 {
+		t.Errorf("expected empty body on HEAD /readyz, got %d bytes: %q", len(bodyBytes), string(bodyBytes))
+	}
+	contentType := headResp.Header.Get("Content-Type")
+	if !strings.Contains(contentType, "application/json") {
+		t.Errorf("expected application/json Content-Type on HEAD /readyz, got %q", contentType)
+	}
+
+	// HEAD /readyz when shutting down -> 503 with empty body
+	srv.MarkShuttingDown()
+	headRespDown, err := http.Head(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("HEAD /readyz after shutdown failed: %v", err)
+	}
+	defer headRespDown.Body.Close()
+
+	if headRespDown.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 on HEAD /readyz during shutdown, got %d", headRespDown.StatusCode)
+	}
+	downBytes, _ := io.ReadAll(headRespDown.Body)
+	if len(downBytes) != 0 {
+		t.Errorf("expected empty body on HEAD /readyz during shutdown, got %d bytes", len(downBytes))
+	}
+}
+
+// 6. /healthz remains a liveness check and does not fail merely because the readiness storage probe fails
+func TestServer_LivenessDecoupledFromStorageProbe(t *testing.T) {
+	baseStore, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer baseStore.Close()
+
+	// Store where Ping fails
+	probeStore := &probeTestStore{
+		IdempotencyStore: baseStore,
+		pingFn: func(ctx context.Context) error {
+			return errors.New("simulated disk stall")
+		},
+	}
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(probeStore))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. /readyz MUST fail with 503
+	readyzResp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz failed: %v", err)
+	}
+	defer readyzResp.Body.Close()
+	if readyzResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected /readyz to return 503, got %d", readyzResp.StatusCode)
+	}
+
+	// 2. /healthz MUST still succeed with 200 OK (liveness check)
+	healthzResp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz failed: %v", err)
+	}
+	defer healthzResp.Body.Close()
+	if healthzResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /healthz to remain 200 OK despite storage probe failure, got %d", healthzResp.StatusCode)
+	}
+
+	var healthBody map[string]string
+	if err := json.NewDecoder(healthzResp.Body).Decode(&healthBody); err != nil {
+		t.Fatalf("failed to decode healthz body: %v", err)
+	}
+	if healthBody["status"] != "healthy" {
+		t.Errorf("expected /healthz status 'healthy', got %q", healthBody["status"])
+	}
+}
+
+// 7. The storage probe respects a bounded context timeout where tested deterministically
+func TestServer_Readyz_StorageProbeTimeout(t *testing.T) {
+	baseStore, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer baseStore.Close()
+
+	pingEntered := make(chan struct{})
+
+	// Store whose Ping blocks until context is cancelled/deadline expires
+	timeoutStore := &probeTestStore{
+		IdempotencyStore: baseStore,
+		pingFn: func(ctx context.Context) error {
+			select {
+			case <-pingEntered:
+			default:
+				close(pingEntered)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	// Configure a short bounded probe timeout for test
+	srv := NewServer(newDiscardLogger(),
+		WithIdempotencyStore(timeoutStore),
+		WithStorageProbeTimeout(50*time.Millisecond),
+	)
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify Ping was indeed invoked
+	select {
+	case <-pingEntered:
+	default:
+		t.Errorf("expected Ping to have been called by readiness probe")
+	}
+
+	// Readiness probe should have timed out and returned 503
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on storage probe timeout, got %d", resp.StatusCode)
+	}
+
+	var body ReadinessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if body.Status != "not_ready" {
+		t.Errorf("expected status 'not_ready', got %q", body.Status)
+	}
+	if body.Checks["storage"] != "unhealthy" {
+		t.Errorf("expected storage check 'unhealthy', got %q", body.Checks["storage"])
+	}
+}

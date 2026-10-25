@@ -279,6 +279,9 @@ func main() {
 	sig := <-shutdownChan
 	logger.Info("shutdown signal received; stopping control plane gracefully...", slog.String("signal", sig.String()))
 
+	// Immediately mark readiness as not ready to shed new incoming traffic
+	srvInstance.MarkShuttingDown()
+
 	// Stop NATS consumer first
 	if consumer != nil {
 		consumer.Stop()

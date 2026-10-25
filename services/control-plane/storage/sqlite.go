@@ -490,6 +490,44 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	return count, nil
 }
 
+// Ping verifies that the SQLite database connection is open and responsive.
+// It executes a lightweight SELECT 1 probe against the database.
+// Note: Ping checks basic database responsiveness only; it does not guarantee
+// that future write transactions or disk I/O will succeed.
+func (s *SQLiteStore) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.RLock()
+	if s.closed || s.db == nil {
+		s.mu.RUnlock()
+		return ErrStoreClosed
+	}
+	db := s.db
+	s.mu.RUnlock()
+
+	var probe int
+	if err := db.QueryRowContext(ctx, `SELECT 1;`).Scan(&probe); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		s.mu.RLock()
+		closed := s.closed
+		s.mu.RUnlock()
+		if closed {
+			return ErrStoreClosed
+		}
+		return fmt.Errorf("storage ping probe failed: %w", err)
+	}
+
+	if probe != 1 {
+		return fmt.Errorf("unexpected storage ping probe response: %d", probe)
+	}
+
+	return nil
+}
+
 // Close gracefully flushes and closes the database connection.
 func (s *SQLiteStore) Close() error {
 	s.mu.Lock()

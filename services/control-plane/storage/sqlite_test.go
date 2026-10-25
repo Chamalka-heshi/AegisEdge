@@ -405,6 +405,9 @@ func TestSQLiteStore_ValidationAndClosedErrors(t *testing.T) {
 	if _, err := store.Count(ctx); !errors.Is(err, ErrStoreClosed) {
 		t.Errorf("expected ErrStoreClosed on Count, got %v", err)
 	}
+	if err := store.Ping(ctx); !errors.Is(err, ErrStoreClosed) {
+		t.Errorf("expected ErrStoreClosed on Ping, got %v", err)
+	}
 
 	// Repeated close is safe no-op
 	if err := store.Close(); err != nil {
@@ -1794,5 +1797,155 @@ func TestSQLiteStore_F07_DuplicateRegistration_MetadataFreshness(t *testing.T) {
 	}
 	if len(nodeAfterEmpty.Capabilities) != 3 {
 		t.Errorf("empty capabilities erased valid metadata: got %v", nodeAfterEmpty.Capabilities)
+	}
+}
+
+func TestSQLiteStore_Ping_Success(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. In-memory database ping
+	memStore, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory store: %v", err)
+	}
+	defer memStore.Close()
+
+	if err := memStore.Ping(ctx); err != nil {
+		t.Fatalf("expected healthy in-memory store ping to succeed, got %v", err)
+	}
+
+	// 2. File-based database ping
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ping_test.db")
+	fileStore, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open file-based store: %v", err)
+	}
+	defer fileStore.Close()
+
+	if err := fileStore.Ping(ctx); err != nil {
+		t.Fatalf("expected healthy file store ping to succeed, got %v", err)
+	}
+}
+
+func TestSQLiteStore_Ping_ClosedStore(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+
+	if err := store.Ping(ctx); err != nil {
+		t.Fatalf("initial ping failed: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	err = store.Ping(ctx)
+	if err == nil {
+		t.Fatalf("expected error on closed store ping, got nil")
+	}
+	if !errors.Is(err, ErrStoreClosed) {
+		t.Errorf("expected ErrStoreClosed, got %v", err)
+	}
+}
+
+func TestSQLiteStore_Ping_ContextCancellation(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Pre-canceled context
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = store.Ping(canceledCtx)
+	if err == nil {
+		t.Fatalf("expected error on pre-canceled context ping, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+
+	// 2. Expired deadline context
+	expiredCtx, cancelDeadline := context.WithDeadline(context.Background(), time.Now().Add(-100*time.Millisecond))
+	defer cancelDeadline()
+
+	err = store.Ping(expiredCtx)
+	if err == nil {
+		t.Fatalf("expected error on expired deadline context ping, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestSQLiteStore_Ping_RepeatedAndConcurrent(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// 1. Repeated sequential pings
+	for i := 0; i < 20; i++ {
+		if err := store.Ping(ctx); err != nil {
+			t.Fatalf("repeated ping %d failed: %v", i, err)
+		}
+	}
+
+	// 2. Concurrent pings across multiple goroutines
+	const goroutines = 10
+	const iterations = 25
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines*iterations)
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for it := 0; it < iterations; it++ {
+				if err := store.Ping(ctx); err != nil {
+					errCh <- err
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent ping failed: %v", err)
+	}
+
+	// 3. Close store and verify concurrent pings all return ErrStoreClosed
+	if err := store.Close(); err != nil {
+		t.Fatalf("store close failed: %v", err)
+	}
+
+	var wgClosed sync.WaitGroup
+	closedErrCh := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wgClosed.Add(1)
+		go func() {
+			defer wgClosed.Done()
+			if err := store.Ping(ctx); !errors.Is(err, ErrStoreClosed) {
+				closedErrCh <- err
+			}
+		}()
+	}
+
+	wgClosed.Wait()
+	close(closedErrCh)
+
+	for err := range closedErrCh {
+		t.Errorf("expected ErrStoreClosed on closed concurrent ping, got: %v", err)
 	}
 }
