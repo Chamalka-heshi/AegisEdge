@@ -195,6 +195,64 @@ type Server struct {
 	authConfig     AuthConfig
 	replayCache    *ReplayCache
 	initErr        error
+	nodeLocks      *nodeLockManager
+}
+
+// nodeLock tracks active and pending operations for a specific node ID.
+type nodeLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// nodeLockManager provides fine-grained, reference-counted per-node operation serialization.
+// It coordinates durable database writes and in-memory reconciliation for the same node
+// without serializing operations across different nodes or holding the global server mutex across disk I/O.
+type nodeLockManager struct {
+	mu    sync.Mutex
+	locks map[string]*nodeLock
+}
+
+func newNodeLockManager() *nodeLockManager {
+	return &nodeLockManager{
+		locks: make(map[string]*nodeLock),
+	}
+}
+
+// Lock acquires operation serialization for the specified nodeID and returns a release function.
+// Empty nodeIDs return a no-op release function.
+func (m *nodeLockManager) Lock(nodeID string) func() {
+	if nodeID == "" {
+		return func() {}
+	}
+
+	m.mu.Lock()
+	nl, ok := m.locks[nodeID]
+	if !ok {
+		nl = &nodeLock{}
+		m.locks[nodeID] = nl
+	}
+	nl.refs++
+	m.mu.Unlock()
+
+	nl.mu.Lock()
+
+	return func() {
+		nl.mu.Unlock()
+
+		m.mu.Lock()
+		nl.refs--
+		if nl.refs == 0 {
+			delete(m.locks, nodeID)
+		}
+		m.mu.Unlock()
+	}
+}
+
+func (s *Server) lockNode(nodeID string) func() {
+	if s.nodeLocks == nil {
+		return func() {}
+	}
+	return s.nodeLocks.Lock(nodeID)
 }
 
 // NewServer initializes a control-plane HTTP ingestion server with optional configuration.
@@ -213,6 +271,7 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 		maxPayloadSize: 1024 * 1024, // 1MB payload limit
 		authConfig:     DefaultAuthConfig(),
 		replayCache:    NewReplayCache(DefaultMaxReplayKeys),
+		nodeLocks:      newNodeLockManager(),
 	}
 	for _, opt := range opts {
 		if err := opt(s); err != nil {
@@ -436,6 +495,9 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 6. Atomic Durable Ingestion (both metadata and complete payload committed in single transaction)
+	unlockNode := s.lockNode(batch.NodeID)
+	defer unlockNode()
+
 	ingestedAt := time.Now().UTC()
 
 	isNew, err := s.store.RecordBatch(r.Context(), &batch, ingestedAt)
@@ -511,7 +573,9 @@ func (s *Server) updateNodeTelemetryActivityLocked(nodeID string, sequenceNumber
 	if !exists || record == nil {
 		return
 	}
-	record.LastSeen = ingestedAt
+	if !ingestedAt.Before(record.LastSeen) {
+		record.LastSeen = ingestedAt
+	}
 	if sequenceNumber > record.SequenceNumber {
 		record.SequenceNumber = sequenceNumber
 	}
@@ -604,6 +668,9 @@ func (s *Server) IngestBatch(ctx context.Context, batch *types.TelemetryBatch) e
 	if err := batch.Validate(); err != nil {
 		return fmt.Errorf("batch validation failed: %w", err)
 	}
+
+	unlockNode := s.lockNode(batch.NodeID)
+	defer unlockNode()
 
 	ingestedAt := time.Now().UTC()
 
@@ -788,12 +855,29 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	unlockNode := s.lockNode(reg.NodeID)
+	defer unlockNode()
+
 	now := time.Now().UTC()
+	metaTime := now
+	if reg.UpdatedAt != nil && !reg.UpdatedAt.IsZero() {
+		metaTime = reg.UpdatedAt.UTC()
+	} else if !reg.RegisteredAt.IsZero() {
+		metaTime = reg.RegisteredAt.UTC()
+	}
+
+	regAt := now
+	if !reg.RegisteredAt.IsZero() {
+		regAt = reg.RegisteredAt.UTC()
+	}
+
 	record := &storage.NodeRecord{
 		NodeID:          reg.NodeID,
 		Status:          types.NodeStatusHealthy,
-		LastSeen:        now,
-		RegisteredAt:    now,
+		LastSeen:        metaTime,
+		RegisteredAt:    regAt,
+		UpdatedAt:       metaTime,
+		MetadataVersion: reg.MetadataVersion,
 		AgentVersion:    reg.AgentVersion,
 		ProtocolVersion: "v1",
 		Hostname:        reg.Hostname,
@@ -820,7 +904,10 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		isNew = true
+		s.mu.RLock()
+		_, inMemExists := s.nodes[reg.NodeID]
+		s.mu.RUnlock()
+		isNew = !inMemExists
 	}
 
 	// 2. Reconcile in-memory state under lock (only after successful durable storage)
@@ -846,13 +933,60 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 	// Duplicate registration: update existing in-memory copy with merged values from record
 	existing, exists := s.nodes[reg.NodeID]
 	if exists && existing != nil {
-		existing.LastSeen = record.LastSeen
-		existing.Hostname = record.Hostname
-		existing.AgentVersion = record.AgentVersion
-		existing.Capabilities = record.Capabilities
-		existing.Labels = record.Labels
+		existMetaTime := existing.UpdatedAt
+		if existMetaTime.IsZero() {
+			existMetaTime = existing.RegisteredAt
+		}
+
+		var shouldAdvanceMetadata bool
+		if record.MetadataVersion > existing.MetadataVersion {
+			shouldAdvanceMetadata = true
+		} else if record.MetadataVersion < existing.MetadataVersion {
+			shouldAdvanceMetadata = false
+		} else {
+			if record.UpdatedAt.After(existMetaTime) {
+				shouldAdvanceMetadata = true
+			} else if record.UpdatedAt.Before(existMetaTime) {
+				shouldAdvanceMetadata = false
+			} else {
+				shouldAdvanceMetadata = true
+			}
+		}
+
+		if shouldAdvanceMetadata {
+			existing.MetadataVersion = record.MetadataVersion
+			existing.UpdatedAt = record.UpdatedAt
+			if record.Hostname != "" {
+				existing.Hostname = record.Hostname
+			}
+			if record.AgentVersion != "" {
+				existing.AgentVersion = record.AgentVersion
+			}
+			if record.ProtocolVersion != "" {
+				existing.ProtocolVersion = record.ProtocolVersion
+			}
+			if record.OS != "" {
+				existing.OS = record.OS
+			}
+			if record.Architecture != "" {
+				existing.Architecture = record.Architecture
+			}
+			if len(record.Capabilities) > 0 {
+				existing.Capabilities = record.Capabilities
+			}
+			if len(record.Labels) > 0 {
+				existing.Labels = record.Labels
+			}
+		}
+
+		if record.LastSeen.After(existing.LastSeen) {
+			existing.LastSeen = record.LastSeen
+		}
 		if record.SequenceNumber > existing.SequenceNumber {
 			existing.SequenceNumber = record.SequenceNumber
+		}
+		if record.HeartbeatSequence > existing.HeartbeatSequence {
+			existing.HeartbeatSequence = record.HeartbeatSequence
 		}
 	} else {
 		s.nodes[reg.NodeID] = record
@@ -942,7 +1076,13 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	unlockNode := s.lockNode(hb.NodeID)
+	defer unlockNode()
+
 	now := time.Now().UTC()
+	if !hb.Timestamp.IsZero() {
+		now = hb.Timestamp.UTC()
+	}
 
 	// 1. Persist to durable store first (without holding s.mu across disk I/O)
 	if s.store != nil {
@@ -952,6 +1092,17 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 				s.writeJSON(w, http.StatusNotFound, ErrorResponse{
 					Error:   "node_not_found",
 					Message: fmt.Sprintf("node %q is not registered with control plane", hb.NodeID),
+				})
+				return
+			}
+			if errors.Is(err, storage.ErrCorruptNodeRecord) {
+				s.logger.Error("corrupt node record encountered during heartbeat update",
+					slog.String("node_id", hb.NodeID),
+					slog.Any("error", err),
+				)
+				s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+					Error:   "corrupt_node_record",
+					Message: "stored node record is corrupted",
 				})
 				return
 			}
@@ -985,19 +1136,27 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	record, exists := s.nodes[hb.NodeID]
 	if !exists {
 		record = &storage.NodeRecord{
-			NodeID:         hb.NodeID,
-			Status:         hb.Status,
-			LastSeen:       now,
-			RegisteredAt:   now,
-			SequenceNumber: hb.SequenceNumber,
+			NodeID:            hb.NodeID,
+			Status:            hb.Status,
+			LastSeen:          now,
+			RegisteredAt:      now,
+			HeartbeatSequence: hb.SequenceNumber,
 		}
 		s.nodes[hb.NodeID] = record
 		s.nodesList = append(s.nodesList, record)
 	} else {
-		record.LastSeen = now
-		record.Status = hb.Status
-		if hb.SequenceNumber > record.SequenceNumber {
-			record.SequenceNumber = hb.SequenceNumber
+		// Ordering policy within heartbeat domain:
+		// 1. Strictly newer timestamp advances status and last_seen
+		// 2. Equal timestamp uses heartbeat sequence tie-breaker
+		if now.After(record.LastSeen) {
+			record.LastSeen = now
+			record.Status = hb.Status
+		} else if now.Equal(record.LastSeen) && hb.SequenceNumber >= record.HeartbeatSequence {
+			record.LastSeen = now
+			record.Status = hb.Status
+		}
+		if hb.SequenceNumber > record.HeartbeatSequence {
+			record.HeartbeatSequence = hb.SequenceNumber
 		}
 	}
 
@@ -1005,6 +1164,7 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		slog.String("node_id", hb.NodeID),
 		slog.String("status", string(hb.Status)),
 		slog.Int64("sequence_number", record.SequenceNumber),
+		slog.Int64("heartbeat_sequence", record.HeartbeatSequence),
 	)
 
 	s.writeJSON(w, http.StatusOK, HeartbeatResponse{

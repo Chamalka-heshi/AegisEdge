@@ -478,8 +478,8 @@ func TestServer_NodeHeartbeat_SuccessAndUnknownNode(t *testing.T) {
 	if !ok {
 		t.Fatal("expected node to exist")
 	}
-	if node.SequenceNumber != 5 {
-		t.Errorf("expected sequence number 5, got %d", node.SequenceNumber)
+	if node.HeartbeatSequence != 5 {
+		t.Errorf("expected heartbeat sequence number 5, got %d", node.HeartbeatSequence)
 	}
 }
 
@@ -2159,8 +2159,8 @@ func TestServer_DurableNodeRegistry_RestartRehydration(t *testing.T) {
 	}
 
 	rec2, _ := srv2.GetNode("node-restart-1")
-	if rec2.SequenceNumber != 150 || rec2.Status != types.NodeStatusHealthy {
-		t.Errorf("expected sequence 150 and status HEALTHY on srv2, got seq=%d status=%s", rec2.SequenceNumber, rec2.Status)
+	if rec2.HeartbeatSequence != 150 || rec2.Status != types.NodeStatusHealthy {
+		t.Errorf("expected heartbeat sequence 150 and status HEALTHY on srv2, got hbSeq=%d status=%s", rec2.HeartbeatSequence, rec2.Status)
 	}
 }
 
@@ -2405,5 +2405,1192 @@ func TestServer_DurableNodeRegistry_ConcurrentInterleavedOps(t *testing.T) {
 	expectedMaxSeq := int64(iterations * 5)
 	if rec.SequenceNumber != expectedMaxSeq {
 		t.Errorf("expected sequence number to reach %d, got %d", expectedMaxSeq, rec.SequenceNumber)
+	}
+}
+
+func TestServer_F01_Deterministic_HeartbeatOrderFencing(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Initial registration
+	t0 := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f1",
+		Hostname:     "host-f1",
+		RegisteredAt: t0,
+	}
+	regBody, _ := json.Marshal(reg)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regBody))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("register failed: status=%d, err=%v", res.StatusCode, err)
+	}
+	res.Body.Close()
+
+	// 2. Newer heartbeat arrives at T2 with Status: HEALTHY, seq: 50
+	t2 := t0.Add(2 * time.Hour)
+	hbNewer := types.Heartbeat{
+		NodeID:         "node-f1",
+		SequenceNumber: 50,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      t2,
+	}
+	hbNewerBody, _ := json.Marshal(hbNewer)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(hbNewerBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("hbNewer failed: status=%d, err=%v", res.StatusCode, err)
+	}
+	res.Body.Close()
+
+	// Verify T2 is recorded
+	recMem, ok := srv.GetNode("node-f1")
+	if !ok || recMem.Status != types.NodeStatusHealthy || recMem.HeartbeatSequence != 50 || !recMem.LastSeen.Equal(t2) {
+		t.Fatalf("state after hbNewer incorrect: status=%s, hbSeq=%d, lastSeen=%v", recMem.Status, recMem.HeartbeatSequence, recMem.LastSeen)
+	}
+
+	// 3. Delayed older heartbeat arrives with timestamp T1 (T0 < T1 < T2), Status: DEGRADED, seq: 10
+	t1 := t0.Add(1 * time.Hour)
+	hbOlder := types.Heartbeat{
+		NodeID:         "node-f1",
+		SequenceNumber: 10,
+		Status:         types.NodeStatusDegraded,
+		Timestamp:      t1,
+	}
+	hbOlderBody, _ := json.Marshal(hbOlder)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(hbOlderBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("hbOlder failed: status=%d, err=%v", res.StatusCode, err)
+	}
+	res.Body.Close()
+
+	// 4. Assert in-memory state: LastSeen, Status, and HeartbeatSequence must NOT regress!
+	recMemAfter, _ := srv.GetNode("node-f1")
+	if recMemAfter.Status != types.NodeStatusHealthy {
+		t.Errorf("DEFECT F-01: in-memory status regressed from HEALTHY to %s", recMemAfter.Status)
+	}
+	if recMemAfter.HeartbeatSequence != 50 {
+		t.Errorf("DEFECT F-01: in-memory heartbeat sequence regressed from 50 to %d", recMemAfter.HeartbeatSequence)
+	}
+	if !recMemAfter.LastSeen.Equal(t2) {
+		t.Errorf("DEFECT F-01: in-memory LastSeen regressed from %v to %v", t2, recMemAfter.LastSeen)
+	}
+
+	// 5. Assert durable SQLite state: must also retain T2 state
+	recDB, err := store.GetNode(ctx, "node-f1")
+	if err != nil {
+		t.Fatalf("store.GetNode failed: %v", err)
+	}
+	if recDB.HeartbeatSequence != 50 {
+		t.Errorf("SQLite sequence regressed: expected 50, got %d", recDB.SequenceNumber)
+	}
+	if !recDB.LastSeen.Equal(t2) {
+		t.Errorf("SQLite LastSeen regressed: expected %v, got %v", t2, recDB.LastSeen)
+	}
+}
+
+func TestServer_F01_Deterministic_RegistrationMetadataFencing(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Initial registration at T0
+	t0 := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f2",
+		Hostname:     "host-initial",
+		AgentVersion: "v1.0.0",
+		RegisteredAt: t0,
+	}
+	regBody, _ := json.Marshal(reg)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regBody))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("initial register failed: %v", err)
+	}
+	res.Body.Close()
+
+	// 2. Newer duplicate registration at T2 with updated metadata
+	t2 := t0.Add(2 * time.Hour)
+	regNewer := types.NodeRegistration{
+		NodeID:       "node-f2",
+		Hostname:     "host-newer",
+		AgentVersion: "v2.0.0",
+		RegisteredAt: t2,
+	}
+	regNewerBody, _ := json.Marshal(regNewer)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regNewerBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("regNewer failed: %v", err)
+	}
+	res.Body.Close()
+
+	recMem, _ := srv.GetNode("node-f2")
+	if recMem.Hostname != "host-newer" || recMem.AgentVersion != "v2.0.0" {
+		t.Fatalf("expected host-newer/v2.0.0, got %s/%s", recMem.Hostname, recMem.AgentVersion)
+	}
+
+	// 3. Delayed older duplicate registration arriving with T1 (T0 < T1 < T2)
+	t1 := t0.Add(1 * time.Hour)
+	regOlder := types.NodeRegistration{
+		NodeID:       "node-f2",
+		Hostname:     "host-older",
+		AgentVersion: "v1.5.0",
+		RegisteredAt: t1,
+	}
+	regOlderBody, _ := json.Marshal(regOlder)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(regOlderBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("regOlder failed: %v", err)
+	}
+	res.Body.Close()
+
+	// 4. Assert in-memory state: metadata must NOT regress to older values!
+	recMemAfter, _ := srv.GetNode("node-f2")
+	if recMemAfter.Hostname != "host-newer" {
+		t.Errorf("DEFECT F-01: in-memory Hostname regressed from host-newer to %q", recMemAfter.Hostname)
+	}
+	if recMemAfter.AgentVersion != "v2.0.0" {
+		t.Errorf("DEFECT F-01: in-memory AgentVersion regressed from v2.0.0 to %q", recMemAfter.AgentVersion)
+	}
+	if !recMemAfter.RegisteredAt.Equal(t0) {
+		t.Errorf("RegisteredAt must be immutable: expected %v, got %v", t0, recMemAfter.RegisteredAt)
+	}
+
+	// 5. Assert SQLite durable state
+	recDB, err := store.GetNode(ctx, "node-f2")
+	if err != nil {
+		t.Fatalf("store.GetNode failed: %v", err)
+	}
+	if recDB.Hostname != "host-newer" {
+		t.Errorf("SQLite Hostname regressed: expected host-newer, got %q", recDB.Hostname)
+	}
+}
+
+func TestServer_F01_Deterministic_HeartbeatTelemetryInterleaving(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	t0 := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f3",
+		Hostname:     "host-f3",
+		RegisteredAt: t0,
+	}
+	bReg, _ := json.Marshal(reg)
+	res, _ := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	res.Body.Close()
+
+	// Ingest telemetry batch seq 100 at T2
+	t2 := t0.Add(2 * time.Hour)
+	batch := sampleTestBatch("b-f3-1", "node-f3", 100)
+	batch.CollectedAt = t2
+	bBody, _ := json.Marshal(batch)
+	res, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(bBody))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("telemetry post failed: %v", err)
+	}
+	res.Body.Close()
+
+	rec, _ := srv.GetNode("node-f3")
+	if rec.SequenceNumber != 100 {
+		t.Fatalf("expected sequence 100, got %d", rec.SequenceNumber)
+	}
+
+	// Ingest delayed heartbeat seq 40 with timestamp T1 < T2
+	t1 := t0.Add(1 * time.Hour)
+	hb := types.Heartbeat{
+		NodeID:         "node-f3",
+		SequenceNumber: 40,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      t1,
+	}
+	hbBody, _ := json.Marshal(hb)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(hbBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("heartbeat post failed: %v", err)
+	}
+	res.Body.Close()
+
+	// Neither sequence number (100) nor LastSeen should regress
+	recAfter, _ := srv.GetNode("node-f3")
+	if recAfter.SequenceNumber != 100 {
+		t.Errorf("sequence number regressed on delayed heartbeat: expected 100, got %d", recAfter.SequenceNumber)
+	}
+
+	// Newer heartbeat with seq 150 advances sequence
+	t3 := t2.Add(1 * time.Hour)
+	hbNewer := types.Heartbeat{
+		NodeID:         "node-f3",
+		SequenceNumber: 150,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      t3,
+	}
+	hbNewerBody, _ := json.Marshal(hbNewer)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(hbNewerBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("newer heartbeat post failed: %v", err)
+	}
+	res.Body.Close()
+
+	recAfterNewer, _ := srv.GetNode("node-f3")
+	if recAfterNewer.HeartbeatSequence != 150 {
+		t.Errorf("heartbeat sequence failed to advance on newer heartbeat: expected 150, got %d", recAfterNewer.HeartbeatSequence)
+	}
+	if recAfterNewer.SequenceNumber != 100 {
+		t.Errorf("telemetry sequence regressed or coupled on newer heartbeat: expected 100, got %d", recAfterNewer.SequenceNumber)
+	}
+
+	// Verify SQLite
+	recDB, _ := store.GetNode(ctx, "node-f3")
+	if recDB.HeartbeatSequence != 150 {
+		t.Errorf("SQLite heartbeat sequence mismatch: expected 150, got %d", recDB.HeartbeatSequence)
+	}
+	if recDB.SequenceNumber != 100 {
+		t.Errorf("SQLite telemetry sequence mismatch: expected 100, got %d", recDB.SequenceNumber)
+	}
+}
+
+func TestServer_F01_Deterministic_HTTPAndNATSSafeReconciliation(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	t0 := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f4",
+		Hostname:     "host-f4",
+		RegisteredAt: t0,
+	}
+	bReg, _ := json.Marshal(reg)
+	res, _ := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	res.Body.Close()
+
+	// 1. HTTP Telemetry Ingest: seq 50
+	bHTTP := sampleTestBatch("b-f4-http", "node-f4", 50)
+	bHTTPBody, _ := json.Marshal(bHTTP)
+	res, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(bHTTPBody))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("HTTP batch failed: %v", err)
+	}
+	res.Body.Close()
+
+	// 2. NATS Ingest: seq 80
+	bNATS := sampleTestBatch("b-f4-nats", "node-f4", 80)
+	if err := srv.IngestBatch(ctx, &bNATS); err != nil {
+		t.Fatalf("NATS IngestBatch failed: %v", err)
+	}
+
+	rec, _ := srv.GetNode("node-f4")
+	if rec.SequenceNumber != 80 {
+		t.Fatalf("expected sequence 80 after NATS ingest, got %d", rec.SequenceNumber)
+	}
+
+	// 3. Delayed NATS Ingest: lower seq 20
+	bNATSOlder := sampleTestBatch("b-f4-nats-older", "node-f4", 20)
+	if err := srv.IngestBatch(ctx, &bNATSOlder); err != nil {
+		t.Fatalf("NATS older batch failed: %v", err)
+	}
+
+	recAfter, _ := srv.GetNode("node-f4")
+	if recAfter.SequenceNumber != 80 {
+		t.Errorf("sequence regressed after older NATS batch: expected 80, got %d", recAfter.SequenceNumber)
+	}
+
+	recDB, _ := store.GetNode(ctx, "node-f4")
+	if recDB.SequenceNumber != 80 {
+		t.Errorf("SQLite sequence regressed: expected 80, got %d", recDB.SequenceNumber)
+	}
+}
+
+func TestServer_F01_Deterministic_IndependentNodeConcurrency(t *testing.T) {
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Explicitly acquire the per-node lock for node-indep-A
+	unlockAlpha := srv.lockNode("node-indep-A")
+
+	// In a separate goroutine, register and heartbeat for node-indep-B.
+	// Because per-node locks are fine-grained, node-indep-B MUST proceed without blocking!
+	doneB := make(chan bool)
+	errB := make(chan error, 1)
+
+	go func() {
+		regB := types.NodeRegistration{
+			NodeID:       "node-indep-B",
+			Hostname:     "host-B",
+			RegisteredAt: time.Now().UTC(),
+		}
+		b, _ := json.Marshal(regB)
+		resp, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b))
+		if err != nil {
+			errB <- err
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			errB <- fmt.Errorf("unexpected status %d", resp.StatusCode)
+			return
+		}
+
+		hbB := types.Heartbeat{
+			NodeID:         "node-indep-B",
+			SequenceNumber: 1,
+			Timestamp:      time.Now().UTC(),
+			Status:         types.NodeStatusHealthy,
+		}
+		bHb, _ := json.Marshal(hbB)
+		resp, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb))
+		if err != nil {
+			errB <- err
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			errB <- fmt.Errorf("unexpected status %d", resp.StatusCode)
+			return
+		}
+		doneB <- true
+	}()
+
+	select {
+	case <-doneB:
+		// Succeeded immediately without waiting for node-indep-A to release its lock!
+	case err := <-errB:
+		t.Fatalf("node-indep-B failed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("deadlock or coarse global lock detected: node-indep-B was blocked by node-indep-A's lock")
+	}
+
+	// Release node-indep-A's lock
+	unlockAlpha()
+}
+
+func TestServer_DurableNodeRegistry_CorruptNodeRecord_StartupRejection(t *testing.T) {
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, "corrupt_startup.db")
+
+	store1, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_, _ = store1.RegisterNode(ctx, &NodeRecord{NodeID: "node-good-1", RegisteredAt: now})
+	_, _ = store1.RegisterNode(ctx, &NodeRecord{NodeID: "node-bad-1", RegisteredAt: now})
+
+	// Manually inject invalid JSON in cp_nodes for node-bad-1
+	_, err = store1.GetPayload(ctx, "x", "y") // no-op check
+	_ = store1.Close()
+
+	// Reopen raw SQLite and corrupt row
+	rawStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("reopen raw store failed: %v", err)
+	}
+	// Call raw DB query to corrupt capabilities_json
+	list, err := rawStore.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListNodes unexpected error before corruption: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 nodes before corruption")
+	}
+	_ = rawStore.Close()
+
+	// Corrupt via direct SQLite file access using a hook or OpenSQLite with corrupted JSON
+	corruptStore, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	// If corruptStore.Close() is called or ListNodes fails:
+	_ = corruptStore.Close()
+
+	srvFailed := NewServer(newDiscardLogger(), WithIdempotencyStore(corruptStore))
+	if srvFailed.InitError() == nil {
+		t.Fatalf("expected InitError on failed store, got nil")
+	}
+	if len(srvFailed.GetNodes()) != 0 {
+		t.Errorf("partially recovered nodes must not be exposed on failed initialization")
+	}
+
+	ts := httptest.NewServer(srvFailed.Routes())
+	defer ts.Close()
+
+	res, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz get failed: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 on healthz when server initialization failed, got %d", res.StatusCode)
+	}
+}
+
+// TestServer_F02_SubSecondTimestampOrdering_HTTP verifies chronologically correct sub-second
+// timestamp comparisons across the HTTP API and SQLite persistence.
+func TestServer_F02_SubSecondTimestampOrdering_HTTP(t *testing.T) {
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Exact-second initial registration: 12:00:00Z
+	tExact := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f02-http",
+		Hostname:     "host-f02",
+		RegisteredAt: tExact,
+	}
+	bReg, _ := json.Marshal(reg)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("register failed: %v", err)
+	}
+	res.Body.Close()
+
+	// 2. Newer fractional-second heartbeat: 12:00:00.5Z (500ms later, Status: DEGRADED, seq: 20)
+	t500ms := time.Date(2026, 10, 25, 12, 0, 0, 500000000, time.UTC)
+	hbNewer := types.Heartbeat{
+		NodeID:         "node-f02-http",
+		SequenceNumber: 20,
+		Status:         types.NodeStatusDegraded,
+		Timestamp:      t500ms,
+	}
+	bNewer, _ := json.Marshal(hbNewer)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bNewer))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("hbNewer failed: %v", err)
+	}
+	res.Body.Close()
+
+	recMem, ok := srv.GetNode("node-f02-http")
+	if !ok || recMem.Status != types.NodeStatusDegraded || !recMem.LastSeen.Equal(t500ms) {
+		t.Fatalf("state after hbNewer failed: status=%s, lastSeen=%v", recMem.Status, recMem.LastSeen)
+	}
+	recDB, err := store.GetNode(context.Background(), "node-f02-http")
+	if err != nil || recDB.Status != types.NodeStatusDegraded || !recDB.LastSeen.Equal(t500ms) {
+		t.Fatalf("SQLite state after hbNewer failed: status=%s, lastSeen=%v", recDB.Status, recDB.LastSeen)
+	}
+
+	// 3. Delayed stale heartbeat: 12:00:00.1Z (100ms, fewer fractional digits, Status: HEALTHY, seq: 5)
+	t100ms := time.Date(2026, 10, 25, 12, 0, 0, 100000000, time.UTC)
+	hbStale := types.Heartbeat{
+		NodeID:         "node-f02-http",
+		SequenceNumber: 5,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      t100ms,
+	}
+	bStale, _ := json.Marshal(hbStale)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bStale))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("hbStale failed: %v", err)
+	}
+	res.Body.Close()
+
+	// Assert that stale heartbeat did NOT regress in-memory or SQLite status/last_seen
+	recMemStale, _ := srv.GetNode("node-f02-http")
+	if recMemStale.Status != types.NodeStatusDegraded || !recMemStale.LastSeen.Equal(t500ms) {
+		t.Errorf("DEFECT F-02: in-memory state regressed on stale sub-second heartbeat: status=%s, lastSeen=%v", recMemStale.Status, recMemStale.LastSeen)
+	}
+	recDBStale, _ := store.GetNode(context.Background(), "node-f02-http")
+	if recDBStale.Status != types.NodeStatusDegraded || !recDBStale.LastSeen.Equal(t500ms) {
+		t.Errorf("DEFECT F-02: SQLite state regressed on stale sub-second heartbeat: status=%s, lastSeen=%v", recDBStale.Status, recDBStale.LastSeen)
+	}
+}
+
+// TestServer_F03_EqualTimestamp_SequenceResolution verifies that when two heartbeat events have identical
+// timestamps, sequence number ordering resolves conflicting status and sequence number never regresses.
+func TestServer_F03_EqualTimestamp_SequenceResolution(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	tEqual := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f03-eq",
+		Hostname:     "host-f03",
+		RegisteredAt: tEqual,
+	}
+	bReg, _ := json.Marshal(reg)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("register failed: %v", err)
+	}
+	res.Body.Close()
+
+	// 1. Initial heartbeat at T_equal with Seq: 50, Status: HEALTHY
+	hb1 := types.Heartbeat{
+		NodeID:         "node-f03-eq",
+		SequenceNumber: 50,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      tEqual,
+	}
+	bHb1, _ := json.Marshal(hb1)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb1))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("hb1 post failed: %v", err)
+	}
+	res.Body.Close()
+
+	rec1, _ := srv.GetNode("node-f03-eq")
+	if rec1.Status != types.NodeStatusHealthy || rec1.HeartbeatSequence != 50 {
+		t.Fatalf("expected HEALTHY and hbSeq 50, got %s / %d", rec1.Status, rec1.HeartbeatSequence)
+	}
+
+	// 2. Conflicting heartbeat arriving with EQUAL timestamp, but LOWER sequence 10, Status: DEGRADED
+	// Must NOT overwrite Status to DEGRADED or regress HeartbeatSequence to 10!
+	hb2 := types.Heartbeat{
+		NodeID:         "node-f03-eq",
+		SequenceNumber: 10,
+		Status:         types.NodeStatusDegraded,
+		Timestamp:      tEqual,
+	}
+	bHb2, _ := json.Marshal(hb2)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb2))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("hb2 post failed: %v", err)
+	}
+	res.Body.Close()
+
+	recMemAfter, _ := srv.GetNode("node-f03-eq")
+	if recMemAfter.Status != types.NodeStatusHealthy {
+		t.Errorf("DEFECT F-03: in-memory status overwritten to DEGRADED by lower sequence at equal timestamp")
+	}
+	if recMemAfter.HeartbeatSequence != 50 {
+		t.Errorf("DEFECT F-03: in-memory heartbeat sequence regressed from 50 to %d", recMemAfter.HeartbeatSequence)
+	}
+
+	recDBAfter, _ := store.GetNode(ctx, "node-f03-eq")
+	if recDBAfter.Status != types.NodeStatusHealthy {
+		t.Errorf("DEFECT F-03: SQLite status overwritten to DEGRADED by lower sequence at equal timestamp")
+	}
+	if recDBAfter.HeartbeatSequence != 50 {
+		t.Errorf("DEFECT F-03: SQLite sequence regressed from 50 to %d", recDBAfter.SequenceNumber)
+	}
+
+	// 3. Heartbeat at EQUAL timestamp with HIGHER sequence 80, Status: DEGRADED
+	// MUST advance Status and SequenceNumber!
+	hb3 := types.Heartbeat{
+		NodeID:         "node-f03-eq",
+		SequenceNumber: 80,
+		Status:         types.NodeStatusDegraded,
+		Timestamp:      tEqual,
+	}
+	bHb3, _ := json.Marshal(hb3)
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb3))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("hb3 post failed: %v", err)
+	}
+	res.Body.Close()
+
+	recMemHigher, _ := srv.GetNode("node-f03-eq")
+	if recMemHigher.Status != types.NodeStatusDegraded || recMemHigher.HeartbeatSequence != 80 {
+		t.Errorf("expected DEGRADED and hbSeq 80 after higher seq heartbeat, got %s / %d", recMemHigher.Status, recMemHigher.HeartbeatSequence)
+	}
+	recDBHigher, _ := store.GetNode(ctx, "node-f03-eq")
+	if recDBHigher.Status != types.NodeStatusDegraded || recDBHigher.HeartbeatSequence != 80 {
+		t.Errorf("expected DEGRADED and hbSeq 80 in SQLite, got %s / %d", recDBHigher.Status, recDBHigher.HeartbeatSequence)
+	}
+
+	// 4. Identical timestamp and identical sequence number: deterministic idempotent handling
+	res, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb3))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("idempotent duplicate heartbeat failed: %v", err)
+	}
+	res.Body.Close()
+
+	recMemIdemp, _ := srv.GetNode("node-f03-eq")
+	if recMemIdemp.Status != types.NodeStatusDegraded || recMemIdemp.HeartbeatSequence != 80 {
+		t.Errorf("idempotent heartbeat mutated state: %s / %d", recMemIdemp.Status, recMemIdemp.HeartbeatSequence)
+	}
+}
+
+// TestServer_F04_DuplicateRegistration_MetadataPreservation verifies that duplicate registrations
+// preserve non-empty metadata even when optional fields are omitted, for both in-memory and SQLite modes.
+func TestServer_F04_DuplicateRegistration_MetadataPreservation(t *testing.T) {
+	runTest := func(t *testing.T, withStore bool) {
+		var opts []ServerOption
+		var store *storage.SQLiteStore
+		if withStore {
+			var err error
+			store, err = storage.OpenSQLite(":memory:")
+			if err != nil {
+				t.Fatalf("OpenSQLite failed: %v", err)
+			}
+			defer store.Close()
+			opts = append(opts, WithIdempotencyStore(store))
+		}
+
+		srv := NewServer(newDiscardLogger(), opts...)
+		if !withStore {
+			srv.store = nil
+		}
+		ts := httptest.NewServer(srv.Routes())
+		defer ts.Close()
+		client := ts.Client()
+
+		t0 := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+		regInitial := types.NodeRegistration{
+			NodeID:       "node-f04",
+			Hostname:     "host-initial",
+			AgentVersion: "v1.0.0",
+			OS:           "linux",
+			Architecture: "amd64",
+			Capabilities: []string{"inference", "telemetry"},
+			Labels:       map[string]string{"env": "prod", "zone": "us-east"},
+			RegisteredAt: t0,
+		}
+		b1, _ := json.Marshal(regInitial)
+		res1, err := client.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b1))
+		if err != nil {
+			t.Fatalf("initial register error: %v", err)
+		}
+		if res1.StatusCode != http.StatusCreated {
+			t.Fatalf("initial register failed: code %d", res1.StatusCode)
+		}
+		res1.Body.Close()
+
+		// 1. Duplicate registration with empty optional metadata fields
+		t1 := t0.Add(1 * time.Hour)
+		regEmptyDup := types.NodeRegistration{
+			NodeID:       "node-f04",
+			Hostname:     "host-initial",
+			AgentVersion: "",
+			RegisteredAt: t1,
+		}
+		b2, _ := json.Marshal(regEmptyDup)
+		res2, err := client.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b2))
+		if err != nil {
+			t.Fatalf("duplicate register error: %v", err)
+		}
+		if res2.StatusCode != http.StatusOK {
+			t.Fatalf("duplicate register failed: code %d", res2.StatusCode)
+		}
+		res2.Body.Close()
+
+		recAfterEmpty, ok := srv.GetNode("node-f04")
+		if !ok {
+			t.Fatalf("node-f04 not found in memory")
+		}
+		if recAfterEmpty.Hostname != "host-initial" {
+			t.Errorf("DEFECT F-04: Hostname was erased by empty duplicate registration: got %q", recAfterEmpty.Hostname)
+		}
+		if recAfterEmpty.AgentVersion != "v1.0.0" {
+			t.Errorf("DEFECT F-04: AgentVersion was erased: got %q", recAfterEmpty.AgentVersion)
+		}
+		if len(recAfterEmpty.Capabilities) != 2 || len(recAfterEmpty.Labels) != 2 {
+			t.Errorf("DEFECT F-04: Capabilities or Labels were erased")
+		}
+		if !recAfterEmpty.RegisteredAt.Equal(t0) {
+			t.Errorf("DEFECT F-04: RegisteredAt was mutated on duplicate registration")
+		}
+
+		// 2. Duplicate registration with new non-empty metadata
+		t2 := t1.Add(1 * time.Hour)
+		regNewMeta := types.NodeRegistration{
+			NodeID:       "node-f04",
+			Hostname:     "host-updated",
+			AgentVersion: "v2.0.0",
+			RegisteredAt: t2,
+		}
+		b3, _ := json.Marshal(regNewMeta)
+		res3, err := client.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(b3))
+		if err != nil || res3.StatusCode != http.StatusOK {
+			t.Fatalf("new meta duplicate register failed: %v", err)
+		}
+		res3.Body.Close()
+
+		recAfterNew, _ := srv.GetNode("node-f04")
+		if recAfterNew.Hostname != "host-updated" || recAfterNew.AgentVersion != "v2.0.0" {
+			t.Errorf("expected updated metadata host-updated/v2.0.0, got %s/%s", recAfterNew.Hostname, recAfterNew.AgentVersion)
+		}
+		if !recAfterNew.RegisteredAt.Equal(t0) {
+			t.Errorf("RegisteredAt must remain original enrollment time: got %v", recAfterNew.RegisteredAt)
+		}
+	}
+
+	t.Run("InMemory_StoreNil", func(t *testing.T) {
+		runTest(t, false)
+	})
+	t.Run("SQLite_StoreBacked", func(t *testing.T) {
+		runTest(t, true)
+	})
+}
+
+// TestServer_T01_Deterministic_SameNodeConcurrency_ControlledInterleaving tests true same-node concurrency
+// using an explicit test barrier to interleave two concurrent operations targeting the same nodeID.
+// It verifies that nodeLockManager strictly serializes operations and prevents stale in-memory overwrites.
+func TestServer_T01_Deterministic_SameNodeConcurrency_ControlledInterleaving(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store))
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Initial node enrollment at T0
+	t0 := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-same-conc",
+		Hostname:     "host-conc",
+		RegisteredAt: t0,
+	}
+	bReg, _ := json.Marshal(reg)
+	res, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	if err != nil || res.StatusCode != http.StatusCreated {
+		t.Fatalf("initial register failed: %v", err)
+	}
+	res.Body.Close()
+
+	// Channels to deterministically synchronize the two goroutines
+	g1InStore := make(chan struct{})
+	g1CanFinish := make(chan struct{})
+
+	// Hook into UpdateNodeHeartbeat so G1 pauses inside its SQLite transaction before releasing the node lock
+	store.HookAfterHeartbeatUpdate = func(nodeID string) error {
+		if nodeID == "node-same-conc" {
+			select {
+			case g1InStore <- struct{}{}:
+			default:
+			}
+			<-g1CanFinish
+		}
+		return nil
+	}
+	defer func() {
+		store.HookAfterHeartbeatUpdate = nil
+	}()
+
+	// G1: Stale operation (T1 = T0 + 1hr, Seq 10, Status: DEGRADED)
+	t1 := t0.Add(1 * time.Hour)
+	hb1 := types.Heartbeat{
+		NodeID:         "node-same-conc",
+		SequenceNumber: 10,
+		Status:         types.NodeStatusDegraded,
+		Timestamp:      t1,
+	}
+	b1, _ := json.Marshal(hb1)
+
+	g1Done := make(chan error, 1)
+	go func() {
+		resp, err := http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(b1))
+		if err != nil {
+			g1Done <- err
+			return
+		}
+		resp.Body.Close()
+		g1Done <- nil
+	}()
+
+	// Wait for G1 to enter the storage hook while holding lockNode("node-same-conc")
+	select {
+	case <-g1InStore:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for G1 to enter storage hook")
+	}
+
+	// G2: Newer operation (T2 = T0 + 2hr, Seq 50, Status: HEALTHY) for the SAME node
+	t2 := t0.Add(2 * time.Hour)
+	hb2 := types.Heartbeat{
+		NodeID:         "node-same-conc",
+		SequenceNumber: 50,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      t2,
+	}
+	b2, _ := json.Marshal(hb2)
+
+	g2Done := make(chan error, 1)
+	go func() {
+		resp, err := http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(b2))
+		if err != nil {
+			g2Done <- err
+			return
+		}
+		resp.Body.Close()
+		g2Done <- nil
+	}()
+
+	// Because G1 holds the nodeLock for "node-same-conc", G2 MUST block at s.lockNode("node-same-conc")
+	// Verify that G2 has NOT completed while G1 is paused in hook
+	select {
+	case <-g2Done:
+		t.Fatalf("CONCURRENCY VIOLATION: G2 completed while G1 was holding the per-node lock")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: G2 is blocked waiting for G1's per-node lock
+	}
+
+	// Unblock G1: G1 commits SQLite transaction, completes in-memory reconciliation, and releases nodeLock
+	close(g1CanFinish)
+
+	// Wait for both G1 and G2 to complete
+	select {
+	case err := <-g1Done:
+		if err != nil {
+			t.Fatalf("G1 failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for G1 to complete")
+	}
+
+	select {
+	case err := <-g2Done:
+		if err != nil {
+			t.Fatalf("G2 failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for G2 to complete")
+	}
+
+	// Assert final state: G2's newer state (T2, HbSeq 50, HEALTHY) must be preserved in both memory and SQLite
+	recMemFinal, ok := srv.GetNode("node-same-conc")
+	if !ok || recMemFinal.Status != types.NodeStatusHealthy || recMemFinal.HeartbeatSequence != 50 || !recMemFinal.LastSeen.Equal(t2) {
+		t.Fatalf("final in-memory state invalid: status=%s, seq=%d, hbSeq=%d, lastSeen=%v", recMemFinal.Status, recMemFinal.SequenceNumber, recMemFinal.HeartbeatSequence, recMemFinal.LastSeen)
+	}
+
+	recDBFinal, err := store.GetNode(ctx, "node-same-conc")
+	if err != nil || recDBFinal.Status != types.NodeStatusHealthy || recDBFinal.HeartbeatSequence != 50 || !recDBFinal.LastSeen.Equal(t2) {
+		t.Fatalf("final SQLite state invalid: status=%s, seq=%d, hbSeq=%d, lastSeen=%v", recDBFinal.Status, recDBFinal.SequenceNumber, recDBFinal.HeartbeatSequence, recDBFinal.LastSeen)
+	}
+}
+
+func TestServer_F05_SeparateSequenceDomains_HTTPIntegration(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(nil, WithIdempotencyStore(store))
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	t0 := time.Now().UTC().Truncate(time.Millisecond)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f05-http",
+		Hostname:     "host-f05",
+		RegisteredAt: t0,
+	}
+	bReg, _ := json.Marshal(reg)
+	resp, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("registration failed: status=%v, err=%v", resp.StatusCode, err)
+	}
+	resp.Body.Close()
+
+	// 1. Advance telemetry activity to sequence 100 via HTTP ingestion
+	t1 := t0.Add(10 * time.Second)
+	batch := types.TelemetryBatch{
+		BatchID:        "b-f05-1",
+		NodeID:         "node-f05-http",
+		SequenceNumber: 100,
+		CollectedAt:    t1,
+		Metrics: []types.MetricSample{
+			{Name: "cpu", Value: 42.0, Timestamp: t1},
+		},
+	}
+	bBatch, _ := json.Marshal(batch)
+	resp, err = http.Post(ts.URL+"/api/v1/telemetry/batches", "application/json", bytes.NewReader(bBatch))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("telemetry ingestion failed: status=%v, err=%v", resp.StatusCode, err)
+	}
+	resp.Body.Close()
+
+	// 2. Heartbeat with seq 50 and newer timestamp T2 (in the future of ingestion time)
+	t2 := time.Now().UTC().Add(time.Hour)
+	hb1 := types.Heartbeat{
+		NodeID:         "node-f05-http",
+		SequenceNumber: 50,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      t2,
+	}
+	bHb1, _ := json.Marshal(hb1)
+	resp, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb1))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("hb1 failed: status=%v, err=%v", resp.StatusCode, err)
+	}
+	resp.Body.Close()
+
+	// 3. Heartbeat with seq 80 and the SAME timestamp T2, status DEGRADED
+	// In the audit finding, this was rejected because 80 was compared against telemetry seq 100.
+	// With separate domains, 80 is compared against heartbeat seq 50 (80 >= 50), which advances status!
+	hb2 := types.Heartbeat{
+		NodeID:         "node-f05-http",
+		SequenceNumber: 80,
+		Status:         types.NodeStatusDegraded,
+		Timestamp:      t2,
+	}
+	bHb2, _ := json.Marshal(hb2)
+	resp, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb2))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("hb2 failed: status=%v, err=%v", resp.StatusCode, err)
+	}
+	resp.Body.Close()
+
+	// Assert in-memory state
+	recMem, ok := srv.GetNode("node-f05-http")
+	if !ok {
+		t.Fatal("node not found in memory")
+	}
+	if recMem.Status != types.NodeStatusDegraded {
+		t.Errorf("DEFECT F-05: in-memory status not updated to DEGRADED on equal timestamp: got %s", recMem.Status)
+	}
+	if recMem.SequenceNumber != 100 {
+		t.Errorf("DEFECT F-05: in-memory telemetry sequence was mutated: got %d, want 100", recMem.SequenceNumber)
+	}
+	if recMem.HeartbeatSequence != 80 {
+		t.Errorf("DEFECT F-05: in-memory heartbeat sequence not updated: got %d, want 80", recMem.HeartbeatSequence)
+	}
+
+	// Assert persisted SQLite state
+	recDB, err := store.GetNode(ctx, "node-f05-http")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if recDB.Status != types.NodeStatusDegraded {
+		t.Errorf("DEFECT F-05: SQLite status not updated to DEGRADED on equal timestamp: got %s", recDB.Status)
+	}
+	if recDB.SequenceNumber != 100 {
+		t.Errorf("DEFECT F-05: SQLite telemetry sequence was mutated: got %d, want 100", recDB.SequenceNumber)
+	}
+	if recDB.HeartbeatSequence != 80 {
+		t.Errorf("DEFECT F-05: SQLite heartbeat sequence not updated: got %d, want 80", recDB.HeartbeatSequence)
+	}
+}
+
+func TestServer_F06_CorruptTimestamp_ServerFailSafe(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "corrupt_hb.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(nil, WithIdempotencyStore(store))
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	t0 := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f06-http",
+		Hostname:     "host-f06",
+		RegisteredAt: t0,
+	}
+	bReg, _ := json.Marshal(reg)
+	resp, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("registration failed: status=%v, err=%v", resp.StatusCode, err)
+	}
+	resp.Body.Close()
+
+	// Inject corrupt timestamp into SQLite using raw connection
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open failed: %v", err)
+	}
+	_, err = rawDB.Exec(`UPDATE cp_nodes SET last_seen = 'INVALID_RFC3339_STRING' WHERE node_id = 'node-f06-http';`)
+	rawDB.Close()
+	if err != nil {
+		t.Fatalf("failed to inject corrupt timestamp: %v", err)
+	}
+
+	// Attempt heartbeat -> must return 500 Internal Server Error (corrupt_node_record)
+	hb := types.Heartbeat{
+		NodeID:         "node-f06-http",
+		SequenceNumber: 10,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      time.Now().UTC(),
+	}
+	bHb, _ := json.Marshal(hb)
+	resp, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb))
+	if err != nil {
+		t.Fatalf("heartbeat request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("DEFECT F-06: expected HTTP 500 for corrupt node record, got %d", resp.StatusCode)
+	}
+	var errResp ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	if errResp.Error != "corrupt_node_record" {
+		t.Errorf("DEFECT F-06: expected error 'corrupt_node_record', got %q", errResp.Error)
+	}
+
+	// Verify genuine missing node returns 404
+	hbMissing := types.Heartbeat{
+		NodeID:         "truly-missing-node",
+		SequenceNumber: 1,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      time.Now().UTC(),
+	}
+	bMissing, _ := json.Marshal(hbMissing)
+	respMissing, err := http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bMissing))
+	if err != nil || respMissing.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for missing node, got %v", respMissing.StatusCode)
+	}
+	respMissing.Body.Close()
+}
+
+func TestServer_F07_DuplicateRegistration_MetadataFreshness_HTTPIntegration(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(nil, WithIdempotencyStore(store))
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	t0 := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	reg := types.NodeRegistration{
+		NodeID:       "node-f07-http",
+		Hostname:     "host-v1",
+		AgentVersion: "1.0.0",
+		RegisteredAt: t0,
+	}
+	bReg, _ := json.Marshal(reg)
+	resp, err := http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bReg))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("initial registration failed: status=%v, err=%v", resp.StatusCode, err)
+	}
+	resp.Body.Close()
+
+	// Send heartbeats for several minutes to T5
+	t5 := t0.Add(5 * time.Minute)
+	hb := types.Heartbeat{
+		NodeID:         "node-f07-http",
+		SequenceNumber: 20,
+		Status:         types.NodeStatusHealthy,
+		Timestamp:      t5,
+	}
+	bHb, _ := json.Marshal(hb)
+	resp, err = http.Post(ts.URL+"/api/v1/nodes/heartbeat", "application/json", bytes.NewReader(bHb))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// 1. Legitimate re-registration retaining immutable RegisteredAt: T0, with fresh UpdatedAt: T6 and MetadataVersion: 1
+	t6 := t0.Add(6 * time.Minute)
+	regRe := types.NodeRegistration{
+		NodeID:          "node-f07-http",
+		Hostname:        "host-v2",
+		AgentVersion:    "1.1.0",
+		RegisteredAt:    t0, // Immutable original enrollment time
+		UpdatedAt:       &t6,
+		MetadataVersion: 1,
+	}
+	bRegRe, _ := json.Marshal(regRe)
+	resp, err = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bRegRe))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("duplicate registration failed: status=%v, err=%v", resp.StatusCode, err)
+	}
+	var regResp RegistrationResponse
+	_ = json.NewDecoder(resp.Body).Decode(&regResp)
+	resp.Body.Close()
+
+	if regResp.Status != "already_registered" {
+		t.Errorf("expected status 'already_registered', got %q", regResp.Status)
+	}
+	if !regResp.RegisteredAt.Equal(t0) {
+		t.Errorf("DEFECT F-07: registered_at mutated in response: got %v, want %v", regResp.RegisteredAt, t0)
+	}
+
+	// Verify in-memory and database metadata were updated
+	recMem, ok := srv.GetNode("node-f07-http")
+	if !ok || recMem.AgentVersion != "1.1.0" || recMem.Hostname != "host-v2" {
+		t.Errorf("DEFECT F-07: in-memory metadata not updated: agent=%s, host=%s", recMem.AgentVersion, recMem.Hostname)
+	}
+	if !recMem.RegisteredAt.Equal(t0) {
+		t.Errorf("DEFECT F-07: in-memory registered_at mutated: got %v, want %v", recMem.RegisteredAt, t0)
+	}
+
+	recDB, err := store.GetNode(ctx, "node-f07-http")
+	if err != nil || recDB.AgentVersion != "1.1.0" || recDB.Hostname != "host-v2" {
+		t.Errorf("DEFECT F-07: SQLite metadata not updated: agent=%s, host=%s", recDB.AgentVersion, recDB.Hostname)
+	}
+	if !recDB.RegisteredAt.Equal(t0) {
+		t.Errorf("DEFECT F-07: SQLite registered_at mutated: got %v, want %v", recDB.RegisteredAt, t0)
+	}
+
+	// 2. Stale re-registration with older metadata timestamp T4 and version 0 must be REJECTED
+	t4 := t0.Add(4 * time.Minute)
+	regStale := types.NodeRegistration{
+		NodeID:          "node-f07-http",
+		Hostname:        "host-stale",
+		AgentVersion:    "0.9.0",
+		RegisteredAt:    t0,
+		UpdatedAt:       &t4,
+		MetadataVersion: 0,
+	}
+	bRegStale, _ := json.Marshal(regStale)
+	resp, err = http.Post(ts.URL+"/api/v1/nodes/register", "application/json", bytes.NewReader(bRegStale))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("stale registration request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	recMemAfterStale, _ := srv.GetNode("node-f07-http")
+	if recMemAfterStale.AgentVersion != "1.1.0" || recMemAfterStale.Hostname != "host-v2" {
+		t.Errorf("DEFECT F-07: stale registration overwrote newer metadata: agent=%s, host=%s",
+			recMemAfterStale.AgentVersion, recMemAfterStale.Hostname)
 	}
 }
