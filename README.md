@@ -213,6 +213,30 @@ A readiness failure does **not** automatically imply a liveness failure:
 * When storage experiences transient busy locks, checkpointing pauses, or slow disk writes, `/readyz` returns `503` so upstream traffic routers hold or redirect incoming edge traffic.
 * If `/healthz` were coupled to storage probes, process supervisors would misinterpret transient storage latency as process failure and terminate the control plane (`SIGKILL`), interrupting in-flight SQLite WAL commits, escalating contention, and risking data loss across premature restarts.
 
+#### 4. Operational Metrics (`GET /metrics`, `HEAD /metrics`)
+* **Purpose**: Provides thread-safe, Prometheus-compatible (format version 0.0.4) operational metrics for the control plane without pulling external dependencies.
+* **Exposition Format & Content-Type**:
+  * Emits Prometheus standard text exposition format with `# HELP` and `# TYPE` declarations.
+  * Responds with `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+* **Fast-Path Performance Guarantees**:
+  * Scraping `/metrics` executes zero SQLite queries and acquires no database locks.
+  * Ingested batch counters, storage probe statistics, and auth failures use lock-free atomic operations or bounded RWMutex snapshots.
+  * Dynamic gauges (e.g. `registered_nodes_count`) evaluate in-memory state under microsecond read locks.
+  * Remains fully responsive (`200 OK`) even when the storage layer is degraded, unavailable, or when the server is in graceful shutdown.
+* **Supported Methods**:
+  * `GET`: Emits serialized metrics text payload.
+  * `HEAD`: Returns `HTTP 200 OK` with identical headers and zero-length body.
+  * Other methods return `HTTP 405 Method Not Allowed` with `Allow: GET, HEAD`.
+* **Standard Control-Plane Metrics**:
+  * `aegisedge_control_plane_ingested_batches_total{transport="http|nats", status="accepted|duplicate"}`: Monotonically increasing counter of batches committed into durable storage. Never incremented on validation or persistence error.
+  * `aegisedge_control_plane_storage_probe_duration_seconds`: Histogram tracking the latency distribution of storage readiness `Ping` probes across sub-millisecond to multi-second buckets.
+  * `aegisedge_control_plane_storage_probe_failures_total`: Counter tracking the count of storage health readiness probe failures or timeouts.
+  * `aegisedge_control_plane_auth_failures_total{reason="..."}`: Counter tracking authentication and authorization rejections, strictly constrained to a bounded allowlist (`invalid_signature`, `expired_timestamp`, `future_timestamp`, `replay_detected`, `missing_auth`, `forbidden`, `unauthorized`, `unknown`).
+  * `aegisedge_control_plane_nats_exhausted_deliveries_total`: Dynamic counter reflecting the total number of transient delivery exhaustion events observed by the NATS JetStream consumer.
+  * `aegisedge_control_plane_registered_nodes_count`: Dynamic gauge reflecting the current count of edge nodes registered in the control-plane memory.
+* **Production Security Consideration**:
+  * Operational metrics should be protected in production by restricting access to authorized monitoring collectors (e.g., Prometheus scrapers) via network policies, internal listener binding, or reverse proxy authentication to prevent information disclosure.
+
 ### Practical Local Verification Examples (PowerShell)
 
 In the local development environment, query the running control plane (e.g. `http://localhost:8080`) using `Invoke-WebRequest`:
@@ -246,6 +270,19 @@ try {
 # Lightweight probe returning HTTP status and headers with zero payload body
 $head = Invoke-WebRequest -Uri "http://localhost:8080/readyz" -Method HEAD -UseBasicParsing
 Write-Host "HEAD Status:" $head.StatusCode
+```
+
+#### D. Scraping Operational Metrics (`/metrics`)
+```powershell
+# Scrape Prometheus text exposition format (returns 200 OK with version 0.0.4)
+$metrics = Invoke-WebRequest -Uri "http://localhost:8080/metrics" -UseBasicParsing
+Write-Host "Metrics Status:"       $metrics.StatusCode
+Write-Host "Content-Type:"         $metrics.Headers["Content-Type"]
+Write-Host "Metrics Body Preview:" ($metrics.Content -split "`n" | Select-Object -First 15 | Out-String)
+
+# Lightweight HEAD probe
+$metricsHead = Invoke-WebRequest -Uri "http://localhost:8080/metrics" -Method HEAD -UseBasicParsing
+Write-Host "Metrics HEAD Status:"  $metricsHead.StatusCode
 ```
 
 #### Interpreting Responses in Local Development

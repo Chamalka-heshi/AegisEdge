@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/metrics"
 	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/storage"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
@@ -191,6 +192,17 @@ func WithIdempotencyStore(store storage.IdempotencyStore) ServerOption {
 	}
 }
 
+// WithMetrics configures the operational metrics instance for the server.
+func WithMetrics(m *metrics.Metrics) ServerOption {
+	return func(s *Server) error {
+		if m == nil {
+			return errors.New("metrics cannot be nil")
+		}
+		s.metrics = m
+		return nil
+	}
+}
+
 // Server provides the HTTP ingestion endpoints for AegisEdge telemetry.
 //
 // NOTE (Phase 6.22B Durable Control-Plane Idempotency Architecture):
@@ -213,6 +225,7 @@ type Server struct {
 	nodeLocks           *nodeLockManager
 	storageProbeTimeout time.Duration
 	shuttingDown        atomic.Bool
+	metrics             *metrics.Metrics
 }
 
 // nodeLock tracks active and pending operations for a specific node ID.
@@ -342,7 +355,23 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 			}
 		}
 	}
+
+	// Initialize operational metrics and wire dynamic registered nodes count
+	if s.metrics == nil {
+		s.metrics = metrics.NewMetrics()
+	}
+	s.metrics.SetRegisteredNodesSource(func() float64 {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return float64(len(s.nodes))
+	})
+
 	return s
+}
+
+// Metrics returns the operational metrics instance for the server.
+func (s *Server) Metrics() *metrics.Metrics {
+	return s.metrics
 }
 
 // InitError returns any initialization error encountered during startup rehydration.
@@ -411,6 +440,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/v1/telemetry/batches", s.handleTelemetryBatches)
 	mux.HandleFunc("/api/v1/nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("/api/v1/nodes/heartbeat", s.handleNodeHeartbeat)
@@ -510,7 +540,17 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	probeCtx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	if err := s.store.Ping(probeCtx); err != nil {
+	probeStart := time.Now()
+	err := s.store.Ping(probeCtx)
+	probeDuration := time.Since(probeStart).Seconds()
+	if s.metrics != nil {
+		s.metrics.RecordStorageProbeDurationSeconds(probeDuration)
+	}
+
+	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordStorageProbeFailure()
+		}
 		s.logger.Warn("readiness storage probe failed", slog.Any("error", err))
 		s.writeReadiness(w, r.Method, http.StatusServiceUnavailable, ReadinessResponse{
 			Status: "not_ready",
@@ -540,6 +580,15 @@ func (s *Server) writeReadiness(w http.ResponseWriter, method string, statusCode
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		s.logger.Error("failed to write readiness response", slog.Any("error", err))
 	}
+}
+
+// handleMetrics exposes Prometheus operational metrics for the control plane.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.metrics == nil {
+		http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	s.metrics.Registry().Handler().ServeHTTP(w, r)
 }
 
 // handleTelemetryBatches processes batch ingestion (POST) and batch queries (GET).
@@ -620,6 +669,9 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	authEnabled := s.authConfig.Enabled
 	s.mu.RUnlock()
 	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != batch.NodeID {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("forbidden")
+		}
 		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 			Error:   "forbidden",
 			Message: fmt.Sprintf("authenticated node %q cannot submit telemetry for node %q", authCtx.NodeID, batch.NodeID),
@@ -648,6 +700,9 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !isNew {
+		if s.metrics != nil {
+			s.metrics.RecordIngestedBatch("http", "duplicate")
+		}
 		// Duplicate batch: already accepted. Return 200 OK with already_accepted status.
 		s.logger.Info("duplicate telemetry batch received (idempotent no-op)",
 			slog.String("batch_id", batch.BatchID),
@@ -671,6 +726,10 @@ func (s *Server) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	s.appendHistoryLocked(record)
 	s.updateNodeTelemetryActivityLocked(batch.NodeID, batch.SequenceNumber, ingestedAt)
 	s.mu.Unlock()
+
+	if s.metrics != nil {
+		s.metrics.RecordIngestedBatch("http", "accepted")
+	}
 
 	s.logger.Info("telemetry batch accepted and ingested",
 		slog.String("batch_id", batch.BatchID),
@@ -727,6 +786,9 @@ func (s *Server) handleListBatches(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	if authEnabled && !authCtx.IsAdmin {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("forbidden")
+		}
 		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 			Error:   "forbidden",
 			Message: "administrative authorization required to list telemetry batches",
@@ -818,6 +880,9 @@ func (s *Server) IngestBatch(ctx context.Context, batch *types.TelemetryBatch) e
 	}
 
 	if !isNew {
+		if s.metrics != nil {
+			s.metrics.RecordIngestedBatch("nats", "duplicate")
+		}
 		s.logger.Info("duplicate batch ingestion (idempotent no-op via NATS consumer)",
 			slog.String("batch_id", batch.BatchID),
 			slog.String("node_id", batch.NodeID),
@@ -833,6 +898,10 @@ func (s *Server) IngestBatch(ctx context.Context, batch *types.TelemetryBatch) e
 	s.appendHistoryLocked(record)
 	s.updateNodeTelemetryActivityLocked(batch.NodeID, batch.SequenceNumber, ingestedAt)
 	s.mu.Unlock()
+
+	if s.metrics != nil {
+		s.metrics.RecordIngestedBatch("nats", "accepted")
+	}
 
 	s.logger.Info("telemetry batch ingested via NATS consumer",
 		slog.String("batch_id", batch.BatchID),
@@ -900,6 +969,10 @@ func (s *Server) writeAuthError(w http.ResponseWriter, err error) {
 		errType = "replay_detected"
 	} else if errors.Is(err, types.ErrMissingAuthHeaders) {
 		errType = "missing_auth_headers"
+	}
+
+	if s.metrics != nil {
+		s.metrics.RecordAuthFailure(errType)
 	}
 
 	s.writeJSON(w, http.StatusUnauthorized, ErrorResponse{
@@ -981,6 +1054,9 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != reg.NodeID {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("forbidden")
+		}
 		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 			Error:   "forbidden",
 			Message: fmt.Sprintf("authenticated node %q cannot register as node %q", authCtx.NodeID, reg.NodeID),
@@ -1202,6 +1278,9 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != hb.NodeID {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("forbidden")
+		}
 		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 			Error:   "forbidden",
 			Message: fmt.Sprintf("authenticated node %q cannot send heartbeat for node %q", authCtx.NodeID, hb.NodeID),
@@ -1340,6 +1419,9 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		// List all nodes: admin only
 		if authEnabled && !authCtx.IsAdmin {
+			if s.metrics != nil {
+				s.metrics.RecordAuthFailure("forbidden")
+			}
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 				Error:   "forbidden",
 				Message: "administrative authorization required to list all nodes",
@@ -1355,6 +1437,9 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 
 	// Single node query: path is node_id
 	if authEnabled && !authCtx.IsAdmin && authCtx.NodeID != path {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("forbidden")
+		}
 		s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 			Error:   "forbidden",
 			Message: fmt.Sprintf("authenticated node %q cannot inspect record for node %q", authCtx.NodeID, path),

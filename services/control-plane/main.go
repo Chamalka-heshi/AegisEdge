@@ -267,6 +267,9 @@ func main() {
 			logger.Error("failed to initialize NATS consumer", slog.Any("error", err))
 			os.Exit(1)
 		}
+		srvInstance.Metrics().SetNATSExhaustedDeliveriesSource(func() float64 {
+			return float64(consumer.ExhaustedDeliveries())
+		})
 		if err := consumer.Start(); err != nil {
 			logger.Error("failed to start NATS consumer", slog.Any("error", err))
 			os.Exit(1)
