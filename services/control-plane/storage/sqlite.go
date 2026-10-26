@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -17,7 +18,7 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// SQLiteStore implements IdempotencyStore using pure-Go SQLite in WAL mode.
+// SQLiteStore implements IdempotencyStore and QuarantineStore using pure-Go SQLite in WAL mode.
 type SQLiteStore struct {
 	db     *sql.DB
 	path   string
@@ -37,7 +38,20 @@ type SQLiteStore struct {
 	// HookAfterHeartbeatUpdate is an optional test hook called inside UpdateNodeHeartbeat
 	// after node existence and freshness checks are completed, before transaction commit.
 	HookAfterHeartbeatUpdate func(nodeID string) error
+
+	// HookAfterQuarantineInsert is an optional test hook called inside RecordQuarantine
+	// after row insert/update before transaction commit.
+	HookAfterQuarantineInsert func() error
+
+	// HookBeforeQuarantineStatusCommit is an optional test hook called inside UpdateQuarantineStatus
+	// after status update before transaction commit.
+	HookBeforeQuarantineStatusCommit func() error
 }
+
+var (
+	_ IdempotencyStore = (*SQLiteStore)(nil)
+	_ QuarantineStore  = (*SQLiteStore)(nil)
+)
 
 // OpenSQLite initializes a SQLite database connection, applies WAL pragmas,
 // and ensures the idempotency and payload schemas are created idempotently.
@@ -165,10 +179,96 @@ func (s *SQLiteStore) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_cp_nodes_last_seen
 		ON cp_nodes(last_seen ASC);
+
+	CREATE TABLE IF NOT EXISTS cp_telemetry_quarantine (
+		id                    TEXT PRIMARY KEY NOT NULL,
+		dedup_key             TEXT UNIQUE NOT NULL,
+		source_stream         TEXT NOT NULL DEFAULT '',
+		source_sequence       INTEGER,
+		source_subject        TEXT NOT NULL DEFAULT '',
+		node_id               TEXT NOT NULL DEFAULT '',
+		batch_id              TEXT NOT NULL DEFAULT '',
+		payload               BLOB NOT NULL,
+		failure_category      TEXT NOT NULL,
+		failure_reason        TEXT NOT NULL,
+		last_failure_category TEXT NOT NULL DEFAULT '',
+		last_failure_reason   TEXT NOT NULL DEFAULT '',
+		delivery_count        INTEGER NOT NULL DEFAULT 0,
+		attempts              INTEGER NOT NULL DEFAULT 1,
+		first_quarantined_at  TEXT NOT NULL,
+		last_quarantined_at   TEXT NOT NULL,
+		status                TEXT NOT NULL DEFAULT 'quarantined',
+		status_updated_at     TEXT NOT NULL,
+		status_reason         TEXT NOT NULL DEFAULT '',
+		status_updated_by     TEXT NOT NULL DEFAULT '',
+		replay_metadata_json  TEXT NOT NULL DEFAULT '{}',
+		created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		CHECK (status IN ('quarantined', 'replayed', 'discarded')),
+		CHECK (failure_category IN ('deserialization_error', 'schema_validation', 'delivery_exhausted', 'storage_failure', 'unknown')),
+		CHECK (delivery_count >= 0),
+		CHECK (attempts >= 1),
+		CHECK (source_sequence IS NULL OR source_sequence >= 0)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_status_time
+		ON cp_telemetry_quarantine(status, last_quarantined_at DESC, id ASC);
+
+	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_node_time
+		ON cp_telemetry_quarantine(node_id, last_quarantined_at DESC, id ASC);
+
+	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_time
+		ON cp_telemetry_quarantine(last_quarantined_at DESC, id ASC);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("failed to execute schema initialization: %w", err)
+	}
+
+	// Safe, idempotent migration for existing databases lacking last_failure diagnostic columns
+	qCols := make(map[string]bool)
+	qRows, err := s.db.Query(`PRAGMA table_info(cp_telemetry_quarantine);`)
+	if err != nil {
+		return fmt.Errorf("failed to check cp_telemetry_quarantine schema: %w", err)
+	}
+	for qRows.Next() {
+		var (
+			cid           int
+			name, colType string
+			notNull, pk   int
+			dfltVal       any
+		)
+		if err := qRows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err == nil {
+			qCols[name] = true
+		}
+	}
+	if err := qRows.Err(); err != nil {
+		qRows.Close()
+		return fmt.Errorf("error reading cp_telemetry_quarantine table info: %w", err)
+	}
+	qRows.Close()
+
+	if len(qCols) > 0 {
+		if !qCols["last_failure_category"] {
+			if _, err := s.db.Exec(`ALTER TABLE cp_telemetry_quarantine ADD COLUMN last_failure_category TEXT NOT NULL DEFAULT '';`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("failed to migrate cp_telemetry_quarantine for last_failure_category: %w", err)
+				}
+			}
+			if _, err := s.db.Exec(`UPDATE cp_telemetry_quarantine SET last_failure_category = failure_category WHERE last_failure_category = '';`); err != nil {
+				return fmt.Errorf("failed to backfill cp_telemetry_quarantine last_failure_category: %w", err)
+			}
+		}
+		if !qCols["last_failure_reason"] {
+			if _, err := s.db.Exec(`ALTER TABLE cp_telemetry_quarantine ADD COLUMN last_failure_reason TEXT NOT NULL DEFAULT '';`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("failed to migrate cp_telemetry_quarantine for last_failure_reason: %w", err)
+				}
+			}
+			if _, err := s.db.Exec(`UPDATE cp_telemetry_quarantine SET last_failure_reason = failure_reason WHERE last_failure_reason = '';`); err != nil {
+				return fmt.Errorf("failed to backfill cp_telemetry_quarantine last_failure_reason: %w", err)
+			}
+		}
 	}
 
 	// Safe, idempotent migration for existing databases lacking separate sequence or metadata columns
@@ -187,6 +287,10 @@ func (s *SQLiteStore) initSchema() error {
 		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err == nil {
 			cols[name] = true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("failed to read cp_nodes schema: %w", err)
 	}
 	rows.Close()
 
@@ -1264,4 +1368,640 @@ func (s *SQLiteStore) UpdateNodeTelemetryActivity(ctx context.Context, nodeID st
 	}
 
 	return true, tx.Commit()
+}
+
+// RecordQuarantine persists a quarantine record idempotently.
+// If a record with the same deduplication identity already exists, it is updated
+// without creating a duplicate row, preserving terminal states.
+func (s *SQLiteStore) RecordQuarantine(ctx context.Context, record *QuarantineRecord) (*QuarantineRecord, error) {
+	if record == nil {
+		return nil, fmt.Errorf("%w: record cannot be nil", ErrInvalidQuarantineRecord)
+	}
+	if err := record.Validate(); err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	rec := *record
+	if rec.Payload == nil {
+		rec.Payload = []byte{}
+	}
+
+	if rec.FailureCategory == "" {
+		rec.FailureCategory = CategoryUnknown
+	}
+	if rec.LastFailureCategory == "" {
+		rec.LastFailureCategory = rec.FailureCategory
+	}
+	if rec.Status == "" {
+		rec.Status = StatusQuarantined
+	}
+	rec.FailureReason = SanitizeFailureReason(rec.FailureReason)
+	if rec.LastFailureReason == "" {
+		rec.LastFailureReason = rec.FailureReason
+	} else {
+		rec.LastFailureReason = SanitizeFailureReason(rec.LastFailureReason)
+	}
+
+	if rec.DeduplicationKey == "" {
+		rec.DeduplicationKey = DeriveDeduplicationKey(
+			rec.SourceStream,
+			rec.SourceSequence,
+			rec.NodeID,
+			rec.BatchID,
+			rec.SourceSubject,
+			rec.Payload,
+		)
+	}
+	if len(rec.DeduplicationKey) > MaxDeduplicationKeyLength {
+		return nil, fmt.Errorf("%w: deduplication key exceeds maximum length %d", ErrInvalidQuarantineRecord, MaxDeduplicationKeyLength)
+	}
+
+	now := time.Now().UTC()
+	if rec.FirstQuarantinedAt.IsZero() {
+		rec.FirstQuarantinedAt = now
+	} else {
+		rec.FirstQuarantinedAt = rec.FirstQuarantinedAt.UTC()
+	}
+	if rec.LastQuarantinedAt.IsZero() {
+		rec.LastQuarantinedAt = rec.FirstQuarantinedAt
+	} else {
+		rec.LastQuarantinedAt = rec.LastQuarantinedAt.UTC()
+	}
+	if rec.StatusUpdatedAt.IsZero() {
+		rec.StatusUpdatedAt = rec.LastQuarantinedAt
+	} else {
+		rec.StatusUpdatedAt = rec.StatusUpdatedAt.UTC()
+	}
+	if rec.Attempts < 1 {
+		rec.Attempts = 1
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin quarantine transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	queryExist := `
+	SELECT id, source_stream, source_sequence, source_subject, node_id, batch_id,
+	       payload, failure_category, failure_reason, last_failure_category, last_failure_reason,
+	       delivery_count, attempts, first_quarantined_at, last_quarantined_at,
+	       status, status_updated_at, status_reason, status_updated_by, replay_metadata_json
+	FROM cp_telemetry_quarantine
+	WHERE dedup_key = ?;
+	`
+	var (
+		existID              string
+		existStream          string
+		existSeq             sql.NullInt64
+		existSubject         string
+		existNodeID          string
+		existBatchID         string
+		existPayload         []byte
+		existCategory        string
+		existReason          string
+		existLastCategory    string
+		existLastReason      string
+		existDeliveryCount   int
+		existAttempts        int
+		existFirstAtStr      string
+		existLastAtStr       string
+		existStatus          string
+		existStatusAtStr     string
+		existStatusReason    string
+		existStatusUpdatedBy string
+		existReplayMetaJSON  string
+	)
+
+	err = tx.QueryRowContext(ctx, queryExist, rec.DeduplicationKey).Scan(
+		&existID, &existStream, &existSeq, &existSubject, &existNodeID, &existBatchID,
+		&existPayload, &existCategory, &existReason, &existLastCategory, &existLastReason,
+		&existDeliveryCount, &existAttempts,
+		&existFirstAtStr, &existLastAtStr, &existStatus, &existStatusAtStr,
+		&existStatusReason, &existStatusUpdatedBy, &existReplayMetaJSON,
+	)
+
+	if err == nil {
+		if !bytes.Equal(existPayload, rec.Payload) {
+			_ = tx.Rollback()
+			return nil, &PayloadConflictError{
+				DeduplicationKey: rec.DeduplicationKey,
+				ExistingSize:     len(existPayload),
+				IncomingSize:     len(rec.Payload),
+			}
+		}
+
+		rec.ID = existID
+		rec.Payload = existPayload
+		firstAt, _ := parseStoredTimestamp(existFirstAtStr)
+		rec.FirstQuarantinedAt = firstAt
+		rec.FailureCategory = QuarantineCategory(existCategory)
+		rec.FailureReason = existReason
+		rec.Attempts = existAttempts + 1
+
+		if record.FailureCategory != "" {
+			rec.LastFailureCategory = record.FailureCategory
+		} else {
+			rec.LastFailureCategory = QuarantineCategory(existLastCategory)
+		}
+		if record.FailureReason != "" {
+			rec.LastFailureReason = SanitizeFailureReason(record.FailureReason)
+		} else {
+			rec.LastFailureReason = existLastReason
+		}
+
+		if QuarantineStatus(existStatus).IsTerminal() {
+			rec.Status = QuarantineStatus(existStatus)
+			rec.StatusReason = existStatusReason
+			rec.StatusUpdatedBy = existStatusUpdatedBy
+			rec.StatusUpdatedAt, _ = parseStoredTimestamp(existStatusAtStr)
+			if existStream != "" && rec.SourceStream == "" {
+				rec.SourceStream = existStream
+			}
+			if existSeq.Valid && rec.SourceSequence == nil {
+				v := uint64(existSeq.Int64)
+				rec.SourceSequence = &v
+			}
+			if existNodeID != "" && rec.NodeID == "" {
+				rec.NodeID = existNodeID
+			}
+			if existBatchID != "" && rec.BatchID == "" {
+				rec.BatchID = existBatchID
+			}
+			if existReplayMetaJSON != "" && existReplayMetaJSON != "{}" {
+				_ = json.Unmarshal([]byte(existReplayMetaJSON), &rec.ReplayMetadata)
+			}
+
+			if rec.DeliveryCount < existDeliveryCount {
+				rec.DeliveryCount = existDeliveryCount
+			}
+			updateQuery := `
+			UPDATE cp_telemetry_quarantine
+			SET attempts = attempts + 1,
+			    last_quarantined_at = ?,
+			    delivery_count = ?,
+			    last_failure_category = ?,
+			    last_failure_reason = ?,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?;
+			`
+			_, err = tx.ExecContext(ctx, updateQuery,
+				formatTimestamp(rec.LastQuarantinedAt),
+				rec.DeliveryCount,
+				string(rec.LastFailureCategory),
+				rec.LastFailureReason,
+				rec.ID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to update resolved quarantine record: %w", err)
+			}
+		} else {
+			if rec.DeliveryCount < existDeliveryCount {
+				rec.DeliveryCount = existDeliveryCount
+			}
+			updateQuery := `
+			UPDATE cp_telemetry_quarantine
+			SET attempts = attempts + 1,
+			    last_quarantined_at = ?,
+			    delivery_count = ?,
+			    last_failure_category = ?,
+			    last_failure_reason = ?,
+			    source_subject = CASE WHEN ? != '' THEN ? ELSE source_subject END,
+			    node_id = CASE WHEN ? != '' THEN ? ELSE node_id END,
+			    batch_id = CASE WHEN ? != '' THEN ? ELSE batch_id END,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?;
+			`
+			_, err = tx.ExecContext(ctx, updateQuery,
+				formatTimestamp(rec.LastQuarantinedAt),
+				rec.DeliveryCount,
+				string(rec.LastFailureCategory),
+				rec.LastFailureReason,
+				rec.SourceSubject, rec.SourceSubject,
+				rec.NodeID, rec.NodeID,
+				rec.BatchID, rec.BatchID,
+				rec.ID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to update active quarantine record: %w", err)
+			}
+		}
+
+		if s.HookAfterQuarantineInsert != nil {
+			if err := s.HookAfterQuarantineInsert(); err != nil {
+				return nil, fmt.Errorf("injected test failure after quarantine update: %w", err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("failed to commit quarantine update: %w", err)
+		}
+		return &rec, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("failed to check existing quarantine dedup key: %w", err)
+	}
+
+	if rec.ID == "" {
+		newID, err := GenerateQuarantineID()
+		if err != nil {
+			return nil, err
+		}
+		rec.ID = newID
+	}
+
+	var replayMetaJSON string
+	if len(rec.ReplayMetadata) > 0 {
+		metaBytes, err := json.Marshal(rec.ReplayMetadata)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal replay metadata: %w", err)
+		}
+		replayMetaJSON = string(metaBytes)
+	} else {
+		replayMetaJSON = "{}"
+	}
+
+	var srcSeqVal any
+	if rec.SourceSequence != nil {
+		srcSeqVal = int64(*rec.SourceSequence)
+	}
+
+	insertQuery := `
+	INSERT INTO cp_telemetry_quarantine (
+		id, dedup_key, source_stream, source_sequence, source_subject,
+		node_id, batch_id, payload, failure_category, failure_reason,
+		last_failure_category, last_failure_reason,
+		delivery_count, attempts, first_quarantined_at, last_quarantined_at,
+		status, status_updated_at, status_reason, status_updated_by,
+		replay_metadata_json
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	`
+	_, err = tx.ExecContext(ctx, insertQuery,
+		rec.ID,
+		rec.DeduplicationKey,
+		rec.SourceStream,
+		srcSeqVal,
+		rec.SourceSubject,
+		rec.NodeID,
+		rec.BatchID,
+		rec.Payload,
+		string(rec.FailureCategory),
+		rec.FailureReason,
+		string(rec.LastFailureCategory),
+		rec.LastFailureReason,
+		rec.DeliveryCount,
+		rec.Attempts,
+		formatTimestamp(rec.FirstQuarantinedAt),
+		formatTimestamp(rec.LastQuarantinedAt),
+		string(rec.Status),
+		formatTimestamp(rec.StatusUpdatedAt),
+		rec.StatusReason,
+		rec.StatusUpdatedBy,
+		replayMetaJSON,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert quarantine record: %w", err)
+	}
+
+	if s.HookAfterQuarantineInsert != nil {
+		if err := s.HookAfterQuarantineInsert(); err != nil {
+			return nil, fmt.Errorf("injected test failure after quarantine insert: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit quarantine insert: %w", err)
+	}
+
+	return &rec, nil
+}
+
+// GetQuarantineRecord retrieves a quarantined record by its stable ID.
+// Returns (nil, ErrQuarantineNotFound) if not found.
+func (s *SQLiteStore) GetQuarantineRecord(ctx context.Context, id string) (*QuarantineRecord, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("%w: id cannot be empty", ErrInvalidQuarantineRecord)
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	query := `
+	SELECT id, dedup_key, source_stream, source_sequence, source_subject,
+	       node_id, batch_id, payload, failure_category, failure_reason,
+	       last_failure_category, last_failure_reason,
+	       delivery_count, attempts, first_quarantined_at, last_quarantined_at,
+	       status, status_updated_at, status_reason, status_updated_by,
+	       replay_metadata_json
+	FROM cp_telemetry_quarantine
+	WHERE id = ?;
+	`
+	var (
+		rec                   QuarantineRecord
+		categoryStr           string
+		lastCategoryStr       string
+		statusStr             string
+		firstAtStr, lastAtStr string
+		statusAtStr           string
+		replayMetaJSON        string
+		srcSeq                sql.NullInt64
+	)
+
+	err := s.db.QueryRowContext(ctx, query, id).Scan(
+		&rec.ID,
+		&rec.DeduplicationKey,
+		&rec.SourceStream,
+		&srcSeq,
+		&rec.SourceSubject,
+		&rec.NodeID,
+		&rec.BatchID,
+		&rec.Payload,
+		&categoryStr,
+		&rec.FailureReason,
+		&lastCategoryStr,
+		&rec.LastFailureReason,
+		&rec.DeliveryCount,
+		&rec.Attempts,
+		&firstAtStr,
+		&lastAtStr,
+		&statusStr,
+		&statusAtStr,
+		&rec.StatusReason,
+		&rec.StatusUpdatedBy,
+		&replayMetaJSON,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrQuarantineNotFound
+		}
+		return nil, fmt.Errorf("failed to query quarantine record: %w", err)
+	}
+
+	rec.FailureCategory = QuarantineCategory(categoryStr)
+	rec.LastFailureCategory = QuarantineCategory(lastCategoryStr)
+	rec.Status = QuarantineStatus(statusStr)
+
+	if srcSeq.Valid {
+		v := uint64(srcSeq.Int64)
+		rec.SourceSequence = &v
+	}
+
+	firstAt, err := parseStoredTimestamp(firstAtStr)
+	if err == nil {
+		rec.FirstQuarantinedAt = firstAt
+	}
+	lastAt, err := parseStoredTimestamp(lastAtStr)
+	if err == nil {
+		rec.LastQuarantinedAt = lastAt
+	}
+	statusAt, err := parseStoredTimestamp(statusAtStr)
+	if err == nil {
+		rec.StatusUpdatedAt = statusAt
+	}
+
+	if replayMetaJSON != "" && replayMetaJSON != "{}" {
+		_ = json.Unmarshal([]byte(replayMetaJSON), &rec.ReplayMetadata)
+	}
+
+	return &rec, nil
+}
+
+// ListQuarantineRecords returns a deterministic paginated list of quarantine records,
+// optionally filtered by status or node ID, ordered by last_quarantined_at DESC, id ASC.
+func (s *SQLiteStore) ListQuarantineRecords(ctx context.Context, filter QuarantineFilter) ([]*QuarantineRecord, error) {
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	if filter.Status != "" && !filter.Status.Valid() {
+		return nil, fmt.Errorf("%w: invalid filter status %q", ErrInvalidQuarantineRecord, filter.Status)
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	} else if limit > 500 {
+		limit = 500
+	}
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	var sb strings.Builder
+	sb.WriteString(`
+	SELECT id, dedup_key, source_stream, source_sequence, source_subject,
+	       node_id, batch_id, payload, failure_category, failure_reason,
+	       last_failure_category, last_failure_reason,
+	       delivery_count, attempts, first_quarantined_at, last_quarantined_at,
+	       status, status_updated_at, status_reason, status_updated_by,
+	       replay_metadata_json
+	FROM cp_telemetry_quarantine
+	WHERE 1=1
+	`)
+
+	var args []any
+	if filter.Status != "" {
+		sb.WriteString(" AND status = ?")
+		args = append(args, string(filter.Status))
+	}
+	if strings.TrimSpace(filter.NodeID) != "" {
+		sb.WriteString(" AND node_id = ?")
+		args = append(args, strings.TrimSpace(filter.NodeID))
+	}
+
+	sb.WriteString(" ORDER BY last_quarantined_at DESC, id ASC LIMIT ? OFFSET ?;")
+	args = append(args, limit, offset)
+
+	rows, err := s.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list quarantine records: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*QuarantineRecord, 0)
+	for rows.Next() {
+		var (
+			rec                   QuarantineRecord
+			categoryStr           string
+			lastCategoryStr       string
+			statusStr             string
+			firstAtStr, lastAtStr string
+			statusAtStr           string
+			replayMetaJSON        string
+			srcSeq                sql.NullInt64
+		)
+		err := rows.Scan(
+			&rec.ID,
+			&rec.DeduplicationKey,
+			&rec.SourceStream,
+			&srcSeq,
+			&rec.SourceSubject,
+			&rec.NodeID,
+			&rec.BatchID,
+			&rec.Payload,
+			&categoryStr,
+			&rec.FailureReason,
+			&lastCategoryStr,
+			&rec.LastFailureReason,
+			&rec.DeliveryCount,
+			&rec.Attempts,
+			&firstAtStr,
+			&lastAtStr,
+			&statusStr,
+			&statusAtStr,
+			&rec.StatusReason,
+			&rec.StatusUpdatedBy,
+			&replayMetaJSON,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan quarantine row: %w", err)
+		}
+
+		rec.FailureCategory = QuarantineCategory(categoryStr)
+		rec.LastFailureCategory = QuarantineCategory(lastCategoryStr)
+		rec.Status = QuarantineStatus(statusStr)
+
+		if srcSeq.Valid {
+			v := uint64(srcSeq.Int64)
+			rec.SourceSequence = &v
+		}
+
+		rec.FirstQuarantinedAt, _ = parseStoredTimestamp(firstAtStr)
+		rec.LastQuarantinedAt, _ = parseStoredTimestamp(lastAtStr)
+		rec.StatusUpdatedAt, _ = parseStoredTimestamp(statusAtStr)
+
+		if replayMetaJSON != "" && replayMetaJSON != "{}" {
+			_ = json.Unmarshal([]byte(replayMetaJSON), &rec.ReplayMetadata)
+		}
+
+		out = append(out, &rec)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("quarantine rows iteration failed: %w", err)
+	}
+
+	return out, nil
+}
+
+// UpdateQuarantineStatus updates a record's status using a validated, explicit transition.
+// Prevents overwriting terminal states and returns ErrInvalidStatusTransition or ErrStatusConflict.
+func (s *SQLiteStore) UpdateQuarantineStatus(ctx context.Context, update QuarantineStatusUpdate) (*QuarantineRecord, error) {
+	if strings.TrimSpace(update.ID) == "" {
+		return nil, fmt.Errorf("%w: id cannot be empty", ErrInvalidQuarantineRecord)
+	}
+	if !update.NewStatus.Valid() {
+		return nil, fmt.Errorf("%w: invalid new status %q", ErrInvalidQuarantineRecord, update.NewStatus)
+	}
+	if update.ExpectedStatus != "" && !update.ExpectedStatus.Valid() {
+		return nil, fmt.Errorf("%w: invalid expected status %q", ErrInvalidQuarantineRecord, update.ExpectedStatus)
+	}
+	if len(update.Reason) > MaxStatusReasonLength {
+		return nil, fmt.Errorf("%w: status reason exceeds maximum length %d", ErrInvalidQuarantineRecord, MaxStatusReasonLength)
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	ts := update.Timestamp
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	} else {
+		ts = ts.UTC()
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin status update transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentStatusStr string
+	queryCheck := `SELECT status FROM cp_telemetry_quarantine WHERE id = ?;`
+	err = tx.QueryRowContext(ctx, queryCheck, update.ID).Scan(&currentStatusStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrQuarantineNotFound
+		}
+		return nil, fmt.Errorf("failed to check current quarantine status: %w", err)
+	}
+
+	currentStatus := QuarantineStatus(currentStatusStr)
+
+	if update.ExpectedStatus != "" && currentStatus != update.ExpectedStatus {
+		return nil, fmt.Errorf("%w: expected status %q but current status is %q", ErrStatusConflict, update.ExpectedStatus, currentStatus)
+	}
+
+	if !IsValidQuarantineTransition(currentStatus, update.NewStatus) {
+		reason := "illegal transition"
+		if currentStatus.IsTerminal() {
+			reason = "cannot transition from terminal status"
+		} else if currentStatus == update.NewStatus {
+			reason = fmt.Sprintf("record is already in status %q", currentStatus)
+		}
+		return nil, &InvalidTransitionError{
+			Current: currentStatus,
+			Target:  update.NewStatus,
+			Reason:  reason,
+		}
+	}
+
+	updateQuery := `
+	UPDATE cp_telemetry_quarantine
+	SET status = ?,
+	    status_updated_at = ?,
+	    status_reason = ?,
+	    status_updated_by = ?,
+	    updated_at = CURRENT_TIMESTAMP
+	WHERE id = ? AND status = ?;
+	`
+	res, err := tx.ExecContext(ctx, updateQuery,
+		string(update.NewStatus),
+		formatTimestamp(ts),
+		update.Reason,
+		update.UpdatedBy,
+		update.ID,
+		currentStatusStr,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute status update: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rows affected for status update: %w", err)
+	}
+	if rowsAffected == 0 {
+		return nil, fmt.Errorf("%w: status changed concurrently for record %q", ErrStatusConflict, update.ID)
+	}
+
+	if s.HookBeforeQuarantineStatusCommit != nil {
+		if err := s.HookBeforeQuarantineStatusCommit(); err != nil {
+			return nil, fmt.Errorf("injected test failure before status commit: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit status update: %w", err)
+	}
+
+	return s.GetQuarantineRecord(ctx, update.ID)
 }
