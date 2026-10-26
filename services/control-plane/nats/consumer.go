@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,13 +45,36 @@ const (
 
 // ConsumerConfig holds configuration for the telemetry consumer.
 type ConsumerConfig struct {
-	NATSURL       string
-	StreamName    string
-	ConsumerName  string
-	MaxDeliver    int           // Maximum delivery attempts for a message before broker advisory (default: 5)
-	AckWait       time.Duration // Server acknowledgment timeout before redelivery (default: 30s)
-	MaxAckPending int           // Max outstanding unacknowledged messages (default: 1000)
-	RetryBackoff  time.Duration // Base backoff delay for transient retries (default: 100ms)
+	NATSURL         string
+	StreamName      string
+	ConsumerName    string
+	MaxDeliver      int                     // Maximum delivery attempts for a message before broker advisory (default: 5)
+	AckWait         time.Duration           // Server acknowledgment timeout before redelivery (default: 30s)
+	MaxAckPending   int                     // Max outstanding unacknowledged messages (default: 1000)
+	RetryBackoff    time.Duration           // Base backoff delay for transient retries (default: 100ms)
+	QuarantineStore storage.QuarantineStore // Durable quarantine store foundation
+}
+
+// recoveryItem encapsulates an exhausted message queued for background recovery persistence.
+type recoveryItem struct {
+	streamSeq     uint64
+	deliveryCount int
+	category      storage.QuarantineCategory
+	reason        string
+	subject       string
+	nodeID        string
+	batchID       string
+	data          []byte
+}
+
+// ConsumerOption configures TelemetryConsumer instances.
+type ConsumerOption func(*TelemetryConsumer)
+
+// WithQuarantineStore provides an explicit quarantine store implementation.
+func WithQuarantineStore(qs storage.QuarantineStore) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		c.quarantineStore = qs
+	}
 }
 
 // TelemetryConsumer subscribes to the AEGISEDGE_TELEMETRY JetStream stream
@@ -59,12 +85,15 @@ type ConsumerConfig struct {
 //   - Valid event processed successfully → ACK (committed to SQLite WAL before ACK)
 //   - Duplicate batch (already ingested) → ACK (idempotent no-op; no duplicate DB rows)
 //   - Permanent validation failure (malformed JSON, invalid envelope, invalid batch schema)
-//     → Terminated via TermWithReason to prevent infinite redelivery loops. The raw message
-//     remains durably preserved in the AEGISEDGE_TELEMETRY stream for forensic audit.
+//     → Persisted to durable SQLite quarantine store, then terminated via TermWithReason
+//     to prevent infinite redelivery loops.
 //   - Transient failure (database locked, storage I/O, network) → Delayed NAK (NakWithDelay)
 //     with exponential backoff, up to MaxDeliver attempts.
-//   - Exhausted transient deliveries (>= MaxDeliver) → JetStream server halts redelivery
-//     and emits a consumer advisory. The message remains preserved in the stream on disk.
+//   - Exhausted transient deliveries (>= MaxDeliver) → Persisted to durable SQLite quarantine
+//     store as CategoryDeliveryExhausted, exhausted metric incremented, NAKed to trigger broker
+//     max-deliveries advisory.
+//   - Quarantine persistence failure at MaxDeliver → Submitted to asynchronous recovery worker;
+//     unacknowledged sequence remains inspectable from stream and is recovered on restart.
 //   - Process shutdown / context cancellation → Leave message unacknowledged so it can
 //     be retried by the next control-plane process instance.
 type TelemetryConsumer struct {
@@ -72,16 +101,24 @@ type TelemetryConsumer struct {
 	handler             IngestionHandler
 	logger              *slog.Logger
 	config              ConsumerConfig
+	js                  jetstream.JetStream
+	stream              jetstream.Stream
 	cons                jetstream.Consumer
+	quarantineStore     storage.QuarantineStore
+	ownsStore           bool
+	recoveryQueue       chan recoveryItem
+	recoveryWg          sync.WaitGroup
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	running             atomic.Bool
 	consumed            atomic.Int64
 	exhaustedDeliveries atomic.Int64
+	quarantinedTotal    atomic.Int64
+	recoveredTotal      atomic.Int64
 }
 
 // NewTelemetryConsumer creates a new consumer connected to the NATS JetStream stream.
-func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *slog.Logger) (*TelemetryConsumer, error) {
+func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *slog.Logger, opts ...ConsumerOption) (*TelemetryConsumer, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -120,6 +157,20 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
 
+	stream, err := js.Stream(context.Background(), cfg.StreamName)
+	if err != nil {
+		// Attempt to create stream if not existing
+		stream, err = js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+			Name:      cfg.StreamName,
+			Subjects:  []string{"aegisedge.v1.telemetry.*"},
+			Retention: jetstream.LimitsPolicy,
+		})
+		if err != nil {
+			nc.Close()
+			return nil, fmt.Errorf("failed to get or create JetStream stream: %w", err)
+		}
+	}
+
 	// Create or get durable consumer on the telemetry stream with explicit delivery bounds
 	cons, err := js.CreateOrUpdateConsumer(context.Background(), cfg.StreamName, jetstream.ConsumerConfig{
 		Durable:       cfg.ConsumerName,
@@ -134,7 +185,38 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 		return nil, fmt.Errorf("failed to create JetStream consumer: %w", err)
 	}
 
+	var qs storage.QuarantineStore = cfg.QuarantineStore
+	var ownsStore bool
+	if qs == nil {
+		memStore, err := storage.OpenSQLite(":memory:")
+		if err != nil {
+			nc.Close()
+			return nil, fmt.Errorf("failed to initialize default in-memory quarantine store: %w", err)
+		}
+		qs = memStore
+		ownsStore = true
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+
+	tc := &TelemetryConsumer{
+		conn:            nc,
+		handler:         handler,
+		logger:          logger,
+		config:          cfg,
+		js:              js,
+		stream:          stream,
+		cons:            cons,
+		quarantineStore: qs,
+		ownsStore:       ownsStore,
+		recoveryQueue:   make(chan recoveryItem, 256),
+		ctx:             ctx,
+		cancel:          cancel,
+	}
+
+	for _, opt := range opts {
+		opt(tc)
+	}
 
 	logger.Info("NATS JetStream consumer initialized",
 		slog.String("stream", cfg.StreamName),
@@ -144,15 +226,7 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 		slog.Int("max_ack_pending", cfg.MaxAckPending),
 	)
 
-	return &TelemetryConsumer{
-		conn:    nc,
-		handler: handler,
-		logger:  logger,
-		config:  cfg,
-		cons:    cons,
-		ctx:     ctx,
-		cancel:  cancel,
-	}, nil
+	return tc, nil
 }
 
 // Start begins consuming messages in the background.
@@ -161,6 +235,16 @@ func (c *TelemetryConsumer) Start() error {
 		return nil
 	}
 	c.running.Store(true)
+
+	// Run recovery on any unacknowledged delivered messages from prior run
+	go func() {
+		if count, err := c.RecoverUnacknowledged(c.ctx); err == nil && count > 0 {
+			c.logger.Info("recovered unacknowledged messages on startup", slog.Int("recovered_count", count))
+		}
+	}()
+
+	c.recoveryWg.Add(1)
+	go c.recoveryWorkerLoop()
 
 	go c.consumeLoop()
 	return nil
@@ -218,6 +302,165 @@ func termMessage(msg jetstream.Msg, reason string) {
 	}
 }
 
+// extractNodeIDFromSubject extracts the trailing node identifier from a standard telemetry subject.
+func extractNodeIDFromSubject(subject string) string {
+	const prefix = "aegisedge.v1.telemetry."
+	if strings.HasPrefix(subject, prefix) {
+		return strings.TrimPrefix(subject, prefix)
+	}
+	return ""
+}
+
+// recordQuarantine creates and idempotently persists a quarantine record.
+func (c *TelemetryConsumer) recordQuarantine(ctx context.Context, msg jetstream.Msg, stream string, seq *uint64, nodeID, batchID string, category storage.QuarantineCategory, reason string, deliveryCount int) error {
+	if c.quarantineStore == nil {
+		return errors.New("quarantine store not configured")
+	}
+
+	data := msg.Data()
+	subject := msg.Subject()
+	dedupKey := storage.DeriveDeduplicationKey(stream, seq, nodeID, batchID, subject, data)
+	qid, err := storage.GenerateQuarantineID()
+	if err != nil {
+		return fmt.Errorf("generate quarantine id failed: %w", err)
+	}
+
+	now := time.Now().UTC()
+	record := &storage.QuarantineRecord{
+		ID:                 qid,
+		DeduplicationKey:   dedupKey,
+		SourceStream:       stream,
+		SourceSequence:     seq,
+		SourceSubject:      subject,
+		NodeID:             nodeID,
+		BatchID:            batchID,
+		Payload:            data,
+		FailureCategory:    category,
+		FailureReason:      storage.SanitizeFailureReason(reason),
+		DeliveryCount:      deliveryCount,
+		Attempts:           1,
+		FirstQuarantinedAt: now,
+		LastQuarantinedAt:  now,
+		Status:             storage.StatusQuarantined,
+		StatusUpdatedAt:    now,
+	}
+
+	_, err = c.quarantineStore.RecordQuarantine(ctx, record)
+	return err
+}
+
+// enqueueRecovery enqueues an exhausted delivery message for asynchronous recovery retry.
+func (c *TelemetryConsumer) enqueueRecovery(seq *uint64, deliveryCount int, category storage.QuarantineCategory, reason, subject, nodeID, batchID string, data []byte) {
+	if seq == nil {
+		return
+	}
+	item := recoveryItem{
+		streamSeq:     *seq,
+		deliveryCount: deliveryCount,
+		category:      category,
+		reason:        reason,
+		subject:       subject,
+		nodeID:        nodeID,
+		batchID:       batchID,
+		data:          data,
+	}
+	select {
+	case c.recoveryQueue <- item:
+		c.logger.Info("enqueued exhausted message for asynchronous recovery",
+			slog.Uint64("stream_seq", *seq),
+			slog.String("subject", subject),
+		)
+	default:
+		c.logger.Error("recovery queue full; unable to enqueue exhausted message",
+			slog.Uint64("stream_seq", *seq),
+			slog.String("subject", subject),
+		)
+	}
+}
+
+// recoveryWorkerLoop processes asynchronously enqueued exhausted messages.
+func (c *TelemetryConsumer) recoveryWorkerLoop() {
+	defer c.recoveryWg.Done()
+	c.logger.Info("telemetry recovery worker started")
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			c.logger.Info("telemetry recovery worker stopping on context cancellation")
+			return
+		case item, ok := <-c.recoveryQueue:
+			if !ok {
+				return
+			}
+			c.retryRecoverItem(item)
+		}
+	}
+}
+
+// retryRecoverItem attempts to persist a failed quarantine record with bounded backoff.
+func (c *TelemetryConsumer) retryRecoverItem(item recoveryItem) {
+	backoff := 50 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+
+		dedupKey := storage.DeriveDeduplicationKey(c.config.StreamName, &item.streamSeq, item.nodeID, item.batchID, item.subject, item.data)
+		qid, _ := storage.GenerateQuarantineID()
+		now := time.Now().UTC()
+		record := &storage.QuarantineRecord{
+			ID:                 qid,
+			DeduplicationKey:   dedupKey,
+			SourceStream:       c.config.StreamName,
+			SourceSequence:     &item.streamSeq,
+			SourceSubject:      item.subject,
+			NodeID:             item.nodeID,
+			BatchID:            item.batchID,
+			Payload:            item.data,
+			FailureCategory:    item.category,
+			FailureReason:      storage.SanitizeFailureReason(item.reason),
+			DeliveryCount:      item.deliveryCount,
+			Attempts:           1,
+			FirstQuarantinedAt: now,
+			LastQuarantinedAt:  now,
+			Status:             storage.StatusQuarantined,
+			StatusUpdatedAt:    now,
+		}
+
+		if c.quarantineStore != nil {
+			_, err := c.quarantineStore.RecordQuarantine(c.ctx, record)
+			if err == nil {
+				c.quarantinedTotal.Add(1)
+				c.recoveredTotal.Add(1)
+				c.logger.Info("exhausted message successfully recovered into durable quarantine",
+					slog.Uint64("stream_seq", item.streamSeq),
+					slog.String("subject", item.subject),
+				)
+				return
+			}
+			if errors.Is(err, storage.ErrPayloadMismatch) {
+				c.logger.Error("CRITICAL: recovery aborted due to payload mismatch conflict",
+					slog.Uint64("stream_seq", item.streamSeq),
+					slog.Any("error", err),
+				)
+				return
+			}
+		}
+
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(backoff):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
 // processMessage handles a single JetStream message with explicit permanent vs transient error discrimination.
 func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 	// Pre-check: if consumer is shutting down, leave message unacknowledged for the next instance
@@ -227,72 +470,105 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 
 	meta, _ := msg.Metadata()
 	deliveryCount := uint64(1)
+	var streamSeq *uint64
+	streamName := c.config.StreamName
 	if meta != nil {
 		deliveryCount = meta.NumDelivered
+		seq := meta.Sequence.Stream
+		streamSeq = &seq
+		if meta.Stream != "" {
+			streamName = meta.Stream
+		}
+	}
+
+	// handlePermanentFailure coordinates logging, quarantine persistence, and conditional termination
+	handlePermanentFailure := func(category storage.QuarantineCategory, failureErr error, reasonPrefix string, nodeID, batchID string) {
+		reason := reasonPrefix
+		if failureErr != nil {
+			reason = fmt.Sprintf("%s: %v", reasonPrefix, failureErr)
+		}
+		c.logger.Error("permanent telemetry event failure; quarantining message",
+			slog.String("stream", streamName),
+			slog.String("consumer", c.config.ConsumerName),
+			slog.String("subject", msg.Subject()),
+			slog.String("node_id", nodeID),
+			slog.String("batch_id", batchID),
+			slog.Uint64("delivery_count", deliveryCount),
+			slog.Int("payload_bytes", len(msg.Data())),
+			slog.String("failure_category", string(category)),
+			slog.Any("error", failureErr),
+		)
+
+		err := c.recordQuarantine(c.ctx, msg, streamName, streamSeq, nodeID, batchID, category, reason, int(deliveryCount))
+		if err == nil {
+			c.quarantinedTotal.Add(1)
+			termMessage(msg, reason)
+			return
+		}
+
+		// Handle payload conflict: if ErrPayloadMismatch, log integrity conflict and do not overwrite or term
+		if errors.Is(err, storage.ErrPayloadMismatch) {
+			c.logger.Error("CRITICAL: quarantine payload conflict detected; deduplication identity already bound to differing payload",
+				slog.String("subject", msg.Subject()),
+				slog.Any("error", err),
+			)
+			_ = msg.Nak()
+			return
+		}
+
+		// Quarantine storage write failed (transient DB error)
+		c.logger.Error("failed to record quarantine for permanent failure",
+			slog.String("subject", msg.Subject()),
+			slog.Uint64("delivery_count", deliveryCount),
+			slog.Any("error", err),
+		)
+
+		if deliveryCount < uint64(c.config.MaxDeliver) {
+			backoffMultiplier := time.Duration(1 << (deliveryCount - 1))
+			delay := c.config.RetryBackoff * backoffMultiplier
+			if delay > 5*time.Second {
+				delay = 5 * time.Second
+			}
+			_ = msg.NakWithDelay(delay)
+			return
+		}
+
+		// Delivery limit reached and quarantine write failed
+		c.exhaustedDeliveries.Add(1)
+		c.enqueueRecovery(streamSeq, int(deliveryCount), category, reason, msg.Subject(), nodeID, batchID, msg.Data())
+		_ = msg.Nak()
 	}
 
 	// 1. Decode event envelope
 	var event types.TelemetryEvent
 	if err := json.Unmarshal(msg.Data(), &event); err != nil {
-		c.logger.Error("malformed telemetry event envelope (permanent failure, terminating message)",
-			slog.String("stream", c.config.StreamName),
-			slog.String("consumer", c.config.ConsumerName),
-			slog.String("subject", msg.Subject()),
-			slog.Uint64("delivery_count", deliveryCount),
-			slog.Int("payload_bytes", len(msg.Data())),
-			slog.String("payload_preview", payloadPreview(msg.Data())),
-			slog.String("failure_category", "malformed_json"),
-			slog.Any("error", err),
-		)
-		termMessage(msg, fmt.Sprintf("malformed_json: %v", err))
+		nodeID := extractNodeIDFromSubject(msg.Subject())
+		var batchID string
+		if msg.Headers() != nil {
+			batchID = msg.Headers().Get("Nats-Msg-Id")
+		}
+		handlePermanentFailure(storage.CategoryDeserialization, err, "malformed_json", nodeID, batchID)
 		return
 	}
 
 	// 2. Validate envelope schema
 	if err := event.Validate(); err != nil {
-		c.logger.Error("telemetry event envelope validation failed (permanent failure, terminating message)",
-			slog.String("stream", c.config.StreamName),
-			slog.String("consumer", c.config.ConsumerName),
-			slog.String("subject", msg.Subject()),
-			slog.String("event_id", event.EventID),
-			slog.String("node_id", event.SourceNodeID),
-			slog.Uint64("delivery_count", deliveryCount),
-			slog.Int("payload_bytes", len(msg.Data())),
-			slog.String("failure_category", "invalid_envelope"),
-			slog.Any("error", err),
-		)
-		termMessage(msg, fmt.Sprintf("invalid_envelope: %v", err))
+		nodeID := event.SourceNodeID
+		if nodeID == "" {
+			nodeID = extractNodeIDFromSubject(msg.Subject())
+		}
+		handlePermanentFailure(storage.CategorySchemaValidation, err, "invalid_envelope", nodeID, "")
 		return
 	}
 
 	// 3. Validate batch domain payload presence and schema
 	if event.Payload == nil {
-		c.logger.Error("telemetry event missing batch payload (permanent failure, terminating message)",
-			slog.String("stream", c.config.StreamName),
-			slog.String("consumer", c.config.ConsumerName),
-			slog.String("subject", msg.Subject()),
-			slog.String("event_id", event.EventID),
-			slog.String("node_id", event.SourceNodeID),
-			slog.Uint64("delivery_count", deliveryCount),
-			slog.String("failure_category", "nil_payload"),
-		)
-		termMessage(msg, "nil_payload")
+		handlePermanentFailure(storage.CategorySchemaValidation, nil, "nil_payload", event.SourceNodeID, "")
 		return
 	}
 
 	if err := event.Payload.Validate(); err != nil {
-		c.logger.Error("telemetry batch domain validation failed (permanent failure, terminating message)",
-			slog.String("stream", c.config.StreamName),
-			slog.String("consumer", c.config.ConsumerName),
-			slog.String("subject", msg.Subject()),
-			slog.String("event_id", event.EventID),
-			slog.String("batch_id", event.Payload.BatchID),
-			slog.String("node_id", event.Payload.NodeID),
-			slog.Uint64("delivery_count", deliveryCount),
-			slog.String("failure_category", "invalid_domain_payload"),
-			slog.Any("error", err),
-		)
-		termMessage(msg, fmt.Sprintf("invalid_domain_payload: %v", err))
+		handlePermanentFailure(storage.CategorySchemaValidation, err, "invalid_domain_payload", event.Payload.NodeID, event.Payload.BatchID)
 		return
 	}
 
@@ -326,18 +602,9 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 			return
 		}
 
-		// Check for permanent invalid metadata error from storage
+		// Permanent invalid metadata error from storage
 		if errors.Is(err, storage.ErrInvalidMeta) {
-			c.logger.Error("batch rejected by storage as invalid metadata (permanent failure, terminating message)",
-				slog.String("stream", c.config.StreamName),
-				slog.String("consumer", c.config.ConsumerName),
-				slog.String("event_id", event.EventID),
-				slog.String("batch_id", event.Payload.BatchID),
-				slog.Uint64("delivery_count", deliveryCount),
-				slog.String("failure_category", "invalid_storage_meta"),
-				slog.Any("error", err),
-			)
-			termMessage(msg, fmt.Sprintf("invalid_storage_meta: %v", err))
+			handlePermanentFailure(storage.CategorySchemaValidation, err, "invalid_storage_meta", event.Payload.NodeID, event.Payload.BatchID)
 			return
 		}
 
@@ -345,20 +612,35 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 		if deliveryCount >= uint64(c.config.MaxDeliver) {
 			// Delivery limit reached: JetStream server will cease redelivering this message to this consumer group
 			// and publish an advisory to $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<STREAM>.<CONSUMER>.
-			// CRITICAL: We do NOT Terminate it so the message remains intact in the stream for operator inspection/replay.
-			c.logger.Error("CRITICAL: telemetry event delivery attempts exhausted on transient failure",
-				slog.String("stream", c.config.StreamName),
-				slog.String("consumer", c.config.ConsumerName),
-				slog.String("subject", msg.Subject()),
-				slog.String("event_id", event.EventID),
-				slog.String("batch_id", event.Payload.BatchID),
-				slog.String("node_id", event.SourceNodeID),
-				slog.Uint64("delivery_count", deliveryCount),
-				slog.Int("max_deliver", c.config.MaxDeliver),
-				slog.String("failure_category", "exhausted_delivery"),
-				slog.Any("error", err),
-			)
 			c.exhaustedDeliveries.Add(1)
+			reason := fmt.Sprintf("delivery limit reached (%d/%d): storage failure: %v", deliveryCount, c.config.MaxDeliver, err)
+			qErr := c.recordQuarantine(c.ctx, msg, streamName, streamSeq, event.SourceNodeID, event.Payload.BatchID, storage.CategoryDeliveryExhausted, reason, int(deliveryCount))
+			if qErr == nil {
+				c.quarantinedTotal.Add(1)
+				c.logger.Error("telemetry event delivery attempts exhausted on transient failure; durably quarantined",
+					slog.String("stream", streamName),
+					slog.String("consumer", c.config.ConsumerName),
+					slog.String("subject", msg.Subject()),
+					slog.String("event_id", event.EventID),
+					slog.String("batch_id", event.Payload.BatchID),
+					slog.String("node_id", event.SourceNodeID),
+					slog.Uint64("delivery_count", deliveryCount),
+					slog.Int("max_deliver", c.config.MaxDeliver),
+					slog.String("failure_category", "delivery_exhausted"),
+					slog.Any("error", err),
+				)
+				_ = msg.Nak()
+				return
+			}
+
+			// Quarantine write failed at MaxDeliver
+			c.logger.Error("CRITICAL: telemetry event delivery attempts exhausted and quarantine persistence failed",
+				slog.String("subject", msg.Subject()),
+				slog.Uint64("delivery_count", deliveryCount),
+				slog.Any("storage_error", err),
+				slog.Any("quarantine_error", qErr),
+			)
+			c.enqueueRecovery(streamSeq, int(deliveryCount), storage.CategoryDeliveryExhausted, reason, msg.Subject(), event.SourceNodeID, event.Payload.BatchID, msg.Data())
 			_ = msg.Nak()
 			return
 		}
@@ -403,20 +685,166 @@ func (c *TelemetryConsumer) Consumed() int64 {
 
 // ExhaustedDeliveries returns the total count of transient delivery exhaustion events observed
 // by this consumer instance during its lifetime.
-//
-// NOTE: This counter is in-memory, thread-safe, and resets upon process restart. It reflects
-// the number of times a message delivery count reached or exceeded MaxDeliver on a transient
-// processing failure before being NAKed to cease redelivery. It is not a durable database metric
-// or a complete monitoring system integration.
 func (c *TelemetryConsumer) ExhaustedDeliveries() int64 {
 	return c.exhaustedDeliveries.Load()
+}
+
+// Quarantined returns the total number of messages recorded into quarantine by this consumer instance.
+func (c *TelemetryConsumer) Quarantined() int64 {
+	return c.quarantinedTotal.Load()
+}
+
+// Recovered returns the total number of messages recovered through the exhaustion recovery mechanism.
+func (c *TelemetryConsumer) Recovered() int64 {
+	return c.recoveredTotal.Load()
+}
+
+// QuarantineStore returns the quarantine store backing this consumer.
+func (c *TelemetryConsumer) QuarantineStore() storage.QuarantineStore {
+	return c.quarantineStore
+}
+
+// Stream returns the underlying JetStream stream handle.
+func (c *TelemetryConsumer) Stream() jetstream.Stream {
+	return c.stream
+}
+
+// Consumer returns the underlying JetStream consumer handle.
+func (c *TelemetryConsumer) Consumer() jetstream.Consumer {
+	return c.cons
+}
+
+// RecoverStreamSequence retrieves the raw message directly from JetStream by stream sequence number,
+// inspects it, and durably persists it to the quarantine store.
+func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint64) (*storage.QuarantineRecord, error) {
+	if c.stream == nil {
+		return nil, errors.New("stream handle not available")
+	}
+	if c.quarantineStore == nil {
+		return nil, errors.New("quarantine store not configured")
+	}
+
+	rawMsg, err := c.stream.GetMsg(ctx, seq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stream message %d: %w", seq, err)
+	}
+
+	var event types.TelemetryEvent
+	cat := storage.CategoryDeliveryExhausted
+	reason := "recovered from stream after delivery exhaustion"
+	var nodeID, batchID string
+
+	if err := json.Unmarshal(rawMsg.Data, &event); err != nil {
+		cat = storage.CategoryDeserialization
+		reason = fmt.Sprintf("malformed_json: %v", err)
+		nodeID = extractNodeIDFromSubject(rawMsg.Subject)
+		if rawMsg.Header != nil {
+			batchID = rawMsg.Header.Get("Nats-Msg-Id")
+		}
+	} else if err := event.Validate(); err != nil {
+		cat = storage.CategorySchemaValidation
+		reason = fmt.Sprintf("invalid_envelope: %v", err)
+		nodeID = event.SourceNodeID
+		if nodeID == "" {
+			nodeID = extractNodeIDFromSubject(rawMsg.Subject)
+		}
+	} else if event.Payload == nil {
+		cat = storage.CategorySchemaValidation
+		reason = "nil_payload"
+		nodeID = event.SourceNodeID
+	} else if err := event.Payload.Validate(); err != nil {
+		cat = storage.CategorySchemaValidation
+		reason = fmt.Sprintf("invalid_domain_payload: %v", err)
+		nodeID = event.Payload.NodeID
+		batchID = event.Payload.BatchID
+	} else {
+		nodeID = event.SourceNodeID
+		if event.Payload != nil {
+			batchID = event.Payload.BatchID
+		}
+	}
+
+	dedupKey := storage.DeriveDeduplicationKey(c.config.StreamName, &seq, nodeID, batchID, rawMsg.Subject, rawMsg.Data)
+	qid, err := storage.GenerateQuarantineID()
+	if err != nil {
+		return nil, fmt.Errorf("generate quarantine id failed: %w", err)
+	}
+
+	now := time.Now().UTC()
+	record := &storage.QuarantineRecord{
+		ID:                 qid,
+		DeduplicationKey:   dedupKey,
+		SourceStream:       c.config.StreamName,
+		SourceSequence:     &seq,
+		SourceSubject:      rawMsg.Subject,
+		NodeID:             nodeID,
+		BatchID:            batchID,
+		Payload:            rawMsg.Data,
+		FailureCategory:    cat,
+		FailureReason:      storage.SanitizeFailureReason(reason),
+		DeliveryCount:      c.config.MaxDeliver,
+		Attempts:           1,
+		FirstQuarantinedAt: now,
+		LastQuarantinedAt:  now,
+		Status:             storage.StatusQuarantined,
+		StatusUpdatedAt:    now,
+	}
+
+	saved, err := c.quarantineStore.RecordQuarantine(ctx, record)
+	if err != nil {
+		return nil, err
+	}
+	c.quarantinedTotal.Add(1)
+	c.recoveredTotal.Add(1)
+	return saved, nil
+}
+
+// RecoverUnacknowledged inspects the consumer's pending unacknowledged message sequence range
+// and recovers each into durable quarantine. This ensures delivery-exhausted messages that failed
+// quarantine persistence across a previous process restart are reliably recovered.
+func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, error) {
+	if c.cons == nil {
+		return 0, errors.New("consumer handle not available")
+	}
+
+	info, err := c.cons.Info(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get consumer info: %w", err)
+	}
+
+	if info.NumAckPending == 0 || info.Delivered.Stream <= info.AckFloor.Stream {
+		return 0, nil
+	}
+
+	recovered := 0
+	for seq := info.AckFloor.Stream + 1; seq <= info.Delivered.Stream; seq++ {
+		if ctx.Err() != nil {
+			return recovered, ctx.Err()
+		}
+		_, err := c.RecoverStreamSequence(ctx, seq)
+		if err != nil {
+			c.logger.Warn("recovery of unacknowledged stream message failed",
+				slog.Uint64("stream_seq", seq),
+				slog.Any("error", err),
+			)
+			continue
+		}
+		recovered++
+	}
+	return recovered, nil
 }
 
 // Stop gracefully stops the consumer.
 func (c *TelemetryConsumer) Stop() {
 	c.cancel()
+	c.recoveryWg.Wait()
 	if c.conn != nil {
 		c.conn.Close()
+	}
+	if c.ownsStore && c.quarantineStore != nil {
+		if closer, ok := c.quarantineStore.(io.Closer); ok {
+			_ = closer.Close()
+		}
 	}
 	c.logger.Info("telemetry consumer stopped")
 }
