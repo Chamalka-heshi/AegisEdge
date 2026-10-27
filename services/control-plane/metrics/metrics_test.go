@@ -246,10 +246,34 @@ func TestControlPlaneMetrics(t *testing.T) {
 	m.SetRegisteredNodesSource(func() float64 {
 		return 15
 	})
+	m.SetNATSAdvisoryStreamMessagesSource(func() float64 {
+		return 42
+	})
+	m.SetNATSAdvisoryStreamBytesSource(func() float64 {
+		return 8192
+	})
+	m.SetNATSAdvisoryPendingBacklogSource(func() float64 {
+		return 5
+	})
+	m.SetNATSAdvisoryPendingAckSource(func() float64 {
+		return 2
+	})
+	m.SetNATSAdvisoryFetchErrorsSource(func() float64 {
+		return 1
+	})
+	m.SetNATSAdvisoryEvictionsSource(func() float64 {
+		return 4
+	})
+	m.SetNATSQuarantinedSource(func() float64 {
+		return 7
+	})
+	m.SetNATSRecoveredSource(func() float64 {
+		return 6
+	})
 
 	output := m.Registry().FormatPrometheus()
 
-	// Verify all 6 metrics are present
+	// Verify all required metrics are present
 	requiredMetrics := []string{
 		MetricIngestedBatchesTotal,
 		MetricStorageProbeDurationSeconds,
@@ -257,6 +281,14 @@ func TestControlPlaneMetrics(t *testing.T) {
 		MetricAuthFailuresTotal,
 		MetricNATSExhaustedDeliveriesTotal,
 		MetricRegisteredNodesCount,
+		MetricNATSAdvisoryStreamMessages,
+		MetricNATSAdvisoryStreamBytes,
+		MetricNATSAdvisoryPendingBacklog,
+		MetricNATSAdvisoryPendingAck,
+		MetricNATSAdvisoryFetchErrorsTotal,
+		MetricNATSAdvisoryEvictionsTotal,
+		MetricNATSQuarantinedTotal,
+		MetricNATSRecoveredTotal,
 	}
 	for _, name := range requiredMetrics {
 		if !strings.Contains(output, name) {
@@ -277,6 +309,14 @@ func TestControlPlaneMetrics(t *testing.T) {
 		`aegisedge_control_plane_auth_failures_total{reason="unknown"} 1`,
 		`aegisedge_control_plane_nats_exhausted_deliveries_total 3`,
 		`aegisedge_control_plane_registered_nodes_count 15`,
+		`aegisedge_control_plane_nats_advisory_stream_messages 42`,
+		`aegisedge_control_plane_nats_advisory_stream_bytes 8192`,
+		`aegisedge_control_plane_nats_advisory_pending_backlog 5`,
+		`aegisedge_control_plane_nats_advisory_pending_ack 2`,
+		`aegisedge_control_plane_nats_advisory_fetch_errors_total 1`,
+		`aegisedge_control_plane_nats_advisory_evictions_total 4`,
+		`aegisedge_control_plane_nats_quarantined_total 7`,
+		`aegisedge_control_plane_nats_recovered_total 6`,
 	}
 	for _, sub := range expectedSubstrings {
 		if !strings.Contains(output, sub) {
