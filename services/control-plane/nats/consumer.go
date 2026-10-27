@@ -567,14 +567,7 @@ func (c *TelemetryConsumer) consumeLoop() {
 	}
 }
 
-// payloadPreview returns a bounded preview of payload bytes for safe diagnostic logging.
-func payloadPreview(data []byte) string {
-	const maxLen = 128
-	if len(data) <= maxLen {
-		return string(data)
-	}
-	return string(data[:maxLen]) + "...(truncated)"
-}
+
 
 // termMessage terminates a permanently poisoned message to prevent infinite redelivery loops.
 // Uses TermWithReason if supported, falling back to Term.

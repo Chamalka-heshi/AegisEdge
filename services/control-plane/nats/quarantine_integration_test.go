@@ -2275,8 +2275,8 @@ func TestConsumer_Advisory_DuplicateReplay_Idempotent(t *testing.T) {
 	publishTestEvent(t, nc, batch)
 	seq := uint64(1)
 
-	advPayload := []byte(fmt.Sprintf(`{"type":"io.nats.jetstream.advisory.v1.max_deliver","stream":"%s","consumer":"%s","stream_seq":%d,"deliveries":3}`,
-		streamName, consumerName, seq))
+	advPayload := fmt.Appendf(nil, `{"type":"io.nats.jetstream.advisory.v1.max_deliver","stream":"%s","consumer":"%s","stream_seq":%d,"deliveries":3}`,
+		streamName, consumerName, seq)
 
 	// Replay 1
 	consumer.handleAdvisoryData(advPayload, nil)
@@ -2623,8 +2623,8 @@ func TestConsumer_Advisory_DeliveryBeyondFormerLimit_RecoversWhenStoreRestored(t
 	publishTestEvent(t, nc, batch)
 	seq := uint64(1)
 
-	advPayload := []byte(fmt.Sprintf(`{"type":"io.nats.jetstream.advisory.v1.max_deliver","stream":"%s","consumer":"%s","stream_seq":%d,"deliveries":3}`,
-		streamName, consumerName, seq))
+	advPayload := fmt.Appendf(nil, `{"type":"io.nats.jetstream.advisory.v1.max_deliver","stream":"%s","consumer":"%s","stream_seq":%d,"deliveries":3}`,
+		streamName, consumerName, seq)
 
 	// Simulate 12 failures (exceeding former MaxDeliver limit of 10)
 	for attempt := 1; attempt <= 12; attempt++ {
@@ -2658,5 +2658,231 @@ func TestConsumer_Advisory_DeliveryBeyondFormerLimit_RecoversWhenStoreRestored(t
 	}
 	if recs[0].FailureCategory != storage.CategoryDeliveryExhausted {
 		t.Errorf("expected CategoryDeliveryExhausted, got %s", recs[0].FailureCategory)
+	}
+}
+
+// 32. Test scenario: Advisory stream capacity exhaustion and eviction detection under DiscardOld
+func TestConsumer_AdvisoryStream_CapacityExhaustionAndEvictionMetrics(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_adv_capacity.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New failed: %v", err)
+	}
+
+	advStreamName := "AEGISEDGE_TEST_CAPACITY_ADVISORIES"
+	advSubject := fmt.Sprintf("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.%s.>", streamName)
+
+	// Pre-create small advisory stream with MaxMsgs=3 and DiscardOld
+	_, err = js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:      advStreamName,
+		Subjects:  []string{advSubject},
+		Retention: jetstream.LimitsPolicy,
+		MaxMsgs:   3,
+		Discard:   jetstream.DiscardOld,
+	})
+	if err != nil {
+		t.Fatalf("failed to create small advisory stream: %v", err)
+	}
+
+	consumerName := fmt.Sprintf("test-cap-cons-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:            natsURL,
+		StreamName:         streamName,
+		ConsumerName:       consumerName,
+		AdvisoryStreamName: advStreamName,
+		MaxDeliver:         3,
+		QuarantineStore:    store,
+	}, &mockAlwaysFailingHandler{}, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	// Initial health inspection: 0 messages, 0 evictions
+	consumer.inspectAdvisoryStreamHealth(context.Background())
+	if msgs := consumer.AdvisoryStreamMessages(); msgs != 0 {
+		t.Errorf("expected 0 initial messages, got %d", msgs)
+	}
+
+	// Publish 6 advisories to subject using JetStream publish to wait for stream ack
+	targetSubj := fmt.Sprintf("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.%s.%s", streamName, consumerName)
+	for i := 1; i <= 6; i++ {
+		payload := fmt.Sprintf(`{"type":"io.nats.jetstream.advisory.v1.max_deliver","stream":"%s","consumer":"%s","stream_seq":%d,"deliveries":3}`,
+			streamName, consumerName, i)
+		ack, pErr := js.Publish(context.Background(), targetSubj, []byte(payload))
+		if pErr != nil {
+			t.Fatalf("publish advisory %d failed: %v", i, pErr)
+		}
+		t.Logf("Published advisory %d: stream=%s, seq=%d", i, ack.Stream, ack.Sequence)
+	}
+
+	// Run health inspection
+	consumer.inspectAdvisoryStreamHealth(context.Background())
+
+	// Stream messages must be capped at 3 due to DiscardOld
+	if msgs := consumer.AdvisoryStreamMessages(); msgs != 3 {
+		t.Errorf("expected 3 stream messages after saturation, got %d", msgs)
+	}
+
+	// Evictions must detect that sequences 1, 2, 3 were evicted
+	if evictions := consumer.AdvisoryEvictions(); evictions < 3 {
+		t.Errorf("expected at least 3 evictions detected, got %d", evictions)
+	}
+}
+
+// 33. Test scenario: Missing/evicted advisory does not prevent direct authoritative quarantine at MaxDeliver
+func TestConsumer_Quarantine_MissingOrEvictedAdvisory_DirectAuthoritativeQuarantine(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_direct_auth.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	handler := &mockAlwaysFailingHandler{}
+	consumerName := fmt.Sprintf("test-direct-auth-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:         natsURL,
+		StreamName:      streamName,
+		ConsumerName:    consumerName,
+		MaxDeliver:      2, // MaxDeliver = 2
+		RetryBackoff:    20 * time.Millisecond,
+		QuarantineStore: store,
+	}, handler, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	if err := consumer.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	batch := &types.TelemetryBatch{
+		BatchID:        fmt.Sprintf("batch-direct-auth-%d", time.Now().UnixNano()),
+		NodeID:         "node-direct-auth",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics:        []types.MetricSample{{Name: "cpu", Value: 85.0, Timestamp: time.Now().UTC()}},
+	}
+	publishTestEvent(t, nc, batch)
+
+	// Await direct authoritative quarantine at MaxDeliver
+	deadline := time.After(4 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out awaiting direct quarantine; calls=%d, exhausted=%d, quarantined=%d",
+				handler.calls.Load(), consumer.ExhaustedDeliveries(), consumer.Quarantined())
+		default:
+			if consumer.ExhaustedDeliveries() >= 1 && consumer.Quarantined() >= 1 {
+				goto directQuarantineDone
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}
+
+directQuarantineDone:
+	// Verify quarantine record committed into durable SQLite
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	records, err := store.ListQuarantineRecords(ctx, storage.QuarantineFilter{})
+	if err != nil {
+		t.Fatalf("ListQuarantineRecords failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 quarantine record committed directly, got %d", len(records))
+	}
+	if records[0].FailureCategory != storage.CategoryDeliveryExhausted {
+		t.Errorf("expected CategoryDeliveryExhausted, got %s", records[0].FailureCategory)
+	}
+	if records[0].BatchID != batch.BatchID {
+		t.Errorf("expected batch ID %s, got %s", batch.BatchID, records[0].BatchID)
+	}
+
+	// Verify message was terminated (termMessage) and delivery attempts ceased
+	time.Sleep(100 * time.Millisecond)
+	callsBefore := handler.calls.Load()
+	time.Sleep(200 * time.Millisecond)
+	if handler.calls.Load() != callsBefore {
+		t.Errorf("handler continued receiving deliveries after termination: calls before %d, now %d",
+			callsBefore, handler.calls.Load())
+	}
+}
+
+// 34. Test scenario: Advisory fetch error is observable in metrics and reconciliation resumes
+func TestConsumer_Advisory_TransientFetchError_ObservableAndResumes(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_adv_fetch_err.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	consumerName := fmt.Sprintf("test-adv-fetch-err-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:         natsURL,
+		StreamName:      streamName,
+		ConsumerName:    consumerName,
+		MaxDeliver:      3,
+		QuarantineStore: store,
+	}, &mockAlwaysFailingHandler{}, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	// Initial fetch error count should be 0
+	if errs := consumer.AdvisoryFetchErrors(); errs != 0 {
+		t.Errorf("expected 0 initial fetch errors, got %d", errs)
+	}
+
+	// Delete the underlying consumer from JetStream to trigger a real fetch error
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New failed: %v", err)
+	}
+	_ = js.DeleteConsumer(context.Background(), consumer.config.AdvisoryStreamName, consumer.config.AdvisoryConsumerName)
+
+	// Attempt reconciliation - must record fetch error instead of failing silently
+	consumer.reconcileDurableAdvisories(context.Background())
+	if errs := consumer.AdvisoryFetchErrors(); errs < 1 {
+		t.Errorf("expected at least 1 advisory fetch error recorded, got %d", errs)
 	}
 }
