@@ -854,6 +854,14 @@ func (s *Server) HasIngestedBatch(nodeID, batchID string) bool {
 	return false
 }
 
+// HasBatch checks whether a batch identified by (nodeID, batchID) has been recorded in durable storage.
+func (s *Server) HasBatch(ctx context.Context, nodeID, batchID string) (bool, error) {
+	if s.store != nil {
+		return s.store.HasBatch(ctx, nodeID, batchID)
+	}
+	return false, nil
+}
+
 // IngestBatch programmatically ingests a validated telemetry batch.
 // Used by the NATS consumer to share the same durable idempotency boundary as HTTP.
 //

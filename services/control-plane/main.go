@@ -261,8 +261,9 @@ func main() {
 	if cfg.NATSEnabled {
 		var err error
 		consumer, err = cpnats.NewTelemetryConsumer(cpnats.ConsumerConfig{
-			NATSURL:         cfg.NATSURL,
-			QuarantineStore: store,
+			NATSURL:          cfg.NATSURL,
+			QuarantineStore:  store,
+			IdempotencyStore: store,
 		}, srvInstance, logger)
 		if err != nil {
 			logger.Error("failed to initialize NATS consumer", slog.Any("error", err))

@@ -22,7 +22,9 @@ import (
 
 // Consumer errors.
 var (
-	ErrConsumerClosed = errors.New("consumer is closed")
+	ErrConsumerClosed  = errors.New("consumer is closed")
+	ErrAlreadyIngested = errors.New("telemetry batch already durably ingested; skipping quarantine")
+	ErrNotEligible     = errors.New("message is valid and has not reached delivery exhaustion; skipping quarantine")
 )
 
 // IngestionHandler defines the contract for processing ingested telemetry batches.
@@ -35,24 +37,36 @@ type IngestionHandler interface {
 	IngestBatch(ctx context.Context, batch *types.TelemetryBatch) error
 }
 
+// IdempotencyChecker queries whether a batch has already been committed to durable storage.
+type IdempotencyChecker interface {
+	HasBatch(ctx context.Context, nodeID, batchID string) (bool, error)
+}
+
 // Default consumer tuning parameters
 const (
-	DefaultMaxDeliver    = 5
-	DefaultAckWait       = 30 * time.Second
-	DefaultMaxAckPending = 1000
-	DefaultRetryBackoff  = 100 * time.Millisecond
+	DefaultMaxDeliver           = 5
+	DefaultAckWait              = 30 * time.Second
+	DefaultMaxAckPending        = 1000
+	DefaultRetryBackoff         = 100 * time.Millisecond
+	DefaultMaxRecoveryBatch     = 100
+	DefaultRecoveryScanInterval = 500 * time.Millisecond
 )
 
 // ConsumerConfig holds configuration for the telemetry consumer.
 type ConsumerConfig struct {
-	NATSURL         string
-	StreamName      string
-	ConsumerName    string
-	MaxDeliver      int                     // Maximum delivery attempts for a message before broker advisory (default: 5)
-	AckWait         time.Duration           // Server acknowledgment timeout before redelivery (default: 30s)
-	MaxAckPending   int                     // Max outstanding unacknowledged messages (default: 1000)
-	RetryBackoff    time.Duration           // Base backoff delay for transient retries (default: 100ms)
-	QuarantineStore storage.QuarantineStore // Durable quarantine store foundation
+	NATSURL              string
+	StreamName           string
+	ConsumerName         string
+	AdvisoryStreamName   string                  // Dedicated JetStream stream capturing max-delivery advisories (default: "<StreamName>_ADVISORIES")
+	AdvisoryConsumerName string                  // Durable consumer name on the advisory stream (default: "<ConsumerName>-advisories")
+	MaxDeliver           int                     // Maximum delivery attempts for a message before broker advisory (default: 5)
+	AckWait              time.Duration           // Server acknowledgment timeout before redelivery (default: 30s)
+	MaxAckPending        int                     // Max outstanding unacknowledged messages (default: 1000)
+	RetryBackoff         time.Duration           // Base backoff delay for transient retries (default: 100ms)
+	QuarantineStore      storage.QuarantineStore // Durable quarantine store foundation
+	IdempotencyStore     IdempotencyChecker      // Authoritative idempotency store for checking already-ingested batches
+	MaxRecoveryBatch     int                     // Maximum sequences inspected per recovery pass (default: 100)
+	RecoveryScanInterval time.Duration           // Interval between recovery passes (default: 500ms)
 }
 
 // recoveryItem encapsulates an exhausted message queued for background recovery persistence.
@@ -65,15 +79,94 @@ type recoveryItem struct {
 	nodeID        string
 	batchID       string
 	data          []byte
+	attempts      int
+	lastAttempt   time.Time
+}
+
+// scanRetryItem encapsulates a stream sequence that encountered a transient recovery error.
+type scanRetryItem struct {
+	seq         uint64
+	attempts    int
+	lastAttempt time.Time
+	lastErr     error
+}
+
+// MaxDeliverAdvisory represents the canonical NATS JetStream broker delivery-exhaustion advisory payload.
+type MaxDeliverAdvisory struct {
+	Type       string    `json:"type"`
+	ID         string    `json:"id,omitempty"`
+	Timestamp  time.Time `json:"timestamp,omitempty"`
+	Stream     string    `json:"stream"`
+	Consumer   string    `json:"consumer"`
+	StreamSeq  uint64    `json:"stream_seq"`
+	Deliveries uint64    `json:"deliveries"`
+}
+
+// recoveryOptions specifies modifiers for recovery calls.
+type recoveryOptions struct {
+	forceExhaustion bool
+}
+
+// RecoveryOption configures recovery operations.
+type RecoveryOption func(*recoveryOptions)
+
+// WithExhaustionEvidence indicates that the caller has external/advisory proof that this sequence exceeded MaxDeliver.
+func WithExhaustionEvidence() RecoveryOption {
+	return func(o *recoveryOptions) {
+		o.forceExhaustion = true
+	}
 }
 
 // ConsumerOption configures TelemetryConsumer instances.
 type ConsumerOption func(*TelemetryConsumer)
 
+// WithAdvisoryStreamName sets the stream name for capturing broker delivery exhaustion advisories.
+func WithAdvisoryStreamName(name string) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		if name != "" {
+			c.config.AdvisoryStreamName = name
+		}
+	}
+}
+
+// WithAdvisoryConsumerName sets the durable consumer name on the advisory stream.
+func WithAdvisoryConsumerName(name string) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		if name != "" {
+			c.config.AdvisoryConsumerName = name
+		}
+	}
+}
+
 // WithQuarantineStore provides an explicit quarantine store implementation.
 func WithQuarantineStore(qs storage.QuarantineStore) ConsumerOption {
 	return func(c *TelemetryConsumer) {
 		c.quarantineStore = qs
+	}
+}
+
+// WithIdempotencyStore provides an explicit authoritative idempotency store implementation.
+func WithIdempotencyStore(is IdempotencyChecker) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		c.idempotencyStore = is
+	}
+}
+
+// WithMaxRecoveryBatch sets the maximum sequences inspected per recovery pass.
+func WithMaxRecoveryBatch(batchSize int) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		if batchSize > 0 {
+			c.config.MaxRecoveryBatch = batchSize
+		}
+	}
+}
+
+// WithRecoveryScanInterval sets the interval between background recovery passes.
+func WithRecoveryScanInterval(interval time.Duration) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		if interval > 0 {
+			c.config.RecoveryScanInterval = interval
+		}
 	}
 }
 
@@ -104,17 +197,89 @@ type TelemetryConsumer struct {
 	js                  jetstream.JetStream
 	stream              jetstream.Stream
 	cons                jetstream.Consumer
+	advStream           jetstream.Stream
+	advCons             jetstream.Consumer
+	advSub              *nats.Subscription
 	quarantineStore     storage.QuarantineStore
+	idempotencyStore    IdempotencyChecker
 	ownsStore           bool
-	recoveryQueue       chan recoveryItem
+	recoveryMu          sync.Mutex
+	pendingExhausted    map[uint64]*recoveryItem
+	pendingScanRetries  map[uint64]*scanRetryItem
+	exhaustedSeqs       map[uint64]bool
+	recoveryCursor      uint64
 	recoveryWg          sync.WaitGroup
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	running             atomic.Bool
+	stopped             atomic.Bool
 	consumed            atomic.Int64
 	exhaustedDeliveries atomic.Int64
 	quarantinedTotal    atomic.Int64
 	recoveredTotal      atomic.Int64
+}
+
+// natsSubjectCovers reports whether pattern covers target subject pattern.
+func natsSubjectCovers(pattern, target string) bool {
+	if pattern == target || pattern == ">" {
+		return true
+	}
+	pTokens := strings.Split(pattern, ".")
+	tTokens := strings.Split(target, ".")
+	for i, pTok := range pTokens {
+		if pTok == ">" {
+			return true
+		}
+		if i >= len(tTokens) {
+			return false
+		}
+		if pTok != "*" && pTok != tTokens[i] {
+			return false
+		}
+	}
+	return len(pTokens) == len(tTokens)
+}
+
+// validateAdvisoryStreamConfig validates that an existing advisory stream has compatible configuration.
+func validateAdvisoryStreamConfig(streamName string, cfg jetstream.StreamConfig, requiredSubjectFilter string) error {
+	covered := false
+	for _, subj := range cfg.Subjects {
+		if natsSubjectCovers(subj, requiredSubjectFilter) {
+			covered = true
+			break
+		}
+	}
+	if !covered {
+		return fmt.Errorf("incompatible advisory stream %q: subjects %v do not cover required subject pattern %q",
+			streamName, cfg.Subjects, requiredSubjectFilter)
+	}
+
+	if cfg.Retention != jetstream.LimitsPolicy {
+		return fmt.Errorf("incompatible advisory stream %q: retention policy is %s, expected LimitsPolicy",
+			streamName, cfg.Retention.String())
+	}
+
+	if cfg.Discard != jetstream.DiscardOld {
+		return fmt.Errorf("incompatible advisory stream %q: discard policy is %s, expected DiscardOld",
+			streamName, cfg.Discard.String())
+	}
+
+	return nil
+}
+
+// validateAdvisoryConsumerConfig validates that an existing advisory consumer has compatible configuration.
+func validateAdvisoryConsumerConfig(consumerName string, cfg jetstream.ConsumerConfig, expectedFilterSubject string) error {
+	if cfg.AckPolicy != jetstream.AckExplicitPolicy {
+		return fmt.Errorf("incompatible advisory consumer %q: ack policy is %s, expected AckExplicit",
+			consumerName, cfg.AckPolicy.String())
+	}
+
+	if cfg.FilterSubject != "" && cfg.FilterSubject != expectedFilterSubject {
+		return fmt.Errorf("incompatible advisory consumer %q: filter subject %q does not match required %q",
+			consumerName, cfg.FilterSubject, expectedFilterSubject)
+	}
+
+	return nil
 }
 
 // NewTelemetryConsumer creates a new consumer connected to the NATS JetStream stream.
@@ -125,8 +290,14 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 	if cfg.StreamName == "" {
 		cfg.StreamName = "AEGISEDGE_TELEMETRY"
 	}
+	if strings.ContainsAny(cfg.StreamName, " \t\r\n.*>") {
+		return nil, fmt.Errorf("invalid stream name %q: must not contain whitespace, '.', '*', or '>'", cfg.StreamName)
+	}
 	if cfg.ConsumerName == "" {
 		cfg.ConsumerName = "control-plane-telemetry"
+	}
+	if strings.ContainsAny(cfg.ConsumerName, " \t\r\n.*>") {
+		return nil, fmt.Errorf("invalid consumer name %q: must not contain whitespace, '.', '*', or '>'", cfg.ConsumerName)
 	}
 	if cfg.MaxDeliver <= 0 {
 		cfg.MaxDeliver = DefaultMaxDeliver
@@ -139,6 +310,12 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 	}
 	if cfg.RetryBackoff <= 0 {
 		cfg.RetryBackoff = DefaultRetryBackoff
+	}
+	if cfg.MaxRecoveryBatch <= 0 {
+		cfg.MaxRecoveryBatch = DefaultMaxRecoveryBatch
+	}
+	if cfg.RecoveryScanInterval <= 0 {
+		cfg.RecoveryScanInterval = DefaultRecoveryScanInterval
 	}
 
 	nc, err := nats.Connect(cfg.NATSURL,
@@ -185,6 +362,81 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 		return nil, fmt.Errorf("failed to create JetStream consumer: %w", err)
 	}
 
+	// 3. Durable advisory stream capturing broker delivery-exhaustion events
+	if cfg.AdvisoryStreamName == "" {
+		cfg.AdvisoryStreamName = fmt.Sprintf("%s_ADVISORIES", cfg.StreamName)
+	}
+	if strings.ContainsAny(cfg.AdvisoryStreamName, " \t\r\n.*>") {
+		nc.Close()
+		return nil, fmt.Errorf("invalid advisory stream name %q: must not contain whitespace, '.', '*', or '>'", cfg.AdvisoryStreamName)
+	}
+	if cfg.AdvisoryConsumerName == "" {
+		cfg.AdvisoryConsumerName = fmt.Sprintf("%s-advisories", cfg.ConsumerName)
+	}
+	if strings.ContainsAny(cfg.AdvisoryConsumerName, " \t\r\n.*>") {
+		nc.Close()
+		return nil, fmt.Errorf("invalid advisory consumer name %q: must not contain whitespace, '.', '*', or '>'", cfg.AdvisoryConsumerName)
+	}
+
+	advSubjectFilter := fmt.Sprintf("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.%s.>", cfg.StreamName)
+	advConsFilter := fmt.Sprintf("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.%s.%s", cfg.StreamName, cfg.ConsumerName)
+
+	advStream, err := js.Stream(context.Background(), cfg.AdvisoryStreamName)
+	if err == nil {
+		// Existing stream: validate its configuration
+		sInfo, sErr := advStream.Info(context.Background())
+		if sErr != nil {
+			nc.Close()
+			return nil, fmt.Errorf("failed to inspect existing advisory stream %q: %w", cfg.AdvisoryStreamName, sErr)
+		}
+		if vErr := validateAdvisoryStreamConfig(cfg.AdvisoryStreamName, sInfo.Config, advSubjectFilter); vErr != nil {
+			nc.Close()
+			return nil, vErr
+		}
+	} else {
+		advStream, err = js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+			Name:      cfg.AdvisoryStreamName,
+			Subjects:  []string{advSubjectFilter},
+			Retention: jetstream.LimitsPolicy,
+			MaxAge:    7 * 24 * time.Hour,
+			Discard:   jetstream.DiscardOld,
+		})
+		if err != nil {
+			nc.Close()
+			return nil, fmt.Errorf("failed to create durable advisory stream %q: %w", cfg.AdvisoryStreamName, err)
+		}
+	}
+
+	var advCons jetstream.Consumer
+	if advStream != nil {
+		existingCons, cErr := advStream.Consumer(context.Background(), cfg.AdvisoryConsumerName)
+		if cErr == nil {
+			cInfo, ciErr := existingCons.Info(context.Background())
+			if ciErr != nil {
+				nc.Close()
+				return nil, fmt.Errorf("failed to inspect existing advisory consumer %q: %w", cfg.AdvisoryConsumerName, ciErr)
+			}
+			if cvErr := validateAdvisoryConsumerConfig(cfg.AdvisoryConsumerName, cInfo.Config, advConsFilter); cvErr != nil {
+				nc.Close()
+				return nil, cvErr
+			}
+			advCons = existingCons
+		} else {
+			advCons, err = js.CreateOrUpdateConsumer(context.Background(), cfg.AdvisoryStreamName, jetstream.ConsumerConfig{
+				Durable:       cfg.AdvisoryConsumerName,
+				AckPolicy:     jetstream.AckExplicitPolicy,
+				FilterSubject: advConsFilter,
+				DeliverPolicy: jetstream.DeliverAllPolicy,
+				MaxDeliver:    -1, // Resilient unlimited redelivery
+				AckWait:       30 * time.Second,
+			})
+			if err != nil {
+				nc.Close()
+				return nil, fmt.Errorf("failed to create durable advisory consumer %q: %w", cfg.AdvisoryConsumerName, err)
+			}
+		}
+	}
+
 	var qs storage.QuarantineStore = cfg.QuarantineStore
 	var ownsStore bool
 	if qs == nil {
@@ -197,25 +449,52 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 		ownsStore = true
 	}
 
+	var is IdempotencyChecker = cfg.IdempotencyStore
+	if is == nil {
+		if asIdemp, ok := cfg.QuarantineStore.(IdempotencyChecker); ok {
+			is = asIdemp
+		} else if asIdemp, ok := handler.(IdempotencyChecker); ok {
+			is = asIdemp
+		} else if ownsStore {
+			if asIdemp, ok := qs.(IdempotencyChecker); ok {
+				is = asIdemp
+			}
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	tc := &TelemetryConsumer{
-		conn:            nc,
-		handler:         handler,
-		logger:          logger,
-		config:          cfg,
-		js:              js,
-		stream:          stream,
-		cons:            cons,
-		quarantineStore: qs,
-		ownsStore:       ownsStore,
-		recoveryQueue:   make(chan recoveryItem, 256),
-		ctx:             ctx,
-		cancel:          cancel,
+		conn:               nc,
+		handler:            handler,
+		logger:             logger,
+		config:             cfg,
+		js:                 js,
+		stream:             stream,
+		cons:               cons,
+		advStream:          advStream,
+		advCons:            advCons,
+		quarantineStore:    qs,
+		idempotencyStore:   is,
+		ownsStore:          ownsStore,
+		pendingExhausted:   make(map[uint64]*recoveryItem),
+		pendingScanRetries: make(map[uint64]*scanRetryItem),
+		exhaustedSeqs:      make(map[uint64]bool),
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 
 	for _, opt := range opts {
 		opt(tc)
+	}
+
+	// Subscribe to broker max-delivery advisory notifications for real-time notification
+	advSubj := fmt.Sprintf("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.%s.%s", cfg.StreamName, cfg.ConsumerName)
+	advSub, err := nc.Subscribe(advSubj, func(m *nats.Msg) {
+		tc.handleAdvisoryData(m.Data, nil)
+	})
+	if err == nil {
+		tc.advSub = advSub
 	}
 
 	logger.Info("NATS JetStream consumer initialized",
@@ -231,27 +510,22 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 
 // Start begins consuming messages in the background.
 func (c *TelemetryConsumer) Start() error {
-	if c.running.Load() {
+	if !c.running.CompareAndSwap(false, true) {
 		return nil
 	}
-	c.running.Store(true)
-
-	// Run recovery on any unacknowledged delivered messages from prior run
-	go func() {
-		if count, err := c.RecoverUnacknowledged(c.ctx); err == nil && count > 0 {
-			c.logger.Info("recovered unacknowledged messages on startup", slog.Int("recovered_count", count))
-		}
-	}()
 
 	c.recoveryWg.Add(1)
 	go c.recoveryWorkerLoop()
 
+	c.recoveryWg.Add(1)
 	go c.consumeLoop()
+
 	return nil
 }
 
 // consumeLoop continuously fetches and processes messages.
 func (c *TelemetryConsumer) consumeLoop() {
+	defer c.recoveryWg.Done()
 	c.logger.Info("telemetry consumer started")
 	defer c.running.Store(false)
 
@@ -260,7 +534,7 @@ func (c *TelemetryConsumer) consumeLoop() {
 			return
 		}
 
-		msgs, err := c.cons.Fetch(10, jetstream.FetchMaxWait(2*time.Second))
+		msgs, err := c.cons.Fetch(10, jetstream.FetchMaxWait(500*time.Millisecond))
 		if err != nil {
 			if c.ctx.Err() != nil {
 				return
@@ -349,113 +623,351 @@ func (c *TelemetryConsumer) recordQuarantine(ctx context.Context, msg jetstream.
 	return err
 }
 
-// enqueueRecovery enqueues an exhausted delivery message for asynchronous recovery retry.
-func (c *TelemetryConsumer) enqueueRecovery(seq *uint64, deliveryCount int, category storage.QuarantineCategory, reason, subject, nodeID, batchID string, data []byte) {
+// markExhausted records a stream sequence as exhausted and schedules it for background recovery persistence.
+func (c *TelemetryConsumer) markExhausted(seq *uint64, deliveryCount int, category storage.QuarantineCategory, reason, subject, nodeID, batchID string, data []byte) {
 	if seq == nil {
 		return
 	}
-	item := recoveryItem{
-		streamSeq:     *seq,
-		deliveryCount: deliveryCount,
-		category:      category,
-		reason:        reason,
-		subject:       subject,
-		nodeID:        nodeID,
-		batchID:       batchID,
-		data:          data,
-	}
-	select {
-	case c.recoveryQueue <- item:
-		c.logger.Info("enqueued exhausted message for asynchronous recovery",
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+
+	c.exhaustedSeqs[*seq] = true
+	if _, exists := c.pendingExhausted[*seq]; !exists {
+		c.pendingExhausted[*seq] = &recoveryItem{
+			streamSeq:     *seq,
+			deliveryCount: deliveryCount,
+			category:      category,
+			reason:        reason,
+			subject:       subject,
+			nodeID:        nodeID,
+			batchID:       batchID,
+			data:          data,
+		}
+		c.logger.Info("tracked exhausted message for recovery",
 			slog.Uint64("stream_seq", *seq),
 			slog.String("subject", subject),
-		)
-	default:
-		c.logger.Error("recovery queue full; unable to enqueue exhausted message",
-			slog.Uint64("stream_seq", *seq),
-			slog.String("subject", subject),
+			slog.Int("pending_count", len(c.pendingExhausted)),
 		)
 	}
 }
 
-// recoveryWorkerLoop processes asynchronously enqueued exhausted messages.
+// enqueueRecovery enqueues an exhausted delivery message for background recovery persistence.
+func (c *TelemetryConsumer) enqueueRecovery(seq *uint64, deliveryCount int, category storage.QuarantineCategory, reason, subject, nodeID, batchID string, data []byte) {
+	c.markExhausted(seq, deliveryCount, category, reason, subject, nodeID, batchID, data)
+}
+
+// MarkSequenceExhausted registers external evidence that a stream sequence has reached delivery exhaustion.
+func (c *TelemetryConsumer) MarkSequenceExhausted(seq uint64) {
+	c.recoveryMu.Lock()
+	c.exhaustedSeqs[seq] = true
+	if _, exists := c.pendingExhausted[seq]; !exists {
+		c.pendingExhausted[seq] = &recoveryItem{
+			streamSeq:     seq,
+			deliveryCount: c.config.MaxDeliver,
+			category:      storage.CategoryDeliveryExhausted,
+			reason:        "marked exhausted by operator or broker advisory",
+		}
+	}
+	c.recoveryMu.Unlock()
+}
+
+// hasExhaustionEvidence reports whether the consumer has observed or received delivery exhaustion evidence for seq.
+func (c *TelemetryConsumer) hasExhaustionEvidence(seq uint64) bool {
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+	return c.exhaustedSeqs[seq]
+}
+
+// PendingRecoveryCount returns the current number of exhausted items awaiting durable quarantine persistence.
+func (c *TelemetryConsumer) PendingRecoveryCount() int {
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+	return len(c.pendingExhausted)
+}
+
+// PendingScanRetriesCount returns the current number of sequences with active scan retry obligations.
+func (c *TelemetryConsumer) PendingScanRetriesCount() int {
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+	return len(c.pendingScanRetries)
+}
+
+// validateAdvisory validates the canonical NATS advisory payload fields.
+func (c *TelemetryConsumer) validateAdvisory(data []byte) (*MaxDeliverAdvisory, error) {
+	var adv MaxDeliverAdvisory
+	if err := json.Unmarshal(data, &adv); err != nil {
+		return nil, fmt.Errorf("malformed advisory json: %w", err)
+	}
+
+	if adv.StreamSeq == 0 {
+		return nil, errors.New("advisory missing or zero stream_seq")
+	}
+
+	if adv.Stream != "" && adv.Stream != c.config.StreamName {
+		return nil, fmt.Errorf("mismatched stream in advisory: expected %s, got %s", c.config.StreamName, adv.Stream)
+	}
+
+	if adv.Consumer != "" && adv.Consumer != c.config.ConsumerName {
+		return nil, fmt.Errorf("mismatched consumer in advisory: expected %s, got %s", c.config.ConsumerName, adv.Consumer)
+	}
+
+	if adv.Deliveries > 0 && adv.Deliveries < uint64(c.config.MaxDeliver) {
+		return nil, fmt.Errorf("advisory deliveries %d below configured MaxDeliver threshold %d", adv.Deliveries, c.config.MaxDeliver)
+	}
+
+	return &adv, nil
+}
+
+// handleAdvisoryData validates, registers, and reconciles a max-deliveries advisory.
+func (c *TelemetryConsumer) handleAdvisoryData(data []byte, ackMsg jetstream.Msg) {
+	adv, err := c.validateAdvisory(data)
+	if err != nil {
+		c.logger.Warn("rejected malformed or mismatched advisory payload",
+			slog.Any("error", err),
+		)
+		if ackMsg != nil {
+			_ = ackMsg.Ack()
+		}
+		return
+	}
+
+	seq := adv.StreamSeq
+	c.recoveryMu.Lock()
+	c.exhaustedSeqs[seq] = true
+	c.recoveryMu.Unlock()
+
+	_, rErr := c.RecoverStreamSequence(c.ctx, seq, WithExhaustionEvidence())
+	if rErr == nil {
+		c.logger.Info("advisory successfully recovered message into durable quarantine",
+			slog.Uint64("stream_seq", seq),
+		)
+		if ackMsg != nil {
+			_ = ackMsg.Ack()
+		}
+		return
+	}
+
+	if errors.Is(rErr, ErrAlreadyIngested) {
+		c.logger.Info("advisory stream message already committed to storage; skipping quarantine",
+			slog.Uint64("stream_seq", seq),
+		)
+		if ackMsg != nil {
+			_ = ackMsg.Ack()
+		}
+		return
+	}
+
+	if errors.Is(rErr, jetstream.ErrMsgNotFound) {
+		c.logger.Warn("advisory source message missing or expired from stream; cannot recover",
+			slog.Uint64("stream_seq", seq),
+		)
+		if ackMsg != nil {
+			_ = ackMsg.Ack()
+		}
+		return
+	}
+
+	if errors.Is(rErr, storage.ErrPayloadMismatch) {
+		c.logger.Error("CRITICAL: recovery payload mismatch conflict on advisory; aborting",
+			slog.Uint64("stream_seq", seq),
+			slog.Any("error", rErr),
+		)
+		if ackMsg != nil {
+			_ = ackMsg.Ack()
+		}
+		return
+	}
+
+	// Transient error (e.g. SQLite database locked): record in memory for retry,
+	// and NAK the advisory with backoff so JetStream redelivers it while keeping it durable.
+	if ackMsg != nil {
+		if err := ackMsg.NakWithDelay(c.config.RetryBackoff); err != nil {
+			_ = ackMsg.Nak()
+		}
+	}
+	c.markExhausted(&seq, int(adv.Deliveries), storage.CategoryDeliveryExhausted, "broker max-deliveries advisory received", "", "", "", nil)
+}
+
+// reconcileDurableAdvisories fetches and processes unacknowledged advisories from the durable advisory stream.
+func (c *TelemetryConsumer) reconcileDurableAdvisories(ctx context.Context) {
+	if c.advCons == nil {
+		return
+	}
+
+	batchSize := c.config.MaxRecoveryBatch
+	if batchSize <= 0 {
+		batchSize = DefaultMaxRecoveryBatch
+	}
+
+	msgs, err := c.advCons.Fetch(batchSize, jetstream.FetchMaxWait(500*time.Millisecond))
+	if err != nil {
+		return
+	}
+
+	for msg := range msgs.Messages() {
+		if ctx.Err() != nil {
+			return
+		}
+		c.handleAdvisoryData(msg.Data(), msg)
+	}
+}
+
+// processPendingRecoveryPass iterates over all pending exhausted items and attempts to persist each
+// to the durable quarantine store with independent per-item backoff.
+func (c *TelemetryConsumer) processPendingRecoveryPass() {
+	c.recoveryMu.Lock()
+	if len(c.pendingExhausted) == 0 {
+		c.recoveryMu.Unlock()
+		return
+	}
+
+	now := time.Now()
+	var toProcess []*recoveryItem
+	for _, item := range c.pendingExhausted {
+		backoff := 50 * time.Millisecond
+		if item.attempts > 0 {
+			shift := item.attempts - 1
+			if shift > 6 {
+				shift = 6
+			}
+			backoff = (50 * time.Millisecond) << shift
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+		if now.Sub(item.lastAttempt) >= backoff {
+			toProcess = append(toProcess, item)
+		}
+	}
+	c.recoveryMu.Unlock()
+
+	for _, item := range toProcess {
+		if c.ctx.Err() != nil {
+			return
+		}
+
+		data := item.data
+		subject := item.subject
+		nodeID := item.nodeID
+		batchID := item.batchID
+		if (len(data) == 0 || nodeID == "" || batchID == "") && c.stream != nil {
+			rawMsg, err := c.stream.GetMsg(c.ctx, item.streamSeq)
+			if err == nil {
+				if len(data) == 0 {
+					data = rawMsg.Data
+				}
+				if subject == "" {
+					subject = rawMsg.Subject
+				}
+				var ev types.TelemetryEvent
+				if json.Unmarshal(rawMsg.Data, &ev) == nil {
+					if nodeID == "" {
+						nodeID = ev.SourceNodeID
+					}
+					if batchID == "" && ev.Payload != nil {
+						batchID = ev.Payload.BatchID
+					}
+				}
+				if nodeID == "" {
+					nodeID = extractNodeIDFromSubject(rawMsg.Subject)
+				}
+				if batchID == "" && rawMsg.Header != nil {
+					batchID = rawMsg.Header.Get("Nats-Msg-Id")
+				}
+			}
+		}
+
+		dedupKey := storage.DeriveDeduplicationKey(c.config.StreamName, &item.streamSeq, nodeID, batchID, subject, data)
+		qid, err := storage.GenerateQuarantineID()
+		if err != nil {
+			continue
+		}
+		recordTime := time.Now().UTC()
+		rec := &storage.QuarantineRecord{
+			ID:                 qid,
+			DeduplicationKey:   dedupKey,
+			SourceStream:       c.config.StreamName,
+			SourceSequence:     &item.streamSeq,
+			SourceSubject:      subject,
+			NodeID:             nodeID,
+			BatchID:            batchID,
+			Payload:            data,
+			FailureCategory:    item.category,
+			FailureReason:      storage.SanitizeFailureReason(item.reason),
+			DeliveryCount:      item.deliveryCount,
+			Attempts:           1,
+			FirstQuarantinedAt: recordTime,
+			LastQuarantinedAt:  recordTime,
+			Status:             storage.StatusQuarantined,
+			StatusUpdatedAt:    recordTime,
+		}
+
+		if c.quarantineStore != nil {
+			_, qErr := c.quarantineStore.RecordQuarantine(c.ctx, rec)
+			if qErr == nil {
+				c.quarantinedTotal.Add(1)
+				c.recoveredTotal.Add(1)
+				c.recoveryMu.Lock()
+				delete(c.pendingExhausted, item.streamSeq)
+				c.recoveryMu.Unlock()
+				c.logger.Info("exhausted message successfully recovered into durable quarantine",
+					slog.Uint64("stream_seq", item.streamSeq),
+					slog.String("subject", subject),
+				)
+				continue
+			}
+
+			if errors.Is(qErr, storage.ErrPayloadMismatch) {
+				c.logger.Error("CRITICAL: recovery aborted due to payload mismatch conflict",
+					slog.Uint64("stream_seq", item.streamSeq),
+					slog.Any("error", qErr),
+				)
+				c.recoveryMu.Lock()
+				delete(c.pendingExhausted, item.streamSeq)
+				c.recoveryMu.Unlock()
+				continue
+			}
+
+			c.recoveryMu.Lock()
+			if current, ok := c.pendingExhausted[item.streamSeq]; ok {
+				current.attempts++
+				current.lastAttempt = time.Now()
+			}
+			c.recoveryMu.Unlock()
+			c.logger.Warn("quarantine write failed during background recovery retry; will retry with backoff",
+				slog.Uint64("stream_seq", item.streamSeq),
+				slog.Int("attempts", item.attempts+1),
+				slog.Any("error", qErr),
+			)
+		}
+	}
+}
+
+// recoveryWorkerLoop processes asynchronously tracked exhausted messages, durable advisories, and periodic scan passes.
 func (c *TelemetryConsumer) recoveryWorkerLoop() {
 	defer c.recoveryWg.Done()
 	c.logger.Info("telemetry recovery worker started")
+
+	ticker := time.NewTicker(c.config.RecoveryScanInterval)
+	defer ticker.Stop()
+
+	// Initial scan pass on startup: reconcile durable advisories first, then pending retries, then scan
+	c.reconcileDurableAdvisories(c.ctx)
+	c.processPendingRecoveryPass()
+	if _, err := c.RecoverUnacknowledged(c.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		c.logger.Debug("initial recovery pass completed", slog.Any("error", err))
+	}
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			c.logger.Info("telemetry recovery worker stopping on context cancellation")
 			return
-		case item, ok := <-c.recoveryQueue:
-			if !ok {
-				return
-			}
-			c.retryRecoverItem(item)
-		}
-	}
-}
-
-// retryRecoverItem attempts to persist a failed quarantine record with bounded backoff.
-func (c *TelemetryConsumer) retryRecoverItem(item recoveryItem) {
-	backoff := 50 * time.Millisecond
-	const maxBackoff = 2 * time.Second
-
-	for {
-		if c.ctx.Err() != nil {
-			return
-		}
-
-		dedupKey := storage.DeriveDeduplicationKey(c.config.StreamName, &item.streamSeq, item.nodeID, item.batchID, item.subject, item.data)
-		qid, _ := storage.GenerateQuarantineID()
-		now := time.Now().UTC()
-		record := &storage.QuarantineRecord{
-			ID:                 qid,
-			DeduplicationKey:   dedupKey,
-			SourceStream:       c.config.StreamName,
-			SourceSequence:     &item.streamSeq,
-			SourceSubject:      item.subject,
-			NodeID:             item.nodeID,
-			BatchID:            item.batchID,
-			Payload:            item.data,
-			FailureCategory:    item.category,
-			FailureReason:      storage.SanitizeFailureReason(item.reason),
-			DeliveryCount:      item.deliveryCount,
-			Attempts:           1,
-			FirstQuarantinedAt: now,
-			LastQuarantinedAt:  now,
-			Status:             storage.StatusQuarantined,
-			StatusUpdatedAt:    now,
-		}
-
-		if c.quarantineStore != nil {
-			_, err := c.quarantineStore.RecordQuarantine(c.ctx, record)
-			if err == nil {
-				c.quarantinedTotal.Add(1)
-				c.recoveredTotal.Add(1)
-				c.logger.Info("exhausted message successfully recovered into durable quarantine",
-					slog.Uint64("stream_seq", item.streamSeq),
-					slog.String("subject", item.subject),
-				)
-				return
-			}
-			if errors.Is(err, storage.ErrPayloadMismatch) {
-				c.logger.Error("CRITICAL: recovery aborted due to payload mismatch conflict",
-					slog.Uint64("stream_seq", item.streamSeq),
-					slog.Any("error", err),
-				)
-				return
-			}
-		}
-
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-time.After(backoff):
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+		case <-ticker.C:
+			c.reconcileDurableAdvisories(c.ctx)
+			c.processPendingRecoveryPass()
+			if _, err := c.RecoverUnacknowledged(c.ctx); err != nil && !errors.Is(err, context.Canceled) {
+				c.logger.Debug("periodic recovery scan pass error", slog.Any("error", err))
 			}
 		}
 	}
@@ -715,13 +1227,27 @@ func (c *TelemetryConsumer) Consumer() jetstream.Consumer {
 }
 
 // RecoverStreamSequence retrieves the raw message directly from JetStream by stream sequence number,
-// inspects it, and durably persists it to the quarantine store.
-func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint64) (*storage.QuarantineRecord, error) {
+// inspects it, queries durable idempotency storage, and durably quarantines it if eligible.
+//
+// Eligibility rules:
+//   - Deserialization or schema validation failure: unconditionally quarantined (poison message).
+//   - Valid schema:
+//     1. Query IdempotencyStore. If already ingested, returns ErrAlreadyIngested (NEVER quarantined).
+//     2. If idempotency check fails with an error, returns that error (NEVER misclassified).
+//     3. If not ingested, only quarantined if delivery exhaustion evidence exists
+//     (recorded via consumer MaxDeliver processing, server advisory, or WithExhaustionEvidence).
+//     Otherwise returns ErrNotEligible.
+func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint64, opts ...RecoveryOption) (*storage.QuarantineRecord, error) {
 	if c.stream == nil {
 		return nil, errors.New("stream handle not available")
 	}
 	if c.quarantineStore == nil {
 		return nil, errors.New("quarantine store not configured")
+	}
+
+	var ro recoveryOptions
+	for _, opt := range opts {
+		opt(&ro)
 	}
 
 	rawMsg, err := c.stream.GetMsg(ctx, seq)
@@ -733,6 +1259,7 @@ func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint6
 	cat := storage.CategoryDeliveryExhausted
 	reason := "recovered from stream after delivery exhaustion"
 	var nodeID, batchID string
+	isPoison := false
 
 	if err := json.Unmarshal(rawMsg.Data, &event); err != nil {
 		cat = storage.CategoryDeserialization
@@ -741,6 +1268,7 @@ func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint6
 		if rawMsg.Header != nil {
 			batchID = rawMsg.Header.Get("Nats-Msg-Id")
 		}
+		isPoison = true
 	} else if err := event.Validate(); err != nil {
 		cat = storage.CategorySchemaValidation
 		reason = fmt.Sprintf("invalid_envelope: %v", err)
@@ -748,19 +1276,42 @@ func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint6
 		if nodeID == "" {
 			nodeID = extractNodeIDFromSubject(rawMsg.Subject)
 		}
+		isPoison = true
 	} else if event.Payload == nil {
 		cat = storage.CategorySchemaValidation
 		reason = "nil_payload"
 		nodeID = event.SourceNodeID
+		isPoison = true
 	} else if err := event.Payload.Validate(); err != nil {
 		cat = storage.CategorySchemaValidation
 		reason = fmt.Sprintf("invalid_domain_payload: %v", err)
 		nodeID = event.Payload.NodeID
 		batchID = event.Payload.BatchID
+		isPoison = true
 	} else {
 		nodeID = event.SourceNodeID
 		if event.Payload != nil {
 			batchID = event.Payload.BatchID
+		}
+	}
+
+	// If the payload is schema-valid, enforce strict eligibility rules:
+	if !isPoison {
+		// 1. Authoritative idempotency check
+		if c.idempotencyStore != nil {
+			has, chkErr := c.idempotencyStore.HasBatch(ctx, nodeID, batchID)
+			if chkErr != nil {
+				return nil, fmt.Errorf("idempotency check failed for node=%s batch=%s: %w", nodeID, batchID, chkErr)
+			}
+			if has {
+				return nil, ErrAlreadyIngested
+			}
+		}
+
+		// 2. Exhaustion evidence check
+		hasEvidence := ro.forceExhaustion || c.hasExhaustionEvidence(seq)
+		if !hasEvidence {
+			return nil, ErrNotEligible
 		}
 	}
 
@@ -796,34 +1347,28 @@ func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint6
 	}
 	c.quarantinedTotal.Add(1)
 	c.recoveredTotal.Add(1)
+	c.recoveryMu.Lock()
+	delete(c.pendingExhausted, seq)
+	c.recoveryMu.Unlock()
 	return saved, nil
 }
 
-// RecoverUnacknowledged inspects the consumer's pending unacknowledged message sequence range
-// and recovers each into durable quarantine. This ensures delivery-exhausted messages that failed
-// quarantine persistence across a previous process restart are reliably recovered.
-func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, error) {
-	if c.cons == nil {
-		return 0, errors.New("consumer handle not available")
-	}
-
-	info, err := c.cons.Info(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get consumer info: %w", err)
-	}
-
-	if info.NumAckPending == 0 || info.Delivered.Stream <= info.AckFloor.Stream {
+// RecoverStreamRange inspects and recovers messages in the given stream sequence interval [startSeq, endSeq] (inclusive).
+func (c *TelemetryConsumer) RecoverStreamRange(ctx context.Context, startSeq, endSeq uint64, opts ...RecoveryOption) (int, error) {
+	if startSeq > endSeq {
 		return 0, nil
 	}
-
 	recovered := 0
-	for seq := info.AckFloor.Stream + 1; seq <= info.Delivered.Stream; seq++ {
+	for seq := startSeq; seq <= endSeq; seq++ {
 		if ctx.Err() != nil {
 			return recovered, ctx.Err()
 		}
-		_, err := c.RecoverStreamSequence(ctx, seq)
+		_, err := c.RecoverStreamSequence(ctx, seq, opts...)
 		if err != nil {
-			c.logger.Warn("recovery of unacknowledged stream message failed",
+			if errors.Is(err, ErrAlreadyIngested) || errors.Is(err, ErrNotEligible) || errors.Is(err, jetstream.ErrMsgNotFound) {
+				continue
+			}
+			c.logger.Warn("stream range recovery inspection failed",
 				slog.Uint64("stream_seq", seq),
 				slog.Any("error", err),
 			)
@@ -834,10 +1379,164 @@ func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, err
 	return recovered, nil
 }
 
+// RecoverUnacknowledged inspects the consumer's pending unacknowledged message sequence range
+// in bounded passes up to MaxRecoveryBatch, advancing recoveryCursor and tracking retry obligations
+// on transient errors so sequences are never permanently skipped.
+func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, error) {
+	if c.cons == nil {
+		return 0, errors.New("consumer handle not available")
+	}
+
+	info, err := c.cons.Info(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get consumer info: %w", err)
+	}
+
+	recovered := 0
+	processed := make(map[uint64]bool)
+
+	// 1. Process pending scan retries from earlier transient errors with per-item backoff
+	c.recoveryMu.Lock()
+	var toRetry []*scanRetryItem
+	now := time.Now()
+	for _, item := range c.pendingScanRetries {
+		backoff := 50 * time.Millisecond
+		if item.attempts > 0 {
+			shift := item.attempts - 1
+			if shift > 6 {
+				shift = 6
+			}
+			backoff = (50 * time.Millisecond) << shift
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+		}
+		if now.Sub(item.lastAttempt) >= backoff {
+			toRetry = append(toRetry, item)
+		}
+	}
+	c.recoveryMu.Unlock()
+
+	for _, item := range toRetry {
+		if ctx.Err() != nil {
+			return recovered, ctx.Err()
+		}
+		_, rErr := c.RecoverStreamSequence(ctx, item.seq)
+		if rErr == nil {
+			recovered++
+			processed[item.seq] = true
+			c.recoveryMu.Lock()
+			delete(c.pendingScanRetries, item.seq)
+			c.recoveryMu.Unlock()
+			continue
+		}
+		if errors.Is(rErr, ErrAlreadyIngested) || errors.Is(rErr, ErrNotEligible) || errors.Is(rErr, jetstream.ErrMsgNotFound) {
+			processed[item.seq] = true
+			c.recoveryMu.Lock()
+			delete(c.pendingScanRetries, item.seq)
+			c.recoveryMu.Unlock()
+			continue
+		}
+		// Transient error on retry
+		c.recoveryMu.Lock()
+		if cur, ok := c.pendingScanRetries[item.seq]; ok {
+			cur.attempts++
+			cur.lastAttempt = time.Now()
+			cur.lastErr = rErr
+			if cur.attempts > 15 {
+				c.logger.Error("scan retry obligation exceeded maximum attempts; dropping retry",
+					slog.Uint64("stream_seq", item.seq),
+					slog.Any("error", rErr),
+				)
+				delete(c.pendingScanRetries, item.seq)
+			}
+		}
+		c.recoveryMu.Unlock()
+	}
+
+	if info.NumAckPending == 0 || info.Delivered.Stream <= info.AckFloor.Stream {
+		return recovered, nil
+	}
+
+	c.recoveryMu.Lock()
+	startSeq := info.AckFloor.Stream + 1
+	if c.recoveryCursor > startSeq {
+		startSeq = c.recoveryCursor
+	}
+	batchSize := uint64(c.config.MaxRecoveryBatch)
+	if batchSize == 0 {
+		batchSize = DefaultMaxRecoveryBatch
+	}
+	endSeq := startSeq + batchSize - 1
+	if endSeq > info.Delivered.Stream {
+		endSeq = info.Delivered.Stream
+	}
+	c.recoveryMu.Unlock()
+
+	if startSeq > endSeq {
+		return recovered, nil
+	}
+
+	for seq := startSeq; seq <= endSeq; seq++ {
+		if ctx.Err() != nil {
+			return recovered, ctx.Err()
+		}
+		if processed[seq] {
+			continue
+		}
+		_, rErr := c.RecoverStreamSequence(ctx, seq)
+		if rErr != nil {
+			if errors.Is(rErr, ErrAlreadyIngested) || errors.Is(rErr, ErrNotEligible) || errors.Is(rErr, jetstream.ErrMsgNotFound) {
+				c.recoveryMu.Lock()
+				delete(c.pendingScanRetries, seq)
+				c.recoveryMu.Unlock()
+				continue
+			}
+			// Transient error encountered during scan pass: record retry obligation so it is retried on the next pass
+			c.logger.Warn("recovery scan inspection failed; recorded retry obligation",
+				slog.Uint64("stream_seq", seq),
+				slog.Any("error", rErr),
+			)
+			c.recoveryMu.Lock()
+			if _, exists := c.pendingScanRetries[seq]; !exists {
+				c.pendingScanRetries[seq] = &scanRetryItem{
+					seq:         seq,
+					attempts:    1,
+					lastAttempt: time.Now(),
+					lastErr:     rErr,
+				}
+			}
+			c.recoveryMu.Unlock()
+			continue
+		}
+		recovered++
+		c.recoveryMu.Lock()
+		delete(c.pendingScanRetries, seq)
+		c.recoveryMu.Unlock()
+	}
+
+	c.recoveryMu.Lock()
+	if endSeq >= info.Delivered.Stream {
+		c.recoveryCursor = info.AckFloor.Stream + 1
+	} else {
+		c.recoveryCursor = endSeq + 1
+	}
+	c.recoveryMu.Unlock()
+
+	return recovered, nil
+}
+
 // Stop gracefully stops the consumer.
 func (c *TelemetryConsumer) Stop() {
+	if c.stopped.Swap(true) {
+		return
+	}
+	c.running.Store(false)
 	c.cancel()
 	c.recoveryWg.Wait()
+	if c.advSub != nil {
+		_ = c.advSub.Unsubscribe()
+	}
 	if c.conn != nil {
 		c.conn.Close()
 	}
