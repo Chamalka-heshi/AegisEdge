@@ -13,6 +13,14 @@ const (
 	MetricAuthFailuresTotal            = "aegisedge_control_plane_auth_failures_total"
 	MetricNATSExhaustedDeliveriesTotal = "aegisedge_control_plane_nats_exhausted_deliveries_total"
 	MetricRegisteredNodesCount         = "aegisedge_control_plane_registered_nodes_count"
+	MetricNATSAdvisoryStreamMessages   = "aegisedge_control_plane_nats_advisory_stream_messages"
+	MetricNATSAdvisoryStreamBytes      = "aegisedge_control_plane_nats_advisory_stream_bytes"
+	MetricNATSAdvisoryPendingBacklog   = "aegisedge_control_plane_nats_advisory_pending_backlog"
+	MetricNATSAdvisoryPendingAck       = "aegisedge_control_plane_nats_advisory_pending_ack"
+	MetricNATSAdvisoryFetchErrorsTotal = "aegisedge_control_plane_nats_advisory_fetch_errors_total"
+	MetricNATSAdvisoryEvictionsTotal   = "aegisedge_control_plane_nats_advisory_evictions_total"
+	MetricNATSQuarantinedTotal         = "aegisedge_control_plane_nats_quarantined_total"
+	MetricNATSRecoveredTotal           = "aegisedge_control_plane_nats_recovered_total"
 )
 
 // Bounded label values and allowlists.
@@ -48,16 +56,32 @@ var allowedAuthReasons = map[string]struct{}{
 type Metrics struct {
 	registry *Registry
 
-	ingestedBatches         *CounterVec
-	storageProbeDuration    *SingleHistogram
-	storageProbeFailures    *SingleCounter
-	authFailures            *CounterVec
-	natsExhaustedDeliveries *FuncCounter
-	registeredNodes         *FuncGauge
+	ingestedBatches            *CounterVec
+	storageProbeDuration       *SingleHistogram
+	storageProbeFailures       *SingleCounter
+	authFailures               *CounterVec
+	natsExhaustedDeliveries    *FuncCounter
+	registeredNodes            *FuncGauge
+	natsAdvisoryStreamMsgs     *FuncGauge
+	natsAdvisoryStreamBytes    *FuncGauge
+	natsAdvisoryPendingBacklog *FuncGauge
+	natsAdvisoryPendingAck     *FuncGauge
+	natsAdvisoryFetchErrors    *FuncCounter
+	natsAdvisoryEvictions      *FuncCounter
+	natsQuarantined            *FuncCounter
+	natsRecovered              *FuncCounter
 
-	mu                   sync.RWMutex
-	natsExhaustedSource  func() float64
-	registeredNodeSource func() float64
+	mu                               sync.RWMutex
+	natsExhaustedSource              func() float64
+	registeredNodeSource             func() float64
+	natsAdvisoryStreamMsgsSource     func() float64
+	natsAdvisoryStreamBytesSource    func() float64
+	natsAdvisoryPendingBacklogSource func() float64
+	natsAdvisoryPendingAckSource     func() float64
+	natsAdvisoryFetchErrorsSource    func() float64
+	natsAdvisoryEvictionsSource      func() float64
+	natsQuarantinedSource            func() float64
+	natsRecoveredSource              func() float64
 }
 
 // NewMetrics initializes and registers all control-plane operational metrics.
@@ -132,6 +156,126 @@ func NewMetrics() *Metrics {
 		},
 	)
 	_ = r.Register(m.registeredNodes)
+
+	m.natsAdvisoryStreamMsgs = NewFuncGauge(
+		MetricNATSAdvisoryStreamMessages,
+		"Current number of advisory messages retained in the durable advisory stream.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsAdvisoryStreamMsgsSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsAdvisoryStreamMsgs)
+
+	m.natsAdvisoryStreamBytes = NewFuncGauge(
+		MetricNATSAdvisoryStreamBytes,
+		"Current storage bytes utilized by the durable advisory stream.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsAdvisoryStreamBytesSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsAdvisoryStreamBytes)
+
+	m.natsAdvisoryPendingBacklog = NewFuncGauge(
+		MetricNATSAdvisoryPendingBacklog,
+		"Current number of pending advisories awaiting consumer retrieval in JetStream.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsAdvisoryPendingBacklogSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsAdvisoryPendingBacklog)
+
+	m.natsAdvisoryPendingAck = NewFuncGauge(
+		MetricNATSAdvisoryPendingAck,
+		"Current number of delivered advisories awaiting acknowledgment from the consumer.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsAdvisoryPendingAckSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsAdvisoryPendingAck)
+
+	m.natsAdvisoryFetchErrors = NewFuncCounter(
+		MetricNATSAdvisoryFetchErrorsTotal,
+		"Total number of transport or protocol errors encountered while fetching from the advisory stream.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsAdvisoryFetchErrorsSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsAdvisoryFetchErrors)
+
+	m.natsAdvisoryEvictions = NewFuncCounter(
+		MetricNATSAdvisoryEvictionsTotal,
+		"Total number of advisory stream messages detected evicted under capacity limits.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsAdvisoryEvictionsSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsAdvisoryEvictions)
+
+	m.natsQuarantined = NewFuncCounter(
+		MetricNATSQuarantinedTotal,
+		"Total number of messages successfully recorded in durable quarantine.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsQuarantinedSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsQuarantined)
+
+	m.natsRecovered = NewFuncCounter(
+		MetricNATSRecoveredTotal,
+		"Total number of messages recovered through stream sequence or advisory recovery pipelines.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsRecoveredSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsRecovered)
 
 	return m
 }
@@ -220,5 +364,85 @@ func (m *Metrics) SetRegisteredNodesSource(fn func() float64) {
 	}
 	m.mu.Lock()
 	m.registeredNodeSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSAdvisoryStreamMessagesSource registers a dynamic source for the advisory stream messages count gauge.
+func (m *Metrics) SetNATSAdvisoryStreamMessagesSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsAdvisoryStreamMsgsSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSAdvisoryStreamBytesSource registers a dynamic source for the advisory stream storage bytes gauge.
+func (m *Metrics) SetNATSAdvisoryStreamBytesSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsAdvisoryStreamBytesSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSAdvisoryPendingBacklogSource registers a dynamic source for the pending advisories backlog gauge.
+func (m *Metrics) SetNATSAdvisoryPendingBacklogSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsAdvisoryPendingBacklogSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSAdvisoryPendingAckSource registers a dynamic source for the unacknowledged advisories gauge.
+func (m *Metrics) SetNATSAdvisoryPendingAckSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsAdvisoryPendingAckSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSAdvisoryFetchErrorsSource registers a dynamic source for the advisory fetch errors counter.
+func (m *Metrics) SetNATSAdvisoryFetchErrorsSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsAdvisoryFetchErrorsSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSAdvisoryEvictionsSource registers a dynamic source for the advisory evictions counter.
+func (m *Metrics) SetNATSAdvisoryEvictionsSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsAdvisoryEvictionsSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSQuarantinedSource registers a dynamic source for the total quarantined records counter.
+func (m *Metrics) SetNATSQuarantinedSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsQuarantinedSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSRecoveredSource registers a dynamic source for the total recovered records counter.
+func (m *Metrics) SetNATSRecoveredSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsRecoveredSource = fn
 	m.mu.Unlock()
 }
