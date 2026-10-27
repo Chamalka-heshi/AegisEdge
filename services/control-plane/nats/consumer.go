@@ -190,33 +190,41 @@ func WithRecoveryScanInterval(interval time.Duration) ConsumerOption {
 //   - Process shutdown / context cancellation → Leave message unacknowledged so it can
 //     be retried by the next control-plane process instance.
 type TelemetryConsumer struct {
-	conn                *nats.Conn
-	handler             IngestionHandler
-	logger              *slog.Logger
-	config              ConsumerConfig
-	js                  jetstream.JetStream
-	stream              jetstream.Stream
-	cons                jetstream.Consumer
-	advStream           jetstream.Stream
-	advCons             jetstream.Consumer
-	advSub              *nats.Subscription
-	quarantineStore     storage.QuarantineStore
-	idempotencyStore    IdempotencyChecker
-	ownsStore           bool
-	recoveryMu          sync.Mutex
-	pendingExhausted    map[uint64]*recoveryItem
-	pendingScanRetries  map[uint64]*scanRetryItem
-	exhaustedSeqs       map[uint64]bool
-	recoveryCursor      uint64
-	recoveryWg          sync.WaitGroup
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	running             atomic.Bool
-	stopped             atomic.Bool
-	consumed            atomic.Int64
-	exhaustedDeliveries atomic.Int64
-	quarantinedTotal    atomic.Int64
-	recoveredTotal      atomic.Int64
+	conn                   *nats.Conn
+	handler                IngestionHandler
+	logger                 *slog.Logger
+	config                 ConsumerConfig
+	js                     jetstream.JetStream
+	stream                 jetstream.Stream
+	cons                   jetstream.Consumer
+	advStream              jetstream.Stream
+	advCons                jetstream.Consumer
+	advSub                 *nats.Subscription
+	quarantineStore        storage.QuarantineStore
+	idempotencyStore       IdempotencyChecker
+	ownsStore              bool
+	recoveryMu             sync.Mutex
+	pendingExhausted       map[uint64]*recoveryItem
+	pendingScanRetries     map[uint64]*scanRetryItem
+	exhaustedSeqs          map[uint64]bool
+	recoveryCursor         uint64
+	recoveryWg             sync.WaitGroup
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	running                atomic.Bool
+	stopped                atomic.Bool
+	consumed               atomic.Int64
+	exhaustedDeliveries    atomic.Int64
+	quarantinedTotal       atomic.Int64
+	recoveredTotal         atomic.Int64
+	advisoryStreamMsgs     atomic.Int64
+	advisoryStreamBytes    atomic.Int64
+	advisoryPendingAck     atomic.Int64
+	advisoryPendingBacklog atomic.Int64
+	advisoryFetchErrors    atomic.Int64
+	advisoryEvictions      atomic.Int64
+	lastAdvisoryFirstSeq   uint64
+	lastHealthInspect      time.Time
 }
 
 // natsSubjectCovers reports whether pattern covers target subject pattern.
@@ -801,6 +809,14 @@ func (c *TelemetryConsumer) reconcileDurableAdvisories(ctx context.Context) {
 
 	msgs, err := c.advCons.Fetch(batchSize, jetstream.FetchMaxWait(500*time.Millisecond))
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		if strings.Contains(err.Error(), "no messages") {
+			return
+		}
+		c.advisoryFetchErrors.Add(1)
+		c.logger.Warn("advisory consumer fetch failed", slog.Any("error", err))
 		return
 	}
 
@@ -809,6 +825,79 @@ func (c *TelemetryConsumer) reconcileDurableAdvisories(ctx context.Context) {
 			return
 		}
 		c.handleAdvisoryData(msg.Data(), msg)
+	}
+
+	if msgs.Error() != nil && ctx.Err() == nil {
+		if !errors.Is(msgs.Error(), context.Canceled) && !errors.Is(msgs.Error(), context.DeadlineExceeded) && !strings.Contains(msgs.Error().Error(), "no messages") {
+			c.advisoryFetchErrors.Add(1)
+			c.logger.Warn("advisory message batch iteration error", slog.Any("error", msgs.Error()))
+		}
+	}
+}
+
+// inspectAdvisoryStreamHealth queries the advisory stream and consumer metadata to track capacity and detect eviction.
+func (c *TelemetryConsumer) inspectAdvisoryStreamHealth(ctx context.Context) {
+	if c.advStream == nil {
+		return
+	}
+
+	sInfo, err := c.advStream.Info(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			c.logger.Debug("failed to query advisory stream info", slog.Any("error", err))
+		}
+		return
+	}
+
+	c.advisoryStreamMsgs.Store(int64(sInfo.State.Msgs))
+	c.advisoryStreamBytes.Store(int64(sInfo.State.Bytes))
+
+	// Capacity threshold warnings (>= 80%)
+	if sInfo.Config.MaxMsgs > 0 && sInfo.State.Msgs >= uint64(float64(sInfo.Config.MaxMsgs)*0.8) {
+		c.logger.Warn("advisory stream message capacity threshold exceeded (>= 80%)",
+			slog.Uint64("messages", sInfo.State.Msgs),
+			slog.Int64("max_messages", sInfo.Config.MaxMsgs),
+		)
+	}
+	if sInfo.Config.MaxBytes > 0 && sInfo.State.Bytes >= uint64(float64(sInfo.Config.MaxBytes)*0.8) {
+		c.logger.Warn("advisory stream byte capacity threshold exceeded (>= 80%)",
+			slog.Uint64("bytes", sInfo.State.Bytes),
+			slog.Int64("max_bytes", sInfo.Config.MaxBytes),
+		)
+	}
+
+	// Eviction detection: FirstSeq advancement under DiscardOld with stream at capacity
+	c.recoveryMu.Lock()
+	prevFirstSeq := c.lastAdvisoryFirstSeq
+	c.lastAdvisoryFirstSeq = sInfo.State.FirstSeq
+	c.recoveryMu.Unlock()
+
+	isAtCapacity := (sInfo.Config.MaxMsgs > 0 && sInfo.State.Msgs >= uint64(sInfo.Config.MaxMsgs)) ||
+		(sInfo.Config.MaxBytes > 0 && sInfo.State.Bytes >= uint64(sInfo.Config.MaxBytes))
+
+	if sInfo.Config.Discard == jetstream.DiscardOld && isAtCapacity {
+		var evictedCount int64
+		if prevFirstSeq > 0 && sInfo.State.FirstSeq > prevFirstSeq {
+			evictedCount = int64(sInfo.State.FirstSeq - prevFirstSeq)
+		} else if prevFirstSeq == 0 && sInfo.State.FirstSeq > 1 {
+			evictedCount = int64(sInfo.State.FirstSeq - 1)
+		}
+		if evictedCount > 0 {
+			c.advisoryEvictions.Add(evictedCount)
+			c.logger.Warn("advisory stream capacity eviction detected under DiscardOld; unacknowledged advisories may have been pruned",
+				slog.Uint64("previous_first_seq", prevFirstSeq),
+				slog.Uint64("current_first_seq", sInfo.State.FirstSeq),
+				slog.Int64("evicted_count", evictedCount),
+			)
+		}
+	}
+
+	if c.advCons != nil {
+		cInfo, cErr := c.advCons.Info(ctx)
+		if cErr == nil {
+			c.advisoryPendingBacklog.Store(int64(cInfo.NumPending))
+			c.advisoryPendingAck.Store(int64(cInfo.NumAckPending))
+		}
 	}
 }
 
@@ -951,7 +1040,8 @@ func (c *TelemetryConsumer) recoveryWorkerLoop() {
 	ticker := time.NewTicker(c.config.RecoveryScanInterval)
 	defer ticker.Stop()
 
-	// Initial scan pass on startup: reconcile durable advisories first, then pending retries, then scan
+	// Initial scan pass on startup: inspect stream health, reconcile durable advisories first, then pending retries, then scan
+	c.inspectAdvisoryStreamHealth(c.ctx)
 	c.reconcileDurableAdvisories(c.ctx)
 	c.processPendingRecoveryPass()
 	if _, err := c.RecoverUnacknowledged(c.ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -964,6 +1054,7 @@ func (c *TelemetryConsumer) recoveryWorkerLoop() {
 			c.logger.Info("telemetry recovery worker stopping on context cancellation")
 			return
 		case <-ticker.C:
+			c.inspectAdvisoryStreamHealth(c.ctx)
 			c.reconcileDurableAdvisories(c.ctx)
 			c.processPendingRecoveryPass()
 			if _, err := c.RecoverUnacknowledged(c.ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -1209,6 +1300,36 @@ func (c *TelemetryConsumer) Quarantined() int64 {
 // Recovered returns the total number of messages recovered through the exhaustion recovery mechanism.
 func (c *TelemetryConsumer) Recovered() int64 {
 	return c.recoveredTotal.Load()
+}
+
+// AdvisoryStreamMessages returns the current message count in the advisory stream.
+func (c *TelemetryConsumer) AdvisoryStreamMessages() int64 {
+	return c.advisoryStreamMsgs.Load()
+}
+
+// AdvisoryStreamBytes returns the current byte size of the advisory stream.
+func (c *TelemetryConsumer) AdvisoryStreamBytes() int64 {
+	return c.advisoryStreamBytes.Load()
+}
+
+// AdvisoryPendingBacklog returns the number of pending advisories awaiting consumer retrieval.
+func (c *TelemetryConsumer) AdvisoryPendingBacklog() int64 {
+	return c.advisoryPendingBacklog.Load()
+}
+
+// AdvisoryPendingAck returns the number of delivered advisories awaiting acknowledgment.
+func (c *TelemetryConsumer) AdvisoryPendingAck() int64 {
+	return c.advisoryPendingAck.Load()
+}
+
+// AdvisoryFetchErrors returns the total number of errors encountered while fetching advisories.
+func (c *TelemetryConsumer) AdvisoryFetchErrors() int64 {
+	return c.advisoryFetchErrors.Load()
+}
+
+// AdvisoryEvictions returns the total number of advisories detected evicted under stream limits.
+func (c *TelemetryConsumer) AdvisoryEvictions() int64 {
+	return c.advisoryEvictions.Load()
 }
 
 // QuarantineStore returns the quarantine store backing this consumer.
