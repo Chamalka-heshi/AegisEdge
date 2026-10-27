@@ -1074,7 +1074,10 @@ func (h *commitSyncHandler) IngestBatch(ctx context.Context, batch *types.Teleme
 	default:
 	}
 	// Block until the test has canceled the consumer context
-	<-h.release
+	select {
+	case <-h.release:
+	case <-ctx.Done():
+	}
 	return nil
 }
 
