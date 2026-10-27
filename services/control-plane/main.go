@@ -272,6 +272,30 @@ func main() {
 		srvInstance.Metrics().SetNATSExhaustedDeliveriesSource(func() float64 {
 			return float64(consumer.ExhaustedDeliveries())
 		})
+		srvInstance.Metrics().SetNATSQuarantinedSource(func() float64 {
+			return float64(consumer.Quarantined())
+		})
+		srvInstance.Metrics().SetNATSRecoveredSource(func() float64 {
+			return float64(consumer.Recovered())
+		})
+		srvInstance.Metrics().SetNATSAdvisoryStreamMessagesSource(func() float64 {
+			return float64(consumer.AdvisoryStreamMessages())
+		})
+		srvInstance.Metrics().SetNATSAdvisoryStreamBytesSource(func() float64 {
+			return float64(consumer.AdvisoryStreamBytes())
+		})
+		srvInstance.Metrics().SetNATSAdvisoryPendingBacklogSource(func() float64 {
+			return float64(consumer.AdvisoryPendingBacklog())
+		})
+		srvInstance.Metrics().SetNATSAdvisoryPendingAckSource(func() float64 {
+			return float64(consumer.AdvisoryPendingAck())
+		})
+		srvInstance.Metrics().SetNATSAdvisoryFetchErrorsSource(func() float64 {
+			return float64(consumer.AdvisoryFetchErrors())
+		})
+		srvInstance.Metrics().SetNATSAdvisoryEvictionsSource(func() float64 {
+			return float64(consumer.AdvisoryEvictions())
+		})
 		if err := consumer.Start(); err != nil {
 			logger.Error("failed to start NATS consumer", slog.Any("error", err))
 			os.Exit(1)
