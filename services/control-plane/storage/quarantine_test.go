@@ -11,7 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
 
 func TestQuarantine_RecordAndGetByID(t *testing.T) {
@@ -1120,4 +1123,343 @@ func TestQuarantine_SchemaMigration_LegacyTableUpgrade(t *testing.T) {
 		t.Fatalf("second OpenSQLite on already-migrated database failed: %v", err)
 	}
 	_ = store2.Close()
+}
+
+func TestQuarantine_AlreadyIngestedBatchCannotBeQuarantined(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	nodeID := "node-ingested-1"
+	batchID := "batch-ingested-1"
+	batch := &types.TelemetryBatch{
+		NodeID:         nodeID,
+		BatchID:        batchID,
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics: []types.MetricSample{
+			{Name: "cpu_usage", Value: 42.0, Timestamp: time.Now().UTC()},
+		},
+	}
+
+	isNew, err := store.RecordBatch(ctx, batch, time.Now().UTC())
+	if err != nil || !isNew {
+		t.Fatalf("RecordBatch failed: isNew=%v, err=%v", isNew, err)
+	}
+
+	// Attempt to quarantine the already-ingested batch
+	seq := uint64(10)
+	rec := &QuarantineRecord{
+		SourceStream:    "AEGISEDGE_TELEMETRY",
+		SourceSequence:  &seq,
+		SourceSubject:   "aegisedge.v1.telemetry." + nodeID,
+		NodeID:          nodeID,
+		BatchID:         batchID,
+		Payload:         []byte(`{"dummy":"payload"}`),
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "delivery exhausted after transient failure",
+		DeliveryCount:   5,
+	}
+
+	saved, err := store.RecordQuarantine(ctx, rec)
+	if err == nil {
+		t.Fatalf("expected RecordQuarantine to fail for already-ingested batch, got record: %+v", saved)
+	}
+	if !errors.Is(err, ErrAlreadyIngested) {
+		t.Fatalf("expected ErrAlreadyIngested, got: %v", err)
+	}
+
+	// Verify no quarantine record exists in durable storage
+	records, err := store.ListQuarantineRecords(ctx, QuarantineFilter{})
+	if err != nil {
+		t.Fatalf("ListQuarantineRecords failed: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 quarantine records, found %d", len(records))
+	}
+}
+
+func TestQuarantine_ConcurrentIngestionAndQuarantine_CannotBothSucceed(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "concurrent_race.db")
+	store, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	const iterations = 30
+	for i := 0; i < iterations; i++ {
+		nodeID := fmt.Sprintf("node-race-%d", i)
+		batchID := fmt.Sprintf("batch-race-%d", i)
+
+		batch := &types.TelemetryBatch{
+			NodeID:         nodeID,
+			BatchID:        batchID,
+			SequenceNumber: int64(i + 1),
+			CollectedAt:    time.Now().UTC(),
+			Metrics: []types.MetricSample{
+				{Name: "cpu_usage", Value: float64(i), Timestamp: time.Now().UTC()},
+			},
+		}
+
+		seq := uint64(i + 100)
+		rec := &QuarantineRecord{
+			SourceStream:    "AEGISEDGE_TELEMETRY",
+			SourceSequence:  &seq,
+			SourceSubject:   "aegisedge.v1.telemetry." + nodeID,
+			NodeID:          nodeID,
+			BatchID:         batchID,
+			Payload:         fmt.Appendf(nil, `{"node":"%s","batch":"%s"}`, nodeID, batchID),
+			FailureCategory: CategoryDeliveryExhausted,
+			FailureReason:   "concurrency race verification",
+			DeliveryCount:   5,
+		}
+
+		var (
+			ingestErr     error
+			quarantineErr error
+			wg            sync.WaitGroup
+			startGate     = make(chan struct{})
+		)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-startGate
+			_, ingestErr = store.RecordBatch(ctx, batch, time.Now().UTC())
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-startGate
+			_, quarantineErr = store.RecordQuarantine(ctx, rec)
+		}()
+
+		close(startGate)
+		wg.Wait()
+
+		// Assert: Both cannot both succeed!
+		if ingestErr == nil && quarantineErr == nil {
+			t.Fatalf("iteration %d: both ingestion and quarantine succeeded for batch (%s, %s); contradictory state permitted!",
+				i, nodeID, batchID)
+		}
+
+		// Verify either ingestion succeeded OR quarantine succeeded
+		if ingestErr != nil && quarantineErr != nil {
+			t.Fatalf("iteration %d: both failed unexpectedly: ingestErr=%v, quarantineErr=%v", i, ingestErr, quarantineErr)
+		}
+
+		if ingestErr == nil {
+			if !errors.Is(quarantineErr, ErrAlreadyIngested) {
+				t.Fatalf("iteration %d: ingestion succeeded but quarantine failed with non-ErrAlreadyIngested: %v", i, quarantineErr)
+			}
+		} else {
+			if !errors.Is(ingestErr, ErrStatusConflict) {
+				t.Fatalf("iteration %d: quarantine succeeded but ingestion failed with non-ErrStatusConflict: %v", i, ingestErr)
+			}
+		}
+
+		// Verify database state has strictly one terminal representation
+		hasBatch, err := store.HasBatch(ctx, nodeID, batchID)
+		if err != nil {
+			t.Fatalf("HasBatch failed: %v", err)
+		}
+		qRecords, err := store.ListQuarantineRecords(ctx, QuarantineFilter{NodeID: nodeID})
+		if err != nil {
+			t.Fatalf("ListQuarantineRecords failed: %v", err)
+		}
+
+		if hasBatch && len(qRecords) > 0 {
+			t.Fatalf("iteration %d: contradictory database state! Batch (%s, %s) exists in BOTH cp_ingested_batches AND cp_telemetry_quarantine",
+				i, nodeID, batchID)
+		}
+		if !hasBatch && len(qRecords) == 0 {
+			t.Fatalf("iteration %d: batch (%s, %s) was lost from both tables!", i, nodeID, batchID)
+		}
+	}
+}
+
+func TestQuarantine_ConcurrentSeparateStoreInstances_CannotBothSucceed(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "separate_instances_race.db")
+
+	store1, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite 1 failed: %v", err)
+	}
+	defer store1.Close()
+
+	store2, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite 2 failed: %v", err)
+	}
+	defer store2.Close()
+
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		nodeID := fmt.Sprintf("node-multi-%d", i)
+		batchID := fmt.Sprintf("batch-multi-%d", i)
+
+		batch := &types.TelemetryBatch{
+			NodeID:         nodeID,
+			BatchID:        batchID,
+			SequenceNumber: int64(i + 1),
+			CollectedAt:    time.Now().UTC(),
+			Metrics: []types.MetricSample{
+				{Name: "cpu_usage", Value: float64(i * 2), Timestamp: time.Now().UTC()},
+			},
+		}
+
+		seq := uint64(i + 500)
+		rec := &QuarantineRecord{
+			SourceStream:    "AEGISEDGE_TELEMETRY",
+			SourceSequence:  &seq,
+			SourceSubject:   "aegisedge.v1.telemetry." + nodeID,
+			NodeID:          nodeID,
+			BatchID:         batchID,
+			Payload:         fmt.Appendf(nil, `{"node":"%s","batch":"%s"}`, nodeID, batchID),
+			FailureCategory: CategoryDeliveryExhausted,
+			FailureReason:   "separate store instance race verification",
+			DeliveryCount:   5,
+		}
+
+		var (
+			ingestErr     error
+			quarantineErr error
+			wg            sync.WaitGroup
+			startGate     = make(chan struct{})
+		)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-startGate
+			_, ingestErr = store1.RecordBatch(ctx, batch, time.Now().UTC())
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-startGate
+			_, quarantineErr = store2.RecordQuarantine(ctx, rec)
+		}()
+
+		close(startGate)
+		wg.Wait()
+
+		// Assert: Both CANNOT both succeed!
+		if ingestErr == nil && quarantineErr == nil {
+			t.Fatalf("iteration %d: both store1 ingestion and store2 quarantine succeeded for batch (%s, %s); contradictory state permitted!",
+				i, nodeID, batchID)
+		}
+
+		// Verify database state has strictly one terminal representation (or retryable lock error)
+		hasBatch, err := store1.HasBatch(ctx, nodeID, batchID)
+		if err != nil {
+			t.Fatalf("HasBatch failed: %v", err)
+		}
+		qRecords, err := store1.ListQuarantineRecords(ctx, QuarantineFilter{NodeID: nodeID})
+		if err != nil {
+			t.Fatalf("ListQuarantineRecords failed: %v", err)
+		}
+
+		if hasBatch && len(qRecords) > 0 {
+			t.Fatalf("iteration %d: contradictory database state across separate store instances! Batch exists in BOTH cp_ingested_batches AND cp_telemetry_quarantine", i)
+		}
+		if ingestErr == nil && !hasBatch {
+			t.Fatalf("iteration %d: ingestErr was nil but batch was not found in cp_ingested_batches", i)
+		}
+		if quarantineErr == nil && len(qRecords) == 0 {
+			t.Fatalf("iteration %d: quarantineErr was nil but record was not found in cp_telemetry_quarantine", i)
+		}
+	}
+}
+
+func TestQuarantine_RepeatedQuarantineRemainsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	seq := uint64(50)
+	nodeID := "node-idempotent"
+	batchID := "batch-idempotent"
+	payload := []byte(`{"event":"test"}`)
+
+	rec1 := &QuarantineRecord{
+		SourceStream:    "AEGISEDGE_TELEMETRY",
+		SourceSequence:  &seq,
+		SourceSubject:   "aegisedge.v1.telemetry." + nodeID,
+		NodeID:          nodeID,
+		BatchID:         batchID,
+		Payload:         payload,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "initial exhaustion attempt",
+		DeliveryCount:   5,
+	}
+
+	saved1, err := store.RecordQuarantine(ctx, rec1)
+	if err != nil {
+		t.Fatalf("first RecordQuarantine failed: %v", err)
+	}
+	if saved1.Attempts != 1 {
+		t.Errorf("expected Attempts=1, got %d", saved1.Attempts)
+	}
+
+	rec2 := &QuarantineRecord{
+		SourceStream:    "AEGISEDGE_TELEMETRY",
+		SourceSequence:  &seq,
+		SourceSubject:   "aegisedge.v1.telemetry." + nodeID,
+		NodeID:          nodeID,
+		BatchID:         batchID,
+		Payload:         payload,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "repeated advisory reconciliation",
+		DeliveryCount:   5,
+	}
+
+	saved2, err := store.RecordQuarantine(ctx, rec2)
+	if err != nil {
+		t.Fatalf("second RecordQuarantine failed: %v", err)
+	}
+	if saved2.ID != saved1.ID {
+		t.Errorf("expected same ID across idempotent quarantine calls, got %s vs %s", saved1.ID, saved2.ID)
+	}
+	if saved2.Attempts != 2 {
+		t.Errorf("expected Attempts=2 on duplicate quarantine, got %d", saved2.Attempts)
+	}
+}
+
+func TestQuarantine_UnexpectedDBErrorNotMistakenForAlreadyIngested(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+
+	// Close store to trigger an unexpected database closed error
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	rec := &QuarantineRecord{
+		NodeID:          "node-err",
+		BatchID:         "batch-err",
+		Payload:         []byte(`{}`),
+		FailureCategory: CategoryDeserialization,
+		FailureReason:   "syntax error",
+	}
+
+	_, err = store.RecordQuarantine(ctx, rec)
+	if err == nil {
+		t.Fatal("expected RecordQuarantine on closed store to fail")
+	}
+	if errors.Is(err, ErrAlreadyIngested) {
+		t.Fatalf("unexpected DB error was mistakenly identified as ErrAlreadyIngested: %v", err)
+	}
 }
