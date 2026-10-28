@@ -23,7 +23,7 @@ import (
 // Consumer errors.
 var (
 	ErrConsumerClosed  = errors.New("consumer is closed")
-	ErrAlreadyIngested = errors.New("telemetry batch already durably ingested; skipping quarantine")
+	ErrAlreadyIngested = storage.ErrAlreadyIngested
 	ErrNotEligible     = errors.New("message is valid and has not reached delivery exhaustion; skipping quarantine")
 )
 
@@ -436,7 +436,7 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 				FilterSubject: advConsFilter,
 				DeliverPolicy: jetstream.DeliverAllPolicy,
 				MaxDeliver:    -1, // Resilient unlimited redelivery
-				AckWait:       30 * time.Second,
+				AckWait:       cfg.AckWait,
 			})
 			if err != nil {
 				nc.Close()
@@ -566,8 +566,6 @@ func (c *TelemetryConsumer) consumeLoop() {
 		}
 	}
 }
-
-
 
 // termMessage terminates a permanently poisoned message to prevent infinite redelivery loops.
 // Uses TermWithReason if supported, falling back to Term.
@@ -752,6 +750,9 @@ func (c *TelemetryConsumer) handleAdvisoryData(data []byte, ackMsg jetstream.Msg
 		c.logger.Info("advisory stream message already committed to storage; skipping quarantine",
 			slog.Uint64("stream_seq", seq),
 		)
+		c.recoveryMu.Lock()
+		delete(c.pendingExhausted, seq)
+		c.recoveryMu.Unlock()
 		if ackMsg != nil {
 			_ = ackMsg.Ack()
 		}
@@ -985,10 +986,12 @@ func (c *TelemetryConsumer) processPendingRecoveryPass() {
 		}
 
 		if c.quarantineStore != nil {
-			_, qErr := c.quarantineStore.RecordQuarantine(c.ctx, rec)
+			saved, qErr := c.quarantineStore.RecordQuarantine(c.ctx, rec)
 			if qErr == nil {
-				c.quarantinedTotal.Add(1)
-				c.recoveredTotal.Add(1)
+				if saved == nil || saved.Attempts == 1 {
+					c.quarantinedTotal.Add(1)
+					c.recoveredTotal.Add(1)
+				}
 				c.recoveryMu.Lock()
 				delete(c.pendingExhausted, item.streamSeq)
 				c.recoveryMu.Unlock()
@@ -996,6 +999,17 @@ func (c *TelemetryConsumer) processPendingRecoveryPass() {
 					slog.Uint64("stream_seq", item.streamSeq),
 					slog.String("subject", subject),
 				)
+				continue
+			}
+
+			if errors.Is(qErr, ErrAlreadyIngested) {
+				c.logger.Info("exhausted message already durably ingested; clearing recovery obligation",
+					slog.Uint64("stream_seq", item.streamSeq),
+					slog.String("subject", subject),
+				)
+				c.recoveryMu.Lock()
+				delete(c.pendingExhausted, item.streamSeq)
+				c.recoveryMu.Unlock()
 				continue
 			}
 
@@ -1099,6 +1113,16 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 		if err == nil {
 			c.quarantinedTotal.Add(1)
 			termMessage(msg, reason)
+			return
+		}
+
+		if errors.Is(err, ErrAlreadyIngested) {
+			c.logger.Info("telemetry event already durably ingested; acknowledging",
+				slog.String("node_id", nodeID),
+				slog.String("batch_id", batchID),
+			)
+			_ = msg.Ack()
+			c.consumed.Add(1)
 			return
 		}
 
@@ -1226,6 +1250,16 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 					slog.Any("error", err),
 				)
 				_ = msg.Nak()
+				return
+			}
+
+			if errors.Is(qErr, ErrAlreadyIngested) {
+				c.logger.Info("telemetry event already durably ingested; acknowledging",
+					slog.String("event_id", event.EventID),
+					slog.String("batch_id", event.Payload.BatchID),
+				)
+				_ = msg.Ack()
+				c.consumed.Add(1)
 				return
 			}
 
@@ -1459,8 +1493,10 @@ func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint6
 	if err != nil {
 		return nil, err
 	}
-	c.quarantinedTotal.Add(1)
-	c.recoveredTotal.Add(1)
+	if saved == nil || saved.Attempts == 1 {
+		c.quarantinedTotal.Add(1)
+		c.recoveredTotal.Add(1)
+	}
 	c.recoveryMu.Lock()
 	delete(c.pendingExhausted, seq)
 	c.recoveryMu.Unlock()
