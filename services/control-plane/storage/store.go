@@ -27,6 +27,7 @@ var (
 
 	// Quarantine storage errors.
 	ErrQuarantineNotFound      = errors.New("quarantine record not found")
+	ErrAlreadyIngested         = errors.New("telemetry batch already durably ingested; skipping quarantine")
 	ErrInvalidQuarantineRecord = errors.New("invalid quarantine record")
 	ErrInvalidStatusTransition = errors.New("invalid quarantine status transition")
 	ErrStatusConflict          = errors.New("quarantine status conflict")
