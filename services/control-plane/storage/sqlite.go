@@ -217,6 +217,9 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_node_time
 		ON cp_telemetry_quarantine(node_id, last_quarantined_at DESC, id ASC);
 
+	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_node_batch
+		ON cp_telemetry_quarantine(node_id, batch_id);
+
 	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_time
 		ON cp_telemetry_quarantine(last_quarantined_at DESC, id ASC);
 	`
@@ -348,6 +351,24 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 		return false, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback() // Safe: no-op if tx.Commit() succeeds
+
+	// Step 0: Check if this batch is currently in active quarantine.
+	// A batch with an active quarantine status cannot be ingested simultaneously.
+	if batch.NodeID != "" && batch.BatchID != "" {
+		var quarantinedCount int
+		chkQErr := tx.QueryRowContext(ctx, `
+			SELECT COUNT(1) FROM cp_telemetry_quarantine
+			WHERE node_id = ? AND batch_id = ? AND status = 'quarantined';
+		`, batch.NodeID, batch.BatchID).Scan(&quarantinedCount)
+		if chkQErr != nil {
+			_ = tx.Rollback()
+			return false, fmt.Errorf("failed to check quarantine status in batch ingestion: %w", chkQErr)
+		}
+		if quarantinedCount > 0 {
+			_ = tx.Rollback()
+			return false, ErrStatusConflict
+		}
+	}
 
 	collectedAtStr := formatTimestamp(batch.CollectedAt)
 	ingestedAtStr := formatTimestamp(ingestedAt)
@@ -1448,6 +1469,26 @@ func (s *SQLiteStore) RecordQuarantine(ctx context.Context, record *QuarantineRe
 		return nil, fmt.Errorf("failed to begin quarantine transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Check whether this batch has already been durably ingested.
+	// A batch committed to cp_ingested_batches must never be quarantined,
+	// preventing contradictory durable state between ingestion and quarantine.
+	// Preserves legitimate deduplication and quarantine for records without node/batch identifiers.
+	if rec.NodeID != "" && rec.BatchID != "" {
+		var ingestedCount int
+		chkErr := tx.QueryRowContext(ctx, `
+			SELECT COUNT(1) FROM cp_ingested_batches
+			WHERE node_id = ? AND batch_id = ?;
+		`, rec.NodeID, rec.BatchID).Scan(&ingestedCount)
+		if chkErr != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("failed to check batch ingestion status in quarantine transaction: %w", chkErr)
+		}
+		if ingestedCount > 0 {
+			_ = tx.Rollback()
+			return nil, ErrAlreadyIngested
+		}
+	}
 
 	queryExist := `
 	SELECT id, source_stream, source_sequence, source_subject, node_id, batch_id,
