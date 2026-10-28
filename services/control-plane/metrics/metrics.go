@@ -234,7 +234,7 @@ func NewMetrics() *Metrics {
 
 	m.natsAdvisoryEvictions = NewFuncCounter(
 		MetricNATSAdvisoryEvictionsTotal,
-		"Total number of advisory stream messages detected evicted under capacity limits.",
+		"Total number of advisory stream sequences pruned under the DiscardOld retention policy.",
 		func() float64 {
 			m.mu.RLock()
 			fn := m.natsAdvisoryEvictionsSource
