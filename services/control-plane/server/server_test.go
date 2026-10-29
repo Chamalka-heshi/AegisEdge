@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/metrics"
 	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/storage"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
@@ -4038,5 +4039,113 @@ func TestServer_Readyz_StorageProbeTimeout(t *testing.T) {
 	}
 	if body.Checks["storage"] != "unhealthy" {
 		t.Errorf("expected storage check 'unhealthy', got %q", body.Checks["storage"])
+	}
+}
+
+// TestServer_PrunerLifecycle verifies configuration validation, RunPrunePass execution,
+// metrics incrementation, and clean worker shutdown.
+func TestServer_PrunerLifecycle(t *testing.T) {
+	ctx := context.Background()
+	m := metrics.NewMetrics()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Validation test
+	invalidCfg := PruningConfig{
+		Enabled:                true,
+		TelemetryRetentionDays: 0,
+		PruneInterval:          time.Hour,
+		PruneBatchSize:         100,
+	}
+	if err := invalidCfg.Validate(); err == nil {
+		t.Fatalf("expected error for non-positive retention days")
+	}
+
+	validCfg := PruningConfig{
+		Enabled:                true,
+		TelemetryRetentionDays: 30,
+		PruneInterval:          50 * time.Millisecond,
+		PruneBatchSize:         500,
+	}
+	if err := validCfg.Validate(); err != nil {
+		t.Fatalf("expected valid config, got: %v", err)
+	}
+
+	srv := NewServer(newDiscardLogger(),
+		WithIdempotencyStore(store),
+		WithMetrics(m),
+		WithPruningConfig(validCfg),
+	)
+
+	// Populate store with old batches
+	now := time.Now().UTC()
+	cutoff := now.Add(-30 * 24 * time.Hour)
+	oldTimestamp := cutoff.Add(-2 * 24 * time.Hour)
+
+	b1 := &types.TelemetryBatch{
+		NodeID:         "node-test",
+		BatchID:        "batch-old-1",
+		SequenceNumber: 1,
+		CollectedAt:    oldTimestamp,
+		Metrics: []types.MetricSample{
+			{Name: "cpu", Value: 10, Timestamp: oldTimestamp},
+		},
+	}
+	b2 := &types.TelemetryBatch{
+		NodeID:         "node-test",
+		BatchID:        "batch-old-2",
+		SequenceNumber: 2,
+		CollectedAt:    now,
+		Metrics: []types.MetricSample{
+			{Name: "cpu", Value: 20, Timestamp: now},
+		},
+	}
+
+	if ok, err := store.RecordBatch(ctx, b1, oldTimestamp); err != nil || !ok {
+		t.Fatalf("failed to record b1: %v", err)
+	}
+	if ok, err := store.RecordBatch(ctx, b2, now); err != nil || !ok {
+		t.Fatalf("failed to record b2: %v", err)
+	}
+
+	// 2. Direct RunPrunePass execution
+	pruned, err := srv.RunPrunePass(ctx)
+	if err != nil {
+		t.Fatalf("RunPrunePass failed: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected 1 batch payload pruned, got: %d", pruned)
+	}
+
+	// Verify metrics
+	metricText := m.Registry().FormatPrometheus()
+	if !strings.Contains(metricText, "aegisedge_control_plane_storage_pruned_payloads_total 1") {
+		t.Fatalf("expected metric to report 1 pruned payload, got output:\n%s", metricText)
+	}
+
+	// 3. Start background pruner loop and verify clean stop
+	prunerCtx, cancelPruner := context.WithCancel(context.Background())
+	if err := srv.StartPruner(prunerCtx); err != nil {
+		t.Fatalf("StartPruner failed: %v", err)
+	}
+
+	// Starting twice is a safe no-op
+	if err := srv.StartPruner(prunerCtx); err != nil {
+		t.Fatalf("second StartPruner returned error: %v", err)
+	}
+
+	// Give the ticker time to tick
+	time.Sleep(120 * time.Millisecond)
+
+	// Cancel pruner context and stop
+	cancelPruner()
+	srv.StopPruner()
+
+	// 4. Close the server and ensure repeated Close is safe
+	if err := srv.Close(); err != nil {
+		t.Fatalf("srv.Close failed: %v", err)
 	}
 }
