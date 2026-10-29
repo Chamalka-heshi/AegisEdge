@@ -170,6 +170,59 @@ func WithMaxHistory(maxHistory int) ServerOption {
 // DefaultStorageProbeTimeout is the default maximum duration for the storage readiness probe.
 const DefaultStorageProbeTimeout = 2 * time.Second
 
+// Storage Retention & Pruning defaults
+const (
+	DefaultTelemetryRetentionDays = 30
+	DefaultPruneInterval          = 1 * time.Hour
+	DefaultPruneBatchSize         = 500
+)
+
+// PruningConfig defines parameters for automated control-plane storage retention pruning.
+type PruningConfig struct {
+	Enabled                bool
+	TelemetryRetentionDays int
+	PruneInterval          time.Duration
+	PruneBatchSize         int
+}
+
+// DefaultPruningConfig returns the canonical production pruning configuration.
+func DefaultPruningConfig() PruningConfig {
+	return PruningConfig{
+		Enabled:                false, // opt-in via configuration or flag
+		TelemetryRetentionDays: DefaultTelemetryRetentionDays,
+		PruneInterval:          DefaultPruneInterval,
+		PruneBatchSize:         DefaultPruneBatchSize,
+	}
+}
+
+// Validate checks PruningConfig invariants.
+func (c PruningConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.TelemetryRetentionDays <= 0 {
+		return fmt.Errorf("telemetry retention days must be greater than zero, got %d", c.TelemetryRetentionDays)
+	}
+	if c.PruneInterval <= 0 {
+		return fmt.Errorf("prune interval must be greater than zero, got %v", c.PruneInterval)
+	}
+	if c.PruneBatchSize <= 0 {
+		return fmt.Errorf("prune batch size must be greater than zero, got %d", c.PruneBatchSize)
+	}
+	return nil
+}
+
+// WithPruningConfig configures telemetry payload retention and background pruning.
+func WithPruningConfig(cfg PruningConfig) ServerOption {
+	return func(s *Server) error {
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+		s.pruneConfig = cfg
+		return nil
+	}
+}
+
 // WithStorageProbeTimeout configures the maximum duration for storage readiness probes.
 func WithStorageProbeTimeout(d time.Duration) ServerOption {
 	return func(s *Server) error {
@@ -226,6 +279,10 @@ type Server struct {
 	storageProbeTimeout time.Duration
 	shuttingDown        atomic.Bool
 	metrics             *metrics.Metrics
+	pruneConfig         PruningConfig
+	pruneCancel         context.CancelFunc
+	pruneWg             sync.WaitGroup
+	pruneStarted        atomic.Bool
 }
 
 // nodeLock tracks active and pending operations for a specific node ID.
@@ -381,11 +438,106 @@ func (s *Server) InitError() error {
 	return s.initErr
 }
 
+// StartPruner starts the background retention pruning worker if pruning is enabled.
+// It is safe to call multiple times; the background loop will start only once.
+func (s *Server) StartPruner(parentCtx context.Context) error {
+	if !s.pruneConfig.Enabled {
+		return nil
+	}
+	if !s.pruneStarted.CompareAndSwap(false, true) {
+		return nil // already started
+	}
+
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
+	ctx, cancel := context.WithCancel(parentCtx)
+	s.pruneCancel = cancel
+
+	s.logger.Info("starting control-plane storage retention pruner",
+		slog.Int("retention_days", s.pruneConfig.TelemetryRetentionDays),
+		slog.Duration("interval", s.pruneConfig.PruneInterval),
+		slog.Int("batch_size", s.pruneConfig.PruneBatchSize),
+	)
+
+	s.pruneWg.Add(1)
+	go s.pruneLoop(ctx)
+
+	return nil
+}
+
+// StopPruner gracefully stops the background pruning worker and waits for any in-flight pass to complete.
+func (s *Server) StopPruner() {
+	if s.pruneCancel != nil {
+		s.pruneCancel()
+	}
+	s.pruneWg.Wait()
+}
+
+// pruneLoop executes the background periodic pruning ticks.
+func (s *Server) pruneLoop(ctx context.Context) {
+	defer s.pruneWg.Done()
+
+	ticker := time.NewTicker(s.pruneConfig.PruneInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("storage retention pruner stopped cleanly")
+			return
+		case <-ticker.C:
+			s.RunPrunePass(ctx)
+		}
+	}
+}
+
+// RunPrunePass executes a single bounded retention pruning pass.
+// A pass failure is logged and recorded to metrics without crashing the server or halting ingestion.
+func (s *Server) RunPrunePass(ctx context.Context) (int64, error) {
+	if s.store == nil || s.IsShuttingDown() {
+		return 0, nil
+	}
+
+	retentionDuration := time.Duration(s.pruneConfig.TelemetryRetentionDays) * 24 * time.Hour
+	cutoff := time.Now().UTC().Add(-retentionDuration)
+
+	pruned, err := s.store.PruneTelemetryPayloads(ctx, cutoff, s.pruneConfig.PruneBatchSize)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, storage.ErrStoreClosed) {
+			return 0, err
+		}
+		s.logger.Warn("storage retention pruning pass failed",
+			slog.Any("error", err),
+			slog.Time("cutoff", cutoff),
+		)
+		if s.metrics != nil {
+			s.metrics.RecordStoragePruneFailure()
+		}
+		return 0, err
+	}
+
+	if pruned > 0 {
+		s.logger.Info("pruned historical telemetry payloads from durable storage",
+			slog.Int64("pruned_payloads", pruned),
+			slog.Time("cutoff", cutoff),
+			slog.Int("limit", s.pruneConfig.PruneBatchSize),
+		)
+		if s.metrics != nil {
+			s.metrics.RecordStoragePrunedPayloads(pruned)
+		}
+	}
+
+	return pruned, nil
+}
+
 // Close gracefully closes the server's underlying persistent storage.
 // It invokes MarkShuttingDown() before closing storage so readiness endpoints (/readyz)
 // immediately transition to not-ready during programmatic shutdown.
 func (s *Server) Close() error {
 	s.MarkShuttingDown()
+	s.StopPruner()
 	if s.store != nil {
 		return s.store.Close()
 	}
