@@ -615,6 +615,72 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	return count, nil
 }
 
+// PruneTelemetryPayloads transactionally removes historical telemetry payloads older than cutoff,
+// up to limit rows.
+//
+// Invariants enforced:
+// 1. cp_ingested_batches metadata rows are strictly retained for permanent deduplication / idempotency.
+// 2. Batches currently in active quarantine ('quarantined') are never pruned to preserve diagnostic evidence.
+// 3. Batches that are the highest known sequence_number for an active registered node are preserved.
+// 4. Bounded: deletes at most limit records per pass.
+// 5. Returns (prunedCount, nil) on success.
+func (s *SQLiteStore) PruneTelemetryPayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, errors.New("cutoff timestamp cannot be zero")
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return 0, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 500
+	}
+
+	cutoffStr := formatTimestamp(cutoff)
+
+	// Step 1: Execute transactional deletion of eligible payloads.
+	// Only delete from cp_telemetry_payloads where:
+	// - ingested_at < cutoff
+	// - (node_id, batch_id) is NOT actively quarantined in cp_telemetry_quarantine
+	// - sequence_number < MAX(sequence_number) for that node (keep at least the newest batch)
+	query := `
+	DELETE FROM cp_telemetry_payloads
+	WHERE (node_id, batch_id) IN (
+		SELECT p.node_id, p.batch_id
+		FROM cp_telemetry_payloads p
+		WHERE p.ingested_at < ?
+		  AND NOT EXISTS (
+			  SELECT 1 FROM cp_telemetry_quarantine q
+			  WHERE q.node_id = p.node_id
+			    AND q.batch_id = p.batch_id
+			    AND q.status = 'quarantined'
+		  )
+		  AND p.sequence_number < (
+			  SELECT MAX(m.sequence_number)
+			  FROM cp_telemetry_payloads m
+			  WHERE m.node_id = p.node_id
+		  )
+		ORDER BY p.ingested_at ASC, p.rowid ASC
+		LIMIT ?
+	);`
+
+	res, err := s.db.ExecContext(ctx, query, cutoffStr, limit)
+	if err != nil {
+		return 0, fmt.Errorf("pruning telemetry payloads failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("getting pruned rows affected failed: %w", err)
+	}
+
+	return rowsAffected, nil
+}
+
 // Ping verifies that the SQLite database connection is open and responsive.
 // It executes a lightweight SELECT 1 probe against the database.
 // Note: Ping checks basic database responsiveness only; it does not guarantee
