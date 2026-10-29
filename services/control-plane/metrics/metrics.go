@@ -22,6 +22,8 @@ const (
 	MetricNATSQuarantinedTotal               = "aegisedge_control_plane_nats_quarantined_total"
 	MetricNATSRecoveredTotal                 = "aegisedge_control_plane_nats_recovered_total"
 	MetricNATSStalledUnacknowledgedSequences = "aegisedge_control_plane_nats_stalled_unacknowledged_sequences"
+	MetricStoragePrunedPayloadsTotal         = "aegisedge_control_plane_storage_pruned_payloads_total"
+	MetricStoragePruneFailuresTotal          = "aegisedge_control_plane_storage_prune_failures_total"
 )
 
 // Bounded label values and allowlists.
@@ -72,6 +74,8 @@ type Metrics struct {
 	natsQuarantined                    *FuncCounter
 	natsRecovered                      *FuncCounter
 	natsStalledUnacknowledgedSequences *FuncGauge
+	storagePrunedPayloads              *SingleCounter
+	storagePruneFailures               *SingleCounter
 
 	mu                                      sync.RWMutex
 	natsExhaustedSource                     func() float64
@@ -295,6 +299,18 @@ func NewMetrics() *Metrics {
 	)
 	_ = r.Register(m.natsStalledUnacknowledgedSequences)
 
+	m.storagePrunedPayloads = NewSingleCounter(
+		MetricStoragePrunedPayloadsTotal,
+		"Total number of historical telemetry payloads successfully pruned from durable storage.",
+	)
+	_ = r.Register(m.storagePrunedPayloads)
+
+	m.storagePruneFailures = NewSingleCounter(
+		MetricStoragePruneFailuresTotal,
+		"Total number of storage telemetry pruning cycle failures.",
+	)
+	_ = r.Register(m.storagePruneFailures)
+
 	return m
 }
 
@@ -341,6 +357,22 @@ func (m *Metrics) RecordStorageProbeFailure() {
 		return
 	}
 	m.storageProbeFailures.Inc()
+}
+
+// RecordStoragePrunedPayloads increments the pruned payloads counter by count.
+func (m *Metrics) RecordStoragePrunedPayloads(count int64) {
+	if m == nil || count <= 0 {
+		return
+	}
+	m.storagePrunedPayloads.Add(float64(count))
+}
+
+// RecordStoragePruneFailure increments the storage prune failure counter.
+func (m *Metrics) RecordStoragePruneFailure() {
+	if m == nil {
+		return
+	}
+	m.storagePruneFailures.Inc()
 }
 
 // SanitizeAuthReason maps an arbitrary auth error string to the bounded allowlist.
