@@ -1949,3 +1949,196 @@ func TestSQLiteStore_Ping_RepeatedAndConcurrent(t *testing.T) {
 		t.Errorf("expected ErrStoreClosed on closed concurrent ping, got: %v", err)
 	}
 }
+
+// TestSQLiteStore_PruneTelemetryPayloads_Comprehensive verifies bounded retention, foreign-key safety,
+// and permanent deduplication preservation.
+func TestSQLiteStore_PruneTelemetryPayloads_Comprehensive(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	cutoff := now.Add(-30 * 24 * time.Hour) // cutoff is 30 days ago: Sept 20
+
+	// 1. Empty database: zero records pruned
+	pruned, err := store.PruneTelemetryPayloads(ctx, cutoff, 100)
+	if err != nil {
+		t.Fatalf("expected nil error on empty prune, got: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("expected 0 pruned from empty DB, got: %d", pruned)
+	}
+
+	// Helper to ingest batches at specific timestamps
+	ingestAt := func(nodeID, batchID string, seq int64, tstamp time.Time) {
+		b := sampleBatch(nodeID, batchID, seq)
+		b.CollectedAt = tstamp
+		ok, err := store.RecordBatch(ctx, b, tstamp)
+		if err != nil || !ok {
+			t.Fatalf("failed to record batch %s: ok=%v err=%v", batchID, ok, err)
+		}
+	}
+
+	// Node 1:
+	// b1: 40 days old (seq 1) -> ELIGIBLE
+	// b2: 35 days old (seq 2) -> ELIGIBLE
+	// b3: 10 days old (seq 3) -> NEWER THAN CUTOFF (NOT ELIGIBLE)
+	// b4: 5 days old (seq 4) -> NEWEST SEQ (NOT ELIGIBLE)
+	ingestAt("node-1", "b1", 1, cutoff.Add(-10*24*time.Hour))
+	ingestAt("node-1", "b2", 2, cutoff.Add(-5*24*time.Hour))
+	ingestAt("node-1", "b3", 3, cutoff.Add(20*24*time.Hour))
+	ingestAt("node-1", "b4", 4, cutoff.Add(25*24*time.Hour))
+
+	// Node 2 (Only 1 batch, 40 days old -> newest seq for node-2, MUST BE PRESERVED)
+	ingestAt("node-2", "b-solo", 1, cutoff.Add(-10*24*time.Hour))
+
+	// Node 3:
+	// b-q1: 40 days old (seq 1), but ACTIVELY QUARANTINED in cp_telemetry_quarantine -> MUST BE PRESERVED
+	// b-q2: 40 days old (seq 2) -> ELIGIBLE
+	// b-q3: 5 days old (seq 3) -> newest seq
+	// First insert active quarantine record for (node-3, b-q1) BEFORE ingestion to simulate quarantine
+	_, qErr := store.RecordQuarantine(ctx, &QuarantineRecord{
+		ID:                 "qrec-node3-bq1",
+		DeduplicationKey:   DeriveDeduplicationKey("", nil, "node-3", "b-q1", "telemetry", []byte("payload")),
+		NodeID:             "node-3",
+		BatchID:            "b-q1",
+		Payload:            []byte("payload"),
+		FailureCategory:    CategoryDeliveryExhausted,
+		FailureReason:      "exhausted test",
+		FirstQuarantinedAt: cutoff.Add(-10 * 24 * time.Hour),
+		LastQuarantinedAt:  cutoff.Add(-10 * 24 * time.Hour),
+		Status:             StatusQuarantined,
+		StatusUpdatedAt:    cutoff.Add(-10 * 24 * time.Hour),
+	})
+	if qErr != nil {
+		t.Fatalf("failed to record quarantine: %v", qErr)
+	}
+
+	// Directly insert b-q1 into cp_telemetry_payloads & cp_ingested_batches to test pruning exclusion
+	// when a quarantine row exists for the batch:
+	cutoffOldStr := formatTimestamp(cutoff.Add(-10 * 24 * time.Hour))
+	_, err = store.db.Exec(`
+		INSERT INTO cp_ingested_batches (node_id, batch_id, sequence_number, collected_at, ingested_at)
+		VALUES ('node-3', 'b-q1', 1, ?, ?);
+		INSERT INTO cp_telemetry_payloads (node_id, batch_id, sequence_number, collected_at, ingested_at, payload_json)
+		VALUES ('node-3', 'b-q1', 1, ?, ?, '{"node_id":"node-3","batch_id":"b-q1","sequence_number":1,"collected_at":"2026-09-10T00:00:00Z","metrics":[]}');
+	`, cutoffOldStr, cutoffOldStr, cutoffOldStr, cutoffOldStr)
+	if err != nil {
+		t.Fatalf("direct insert of quarantined batch failed: %v", err)
+	}
+
+	ingestAt("node-3", "b-q2", 2, cutoff.Add(-10*24*time.Hour))
+	ingestAt("node-3", "b-q3", 3, cutoff.Add(25*24*time.Hour))
+
+	// Total payloads initially: 8
+	// Eligible for pruning:
+	// - node-1: b1, b2 (2 items)
+	// - node-2: none (b-solo is MAX sequence)
+	// - node-3: b-q2 (1 item, b-q1 is actively quarantined, b-q3 is MAX seq and recent)
+	// Total eligible = 3 payloads: node-1/b1, node-1/b2, node-3/b-q2
+
+	// 2. Test Limit Enforcement (limit = 2)
+	pruned, err = store.PruneTelemetryPayloads(ctx, cutoff, 2)
+	if err != nil {
+		t.Fatalf("prune with limit 2 failed: %v", err)
+	}
+	if pruned != 2 {
+		t.Fatalf("expected exactly 2 payloads pruned, got: %d", pruned)
+	}
+
+	// 3. Second pass (limit = 10): prunes the remaining 1 eligible payload
+	prunedRemaining, err := store.PruneTelemetryPayloads(ctx, cutoff, 10)
+	if err != nil {
+		t.Fatalf("prune remaining failed: %v", err)
+	}
+	if prunedRemaining != 1 {
+		t.Fatalf("expected exactly 1 payload pruned in second pass, got: %d", prunedRemaining)
+	}
+
+	// 4. Repeated pass: safe and idempotent (0 pruned)
+	prunedZero, err := store.PruneTelemetryPayloads(ctx, cutoff, 10)
+	if err != nil {
+		t.Fatalf("subsequent prune failed: %v", err)
+	}
+	if prunedZero != 0 {
+		t.Fatalf("expected 0 payloads pruned on repeated pass, got: %d", prunedZero)
+	}
+
+	// 5. Verify Ingested Metadata & Idempotency Preserved
+	// All 8 batches MUST still exist in cp_ingested_batches
+	count, err := store.Count(ctx)
+	if err != nil {
+		t.Fatalf("store.Count failed: %v", err)
+	}
+	if count != 8 {
+		t.Fatalf("expected cp_ingested_batches count to remain 8, got: %d", count)
+	}
+
+	for _, id := range []string{"b1", "b2", "b3", "b4"} {
+		has, err := store.HasBatch(ctx, "node-1", id)
+		if err != nil || !has {
+			t.Fatalf("expected HasBatch to report true for node-1/%s: has=%v err=%v", id, has, err)
+		}
+	}
+
+	// Re-submitting an already-pruned batch ("node-1", "b1") MUST be detected as duplicate
+	dupBatch := sampleBatch("node-1", "b1", 1)
+	isNew, err := store.RecordBatch(ctx, dupBatch, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RecordBatch for duplicate returned error: %v", err)
+	}
+	if isNew {
+		t.Fatalf("expected isNew=false (idempotent duplicate detection), got isNew=true")
+	}
+
+	// 6. Verify GetPayload for pruned vs unpruned batches
+	// node-1/b1 was pruned -> GetPayload returns ErrBatchNotFound
+	_, err = store.GetPayload(ctx, "node-1", "b1")
+	if !errors.Is(err, ErrBatchNotFound) {
+		t.Fatalf("expected ErrBatchNotFound for pruned payload node-1/b1, got: %v", err)
+	}
+
+	// node-1/b3 was not pruned -> GetPayload succeeds
+	p3, err := store.GetPayload(ctx, "node-1", "b3")
+	if err != nil || p3 == nil {
+		t.Fatalf("expected GetPayload for unpruned node-1/b3 to succeed, got: %v", err)
+	}
+
+	// node-2/b-solo was preserved (MAX seq) -> GetPayload succeeds
+	pSolo, err := store.GetPayload(ctx, "node-2", "b-solo")
+	if err != nil || pSolo == nil {
+		t.Fatalf("expected GetPayload for max seq node-2/b-solo to succeed, got: %v", err)
+	}
+
+	// node-3/b-q1 was preserved (quarantined) -> GetPayload succeeds
+	pq1, err := store.GetPayload(ctx, "node-3", "b-q1")
+	if err != nil || pq1 == nil {
+		t.Fatalf("expected GetPayload for actively quarantined node-3/b-q1 to succeed, got: %v", err)
+	}
+
+	// 7. Error cases
+	// Zero cutoff returns error
+	_, err = store.PruneTelemetryPayloads(ctx, time.Time{}, 10)
+	if err == nil {
+		t.Fatalf("expected error for zero cutoff timestamp")
+	}
+
+	// Context canceled returns context error
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = store.PruneTelemetryPayloads(canceledCtx, cutoff, 10)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+
+	// Store closed returns ErrStoreClosed
+	closedStore, _ := OpenSQLite(":memory:")
+	_ = closedStore.Close()
+	_, err = closedStore.PruneTelemetryPayloads(ctx, cutoff, 10)
+	if !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("expected ErrStoreClosed on closed store, got: %v", err)
+	}
+}
