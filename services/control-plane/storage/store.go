@@ -193,6 +193,12 @@ type IdempotencyStore interface {
 	// Returns (true, nil) if an existing node record was updated, (false, nil) if the node is not registered.
 	UpdateNodeTelemetryActivity(ctx context.Context, nodeID string, seqNum int64, ingestedAt time.Time) (bool, error)
 
+	// PruneTelemetryPayloads transactionally removes historical telemetry payloads older than cutoff,
+	// bounded by limit. Idempotency metadata records in cp_ingested_batches and active quarantine records
+	// are strictly preserved to ensure deduplication safety and recovery auditability.
+	// Returns the number of pruned payload records.
+	PruneTelemetryPayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+
 	// Ping verifies that the underlying storage is responsive and available.
 	// Returns ErrStoreClosed if the store has been closed.
 	// Returns context errors (e.g. context.Canceled, context.DeadlineExceeded) if ctx is done.
