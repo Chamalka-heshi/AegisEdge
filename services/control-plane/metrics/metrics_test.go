@@ -293,6 +293,8 @@ func TestControlPlaneMetrics(t *testing.T) {
 		MetricNATSQuarantinedTotal,
 		MetricNATSRecoveredTotal,
 		MetricNATSStalledUnacknowledgedSequences,
+		MetricStoragePrunedPayloadsTotal,
+		MetricStoragePruneFailuresTotal,
 	}
 	for _, name := range requiredMetrics {
 		if !strings.Contains(output, name) {
