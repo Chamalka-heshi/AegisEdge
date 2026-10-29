@@ -171,32 +171,33 @@ The consumer uses explicit durability tuning parameters (configurable via `Consu
 >
 > 2. **Inspecting vs. Replaying Messages**:
 >    * **Inspection**: Operators can inspect stream contents and read specific messages using the NATS CLI without affecting consumer state.
->    * **Replay / Redrive Limitation**: **AegisEdge does not currently implement or verify automated message replay, redrive, or dead-letter queue extraction.** Reading a message with `nats msg get` is strictly a read-only operation and does **not** redeliver or replay the message to the consumer. Replaying an exhausted message requires manual operator re-publication or custom tooling outside the current control-plane scope.
+>    * **Replay / Redrive Limitation**: **AegisEdge does not currently implement or verify automated message replay, redrive, or dead-letter queue extraction.** Reading a message with `nats stream get` is strictly a read-only operation and does **not** redeliver or replay the message to the consumer. Replaying an exhausted message requires manual operator re-publication or custom tooling outside the current control-plane scope.
 
-### In-Memory Delivery Exhaustion Observability (Phase 6.28 Stage 3)
+### In-Memory Delivery Exhaustion & Stalled Sequence Observability
 
-The control-plane `TelemetryConsumer` exposes an in-process thread-safe metric counter via `consumer.ExhaustedDeliveries() int64`:
-* **Tracking**: The counter increments by 1 whenever an in-flight message delivery count reaches or exceeds `MaxDeliver` on a transient processing failure before the consumer issues its terminal `Nak()`.
-* **In-Memory Lifecycle**: This counter is strictly in-memory and resets to 0 upon process restart. It is not persisted to SQLite or JetStream metadata and does not replace production monitoring integrations (e.g., Prometheus/OpenTelemetry).
-* **Delivery Replay Limitations**: The counter reflects delivery exhaustion events recognized by the running consumer instance. If an operator recreates the durable consumer or alters stream delivery configuration, JetStream may re-deliver messages, resulting in additional lifecycle counts.
+The control-plane `TelemetryConsumer` exposes in-process thread-safe metric instruments:
+* **Exhausted Deliveries**: `consumer.ExhaustedDeliveries() int64` / Prometheus counter `aegisedge_control_plane_nats_exhausted_deliveries_total` tracks in-flight deliveries reaching `MaxDeliver` before terminal NAK.
+* **Stalled Unacknowledged Sequences**: `consumer.StalledUnacknowledgedSequences() int64` / Prometheus gauge `aegisedge_control_plane_nats_stalled_unacknowledged_sequences` tracks unacknowledged stream sequences holding the consumer AckFloor that have repeatedly returned `ErrNotEligible`.
+* **In-Memory Lifecycle**: Both instruments are strictly in-memory and process-local: they reset upon control-plane restart and do not persist to SQLite or JetStream metadata.
+* **Recovery Runbook**: For the end-to-end investigation and recovery workflow (Observe $\rightarrow$ Inspect $\rightarrow$ Decide $\rightarrow$ Recover $\rightarrow$ Verify), refer to [Telemetry Batch Quarantine and Recovery Runbook](telemetry-quarantine.md#8-control-plane-jetstream-stalled-sequence-recovery-workflow).
 
 ### Operator Diagnostic Commands
 
-When investigating poison messages, transient delivery exhaustion, or advisory alerts, operators can use the standard NATS CLI for diagnostic inspection:
+When investigating poison messages, transient delivery exhaustion, or advisory alerts, operators can use the external official NATS CLI (`nats-io/natscli`) for read-only diagnostic inspection (validate syntax against the installed CLI version):
 
 ```powershell
-# 1. View overall consumer progress, ack state, and pending redeliveries
+# 1. View overall consumer progress, ack state, and pending redeliveries (read-only)
 nats consumer report AEGISEDGE_TELEMETRY
 
-# 2. Inspect detailed consumer configuration, redelivery counts, and stream state
+# 2. Inspect detailed consumer configuration, redelivery counts, and stream state (read-only)
 nats consumer info AEGISEDGE_TELEMETRY aegisedge-control-plane-telemetry
 
 # 3. Interactively page through stored messages and metadata in the stream (read-only)
 nats stream view AEGISEDGE_TELEMETRY
 
 # 4. Read a specific raw message payload and headers by stream sequence number (read-only; does not replay)
-nats msg get AEGISEDGE_TELEMETRY <sequence_number>
+nats stream get AEGISEDGE_TELEMETRY <sequence_number>
 
-# 5. Monitor real-time broker advisory events, including MaxDeliver exhaustion alerts
+# 5. Monitor real-time broker advisory events, including MaxDeliver exhaustion alerts (read-only)
 nats event --advisory
 ```
