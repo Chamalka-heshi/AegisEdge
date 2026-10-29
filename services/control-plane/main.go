@@ -41,6 +41,12 @@ type ServerConfig struct {
 	TLSKeyFile        string
 	MaxHistoryBatches int
 	DBPath            string
+
+	// Storage Retention & Pruning
+	RetentionEnabled       bool
+	TelemetryRetentionDays int
+	PruneInterval          time.Duration
+	PruneBatchSize         int
 }
 
 // BuildServerConfig constructs and validates ServerConfig and AuthConfig from CLI flags and environment variables.
@@ -106,6 +112,45 @@ func BuildServerConfig(flags ServerConfig, isProduction bool) (ServerConfig, ser
 		cfg.DBPath = DefaultDBPath
 	}
 
+	// Retention configuration defaults and environment overrides
+	if !cfg.RetentionEnabled {
+		if retStr := strings.TrimSpace(os.Getenv("STORAGE_RETENTION_ENABLED")); retStr != "" {
+			if strings.ToLower(retStr) == "true" || retStr == "1" {
+				cfg.RetentionEnabled = true
+			}
+		}
+	}
+	if cfg.TelemetryRetentionDays <= 0 {
+		if daysStr := strings.TrimSpace(os.Getenv("STORAGE_RETENTION_DAYS")); daysStr != "" {
+			if val, err := strconv.Atoi(daysStr); err == nil && val > 0 {
+				cfg.TelemetryRetentionDays = val
+			}
+		}
+	}
+	if cfg.TelemetryRetentionDays <= 0 {
+		cfg.TelemetryRetentionDays = server.DefaultTelemetryRetentionDays
+	}
+	if cfg.PruneInterval <= 0 {
+		if intvStr := strings.TrimSpace(os.Getenv("STORAGE_PRUNE_INTERVAL")); intvStr != "" {
+			if d, err := time.ParseDuration(intvStr); err == nil && d > 0 {
+				cfg.PruneInterval = d
+			}
+		}
+	}
+	if cfg.PruneInterval <= 0 {
+		cfg.PruneInterval = server.DefaultPruneInterval
+	}
+	if cfg.PruneBatchSize <= 0 {
+		if sizeStr := strings.TrimSpace(os.Getenv("STORAGE_PRUNE_BATCH_SIZE")); sizeStr != "" {
+			if val, err := strconv.Atoi(sizeStr); err == nil && val > 0 {
+				cfg.PruneBatchSize = val
+			}
+		}
+	}
+	if cfg.PruneBatchSize <= 0 {
+		cfg.PruneBatchSize = server.DefaultPruneBatchSize
+	}
+
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	var nodeSecrets map[string]string
@@ -150,6 +195,10 @@ func main() {
 		tlsKeyFile        = flag.String("tls-key", "", "Path to TLS private key file")
 		maxHistoryBatches = flag.Int("max-history-batches", server.DefaultMaxHistoryBatches, "Maximum number of recent telemetry batch payloads retained in memory")
 		dbPath            = flag.String("db-path", DefaultDBPath, "Path to SQLite database file for durable idempotency tracking")
+		retentionEnabled  = flag.Bool("retention-enabled", false, "Enable background telemetry payload retention and pruning")
+		retentionDays     = flag.Int("retention-days", server.DefaultTelemetryRetentionDays, "Days to retain historical telemetry payloads")
+		pruneInterval     = flag.Duration("prune-interval", server.DefaultPruneInterval, "Interval between background storage pruning cycles")
+		pruneBatchSize    = flag.Int("prune-batch-size", server.DefaultPruneBatchSize, "Maximum payloads pruned per pass")
 	)
 	flag.Parse()
 
@@ -159,18 +208,22 @@ func main() {
 	}
 
 	rawFlags := ServerConfig{
-		Host:              *host,
-		Port:              *port,
-		LogLevel:          *logLevel,
-		AuthEnabled:       *authEnabled,
-		SharedSecret:      *sharedSecret,
-		NodeSecretsFile:   *nodeSecretsFile,
-		AdminToken:        *adminToken,
-		MaxClockSkew:      *maxClockSkew,
-		TLSCertFile:       *tlsCertFile,
-		TLSKeyFile:        *tlsKeyFile,
-		MaxHistoryBatches: *maxHistoryBatches,
-		DBPath:            *dbPath,
+		Host:                   *host,
+		Port:                   *port,
+		LogLevel:               *logLevel,
+		AuthEnabled:            *authEnabled,
+		SharedSecret:           *sharedSecret,
+		NodeSecretsFile:        *nodeSecretsFile,
+		AdminToken:             *adminToken,
+		MaxClockSkew:           *maxClockSkew,
+		TLSCertFile:            *tlsCertFile,
+		TLSKeyFile:             *tlsKeyFile,
+		MaxHistoryBatches:      *maxHistoryBatches,
+		DBPath:                 *dbPath,
+		RetentionEnabled:       *retentionEnabled,
+		TelemetryRetentionDays: *retentionDays,
+		PruneInterval:          *pruneInterval,
+		PruneBatchSize:         *pruneBatchSize,
 	}
 
 	// Environment posture check
@@ -217,12 +270,25 @@ func main() {
 	srvInstance := server.NewServer(logger,
 		server.WithIdempotencyStore(store),
 		server.WithMaxHistory(cfg.MaxHistoryBatches),
+		server.WithPruningConfig(server.PruningConfig{
+			Enabled:                cfg.RetentionEnabled,
+			TelemetryRetentionDays: cfg.TelemetryRetentionDays,
+			PruneInterval:          cfg.PruneInterval,
+			PruneBatchSize:         cfg.PruneBatchSize,
+		}),
 	)
 	if err := srvInstance.InitError(); err != nil {
 		logger.Error("failed to rehydrate node registry from durable storage", slog.Any("error", err))
 		os.Exit(1)
 	}
 	srvInstance.SetAuthConfig(authConfig)
+
+	// Start background storage retention pruner if enabled
+	if cfg.RetentionEnabled {
+		if err := srvInstance.StartPruner(context.Background()); err != nil {
+			logger.Error("failed to start storage retention pruner", slog.Any("error", err))
+		}
+	}
 
 	httpServer := &http.Server{
 		Addr:         listenAddr,
