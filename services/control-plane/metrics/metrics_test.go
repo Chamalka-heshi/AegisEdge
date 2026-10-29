@@ -270,6 +270,9 @@ func TestControlPlaneMetrics(t *testing.T) {
 	m.SetNATSRecoveredSource(func() float64 {
 		return 6
 	})
+	m.SetNATSStalledUnacknowledgedSequencesSource(func() float64 {
+		return 3
+	})
 
 	output := m.Registry().FormatPrometheus()
 
@@ -289,6 +292,7 @@ func TestControlPlaneMetrics(t *testing.T) {
 		MetricNATSAdvisoryEvictionsTotal,
 		MetricNATSQuarantinedTotal,
 		MetricNATSRecoveredTotal,
+		MetricNATSStalledUnacknowledgedSequences,
 	}
 	for _, name := range requiredMetrics {
 		if !strings.Contains(output, name) {
@@ -317,6 +321,7 @@ func TestControlPlaneMetrics(t *testing.T) {
 		`aegisedge_control_plane_nats_advisory_evictions_total 4`,
 		`aegisedge_control_plane_nats_quarantined_total 7`,
 		`aegisedge_control_plane_nats_recovered_total 6`,
+		`aegisedge_control_plane_nats_stalled_unacknowledged_sequences 3`,
 	}
 	for _, sub := range expectedSubstrings {
 		if !strings.Contains(output, sub) {

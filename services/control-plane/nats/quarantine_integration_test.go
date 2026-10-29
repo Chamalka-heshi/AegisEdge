@@ -1,10 +1,12 @@
 package nats
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -3281,10 +3283,11 @@ func TestConsumer_Recovery_PendingExhausted_AlreadyIngestedClearsObligation(t *t
 
 	consumerName := fmt.Sprintf("test-clear-already-ingested-%d", time.Now().UnixNano())
 	consumer, err := NewTelemetryConsumer(ConsumerConfig{
-		NATSURL:         natsURL,
-		StreamName:      streamName,
-		ConsumerName:    consumerName,
-		QuarantineStore: store,
+		NATSURL:          natsURL,
+		StreamName:       streamName,
+		ConsumerName:     consumerName,
+		QuarantineStore:  store,
+		IdempotencyStore: store,
 	}, &mockAlwaysFailingHandler{}, silentLogger())
 	if err != nil {
 		t.Fatalf("NewTelemetryConsumer failed: %v", err)
@@ -3324,5 +3327,497 @@ func TestConsumer_Recovery_PendingExhausted_AlreadyIngestedClearsObligation(t *t
 	records, err := store.ListQuarantineRecords(context.Background(), storage.QuarantineFilter{})
 	if err != nil || len(records) != 0 {
 		t.Fatalf("expected 0 quarantine records, got %d (err: %v)", len(records), err)
+	}
+}
+
+// deliverAndNak fetches messages once through the consumer and NAKs them so NumAckPending > 0
+func deliverAndNak(t *testing.T, consumer *TelemetryConsumer, count int) {
+	t.Helper()
+	msgs, err := consumer.cons.Fetch(count, jetstream.FetchMaxWait(2*time.Second))
+	if err != nil {
+		t.Fatalf("Fetch failed: %v", err)
+	}
+	for msg := range msgs.Messages() {
+		_ = msg.Nak()
+	}
+}
+
+// 39. Test scenario: Unacknowledged sequence returning ErrNotEligible is tracked and gauge updated without duplicates
+func TestConsumer_StalledUnacknowledged_TrackedAndGaugeUpdated(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_stalled_track.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	consumerName := fmt.Sprintf("test-stalled-track-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:          natsURL,
+		StreamName:       streamName,
+		ConsumerName:     consumerName,
+		QuarantineStore:  store,
+		IdempotencyStore: store,
+	}, &mockAlwaysFailingHandler{}, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	// Publish a valid telemetry event
+	batch := &types.TelemetryBatch{
+		NodeID:         "node-stalled-1",
+		BatchID:        "batch-stalled-1",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics:        []types.MetricSample{{Name: "m1", Value: 10.0, Timestamp: time.Now().UTC()}},
+	}
+	publishTestEvent(t, nc, batch)
+	deliverAndNak(t, consumer, 1)
+
+	ctx := context.Background()
+
+	// Initial scan: sequence 1 is unacknowledged, valid, not ingested, and has no exhaustion evidence
+	recovered, err := consumer.RecoverUnacknowledged(ctx)
+	if err != nil {
+		t.Fatalf("RecoverUnacknowledged failed: %v", err)
+	}
+	if recovered != 0 {
+		t.Fatalf("expected 0 recovered, got %d", recovered)
+	}
+
+	// Verify sequence 1 is tracked and gauge updated
+	if consumer.StalledUnacknowledgedSequences() != 1 {
+		t.Fatalf("expected StalledUnacknowledgedSequences=1, got %d", consumer.StalledUnacknowledgedSequences())
+	}
+	stalled := consumer.StalledSequences()
+	if len(stalled) != 1 {
+		t.Fatalf("expected 1 stalled sequence item, got %d", len(stalled))
+	}
+	if stalled[0].StreamSequence != 1 {
+		t.Errorf("expected tracked stream_seq=1, got %d", stalled[0].StreamSequence)
+	}
+
+	// Repeated scan: must not create duplicate entries
+	recovered, err = consumer.RecoverUnacknowledged(ctx)
+	if err != nil {
+		t.Fatalf("second RecoverUnacknowledged failed: %v", err)
+	}
+	if recovered != 0 {
+		t.Fatalf("expected 0 recovered on second scan, got %d", recovered)
+	}
+	if consumer.StalledUnacknowledgedSequences() != 1 {
+		t.Fatalf("expected StalledUnacknowledgedSequences to remain 1, got %d", consumer.StalledUnacknowledgedSequences())
+	}
+	stalled = consumer.StalledSequences()
+	if len(stalled) != 1 {
+		t.Fatalf("expected 1 stalled item, got %d", len(stalled))
+	}
+}
+
+// 40a. Test scenario: Resolution via operator recovery clears stalled tracking and updates gauge
+func TestConsumer_StalledUnacknowledged_ResolutionViaRecovery(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_stalled_res_rec.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	consumerName := fmt.Sprintf("test-stalled-res-rec-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:          natsURL,
+		StreamName:       streamName,
+		ConsumerName:     consumerName,
+		QuarantineStore:  store,
+		IdempotencyStore: store,
+	}, &mockAlwaysFailingHandler{}, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	batch1 := &types.TelemetryBatch{
+		NodeID:         "node-res-1",
+		BatchID:        "batch-res-1",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics:        []types.MetricSample{{Name: "m1", Value: 10.0, Timestamp: time.Now().UTC()}},
+	}
+	publishTestEvent(t, nc, batch1)
+	deliverAndNak(t, consumer, 1)
+
+	ctx := context.Background()
+	_, _ = consumer.RecoverUnacknowledged(ctx)
+	if consumer.StalledUnacknowledgedSequences() != 1 {
+		t.Fatalf("expected 1 stalled sequence, got %d", consumer.StalledUnacknowledgedSequences())
+	}
+
+	// Operator manually forces quarantine
+	saved, rErr := consumer.RecoverStreamSequence(ctx, 1, WithForceExhaustion(true))
+	if rErr != nil {
+		t.Fatalf("RecoverStreamSequence failed: %v", rErr)
+	}
+	if saved == nil {
+		t.Fatal("expected non-nil saved quarantine record")
+	}
+
+	// Stalled entry must be immediately cleared and gauge decremented to 0
+	if consumer.StalledUnacknowledgedSequences() != 0 {
+		t.Fatalf("expected StalledUnacknowledgedSequences=0 after recovery, got %d", consumer.StalledUnacknowledgedSequences())
+	}
+	if len(consumer.StalledSequences()) != 0 {
+		t.Fatalf("expected 0 stalled items after recovery, got %d", len(consumer.StalledSequences()))
+	}
+}
+
+// 40b. Test scenario: Resolution via prior batch ingestion clears stalled tracking and updates gauge
+func TestConsumer_StalledUnacknowledged_ResolutionViaIngestion(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_stalled_res_ing.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	consumerName := fmt.Sprintf("test-stalled-res-ing-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:          natsURL,
+		StreamName:       streamName,
+		ConsumerName:     consumerName,
+		QuarantineStore:  store,
+		IdempotencyStore: store,
+	}, &mockAlwaysFailingHandler{}, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	batch2 := &types.TelemetryBatch{
+		NodeID:         "node-res-2",
+		BatchID:        "batch-res-2",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics:        []types.MetricSample{{Name: "m1", Value: 20.0, Timestamp: time.Now().UTC()}},
+	}
+	publishTestEvent(t, nc, batch2)
+	deliverAndNak(t, consumer, 1)
+
+	ctx := context.Background()
+	_, _ = consumer.RecoverUnacknowledged(ctx)
+	if consumer.StalledUnacknowledgedSequences() != 1 {
+		t.Fatalf("expected 1 stalled sequence for batch2, got %d", consumer.StalledUnacknowledgedSequences())
+	}
+
+	// Batch2 is committed to ingested storage
+	if _, err := store.RecordBatch(ctx, batch2, time.Now().UTC()); err != nil {
+		t.Fatalf("RecordBatch failed: %v", err)
+	}
+
+	// Next scan observes ErrAlreadyIngested and clears tracking
+	_, _ = consumer.RecoverUnacknowledged(ctx)
+	if consumer.StalledUnacknowledgedSequences() != 0 {
+		t.Fatalf("expected StalledUnacknowledgedSequences=0 after batch2 ingestion, got %d", consumer.StalledUnacknowledgedSequences())
+	}
+	if len(consumer.StalledSequences()) != 0 {
+		t.Fatalf("expected 0 stalled items after batch2 ingestion, got %d", len(consumer.StalledSequences()))
+	}
+}
+
+// 41. Test scenario: Warning threshold and rate limiting prevent log flooding
+func TestConsumer_StalledUnacknowledged_WarningThresholdAndRateLimiting(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_stalled_warn.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	var logBuf bytes.Buffer
+	textHandler := slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	logger := slog.New(textHandler)
+
+	simulatedTime := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	clockMu := sync.Mutex{}
+	clock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return simulatedTime
+	}
+
+	consumerName := fmt.Sprintf("test-stalled-warn-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:                 natsURL,
+		StreamName:              streamName,
+		ConsumerName:            consumerName,
+		QuarantineStore:         store,
+		StalledWarningThreshold: 5 * time.Second,
+	}, &mockAlwaysFailingHandler{}, logger, WithClock(clock))
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	batch := &types.TelemetryBatch{
+		NodeID:         "node-warn-1",
+		BatchID:        "batch-warn-1",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics:        []types.MetricSample{{Name: "m1", Value: 10.0, Timestamp: time.Now().UTC()}},
+	}
+	publishTestEvent(t, nc, batch)
+	deliverAndNak(t, consumer, 1)
+
+	ctx := context.Background()
+
+	// Initial scan at elapsed=0s (< 5s threshold): no warning emitted
+	_, err = consumer.RecoverUnacknowledged(ctx)
+	if err != nil {
+		t.Fatalf("RecoverUnacknowledged failed: %v", err)
+	}
+	if logBuf.Len() > 0 {
+		t.Fatalf("expected no warning log on initial scan, got: %s", logBuf.String())
+	}
+	stalled := consumer.StalledSequences()
+	if len(stalled) != 1 || stalled[0].WarnEmitted {
+		t.Fatalf("expected 1 stalled item with WarnEmitted=false")
+	}
+
+	// Advance clock past 5s threshold
+	clockMu.Lock()
+	simulatedTime = simulatedTime.Add(6 * time.Second)
+	clockMu.Unlock()
+
+	// Second scan at elapsed=6s: warning must be emitted on state transition
+	_, err = consumer.RecoverUnacknowledged(ctx)
+	if err != nil {
+		t.Fatalf("second RecoverUnacknowledged failed: %v", err)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "unacknowledged stream sequence holding ack floor without authoritative exhaustion evidence") {
+		t.Fatalf("expected warning log message, got:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "stream_seq=1") {
+		t.Errorf("expected stream_seq=1 in log output:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "missing authoritative exhaustion evidence") {
+		t.Errorf("expected reason in log output:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "remediation=") {
+		t.Errorf("expected remediation in log output:\n%s", logOutput)
+	}
+	stalled = consumer.StalledSequences()
+	if len(stalled) != 1 || !stalled[0].WarnEmitted {
+		t.Fatalf("expected 1 stalled item with WarnEmitted=true")
+	}
+
+	// Clear log buffer
+	logBuf.Reset()
+
+	// Third scan shortly after: must NOT emit warning again (zero log flooding)
+	clockMu.Lock()
+	simulatedTime = simulatedTime.Add(1 * time.Second)
+	clockMu.Unlock()
+
+	_, err = consumer.RecoverUnacknowledged(ctx)
+	if err != nil {
+		t.Fatalf("third RecoverUnacknowledged failed: %v", err)
+	}
+	if logBuf.Len() > 0 {
+		t.Fatalf("expected zero log flooding on subsequent scan, got: %s", logBuf.String())
+	}
+}
+
+// 42. Test scenario: Stalled detection never force-quarantines, ACKs, or TERMs a valid message solely because it is stalled
+func TestConsumer_StalledUnacknowledged_SafetyInvariants_NeverSpeculativelyQuarantinedOrAcked(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_stalled_safety.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	consumerName := fmt.Sprintf("test-stalled-safety-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:          natsURL,
+		StreamName:       streamName,
+		ConsumerName:     consumerName,
+		QuarantineStore:  store,
+		IdempotencyStore: store,
+	}, &mockAlwaysFailingHandler{}, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	batch := &types.TelemetryBatch{
+		NodeID:         "node-safety-1",
+		BatchID:        "batch-safety-1",
+		SequenceNumber: 1,
+		CollectedAt:    time.Now().UTC(),
+		Metrics:        []types.MetricSample{{Name: "m1", Value: 10.0, Timestamp: time.Now().UTC()}},
+	}
+	publishTestEvent(t, nc, batch)
+	deliverAndNak(t, consumer, 1)
+
+	ctx := context.Background()
+
+	// Repeatedly scan 5 times
+	for i := 0; i < 5; i++ {
+		_, err := consumer.RecoverUnacknowledged(ctx)
+		if err != nil {
+			t.Fatalf("scan %d failed: %v", i, err)
+		}
+	}
+
+	// Verify message was NEVER quarantined
+	if consumer.Quarantined() != 0 {
+		t.Fatalf("expected 0 quarantined messages, got %d", consumer.Quarantined())
+	}
+	records, err := store.ListQuarantineRecords(ctx, storage.QuarantineFilter{})
+	if err != nil || len(records) != 0 {
+		t.Fatalf("expected 0 quarantine records in DB, got %d (err: %v)", len(records), err)
+	}
+
+	// Verify message was NOT acknowledged or terminated: it remains pending in consumer
+	info, err := consumer.Consumer().Info(ctx)
+	if err != nil {
+		t.Fatalf("Consumer.Info failed: %v", err)
+	}
+	if info.NumAckPending != 1 {
+		t.Fatalf("expected 1 message still pending acknowledgment in JetStream, got %d", info.NumAckPending)
+	}
+}
+
+// 43. Test scenario: Concurrent scans, queries, and resolutions do not race or corrupt tracking state
+func TestConsumer_StalledUnacknowledged_ConcurrentScansAndResolution_RaceSafety(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL, nats.Timeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer nc.Close()
+
+	streamName := "AEGISEDGE_TELEMETRY"
+	setupTestStream(t, nc, streamName)
+
+	dbPath := filepath.Join(t.TempDir(), "quarantine_stalled_concurrent.db")
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	consumerName := fmt.Sprintf("test-stalled-concurrent-%d", time.Now().UnixNano())
+	consumer, err := NewTelemetryConsumer(ConsumerConfig{
+		NATSURL:          natsURL,
+		StreamName:       streamName,
+		ConsumerName:     consumerName,
+		QuarantineStore:  store,
+		IdempotencyStore: store,
+	}, &mockAlwaysFailingHandler{}, silentLogger())
+	if err != nil {
+		t.Fatalf("NewTelemetryConsumer failed: %v", err)
+	}
+	defer consumer.Stop()
+
+	// Publish 3 valid batches
+	for i := 1; i <= 3; i++ {
+		batch := &types.TelemetryBatch{
+			NodeID:         fmt.Sprintf("node-conc-%d", i),
+			BatchID:        fmt.Sprintf("batch-conc-%d", i),
+			SequenceNumber: int64(i),
+			CollectedAt:    time.Now().UTC(),
+			Metrics:        []types.MetricSample{{Name: "m", Value: float64(i), Timestamp: time.Now().UTC()}},
+		}
+		publishTestEvent(t, nc, batch)
+	}
+	deliverAndNak(t, consumer, 3)
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+
+	// 10 concurrent workers performing scans, getters, and resolution
+	for w := 0; w < 10; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for iter := 0; iter < 50; iter++ {
+				switch iter % 4 {
+				case 0:
+					_, _ = consumer.RecoverUnacknowledged(ctx)
+				case 1:
+					_ = consumer.StalledUnacknowledgedSequences()
+				case 2:
+					_ = consumer.StalledSequences()
+				case 3:
+					consumer.clearStalledSequence(uint64((iter % 3) + 1))
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+
+	// Final scan to verify tracker remains usable and uncorrupted
+	_, err = consumer.RecoverUnacknowledged(ctx)
+	if err != nil {
+		t.Fatalf("final RecoverUnacknowledged failed: %v", err)
+	}
+	count := consumer.StalledUnacknowledgedSequences()
+	stalled := consumer.StalledSequences()
+	if int64(len(stalled)) != count {
+		t.Fatalf("mismatch between StalledUnacknowledgedSequences (%d) and len(StalledSequences) (%d)", count, len(stalled))
 	}
 }

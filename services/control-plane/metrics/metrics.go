@@ -7,20 +7,21 @@ import (
 
 // Metric names for control-plane operational metrics.
 const (
-	MetricIngestedBatchesTotal         = "aegisedge_control_plane_ingested_batches_total"
-	MetricStorageProbeDurationSeconds  = "aegisedge_control_plane_storage_probe_duration_seconds"
-	MetricStorageProbeFailuresTotal    = "aegisedge_control_plane_storage_probe_failures_total"
-	MetricAuthFailuresTotal            = "aegisedge_control_plane_auth_failures_total"
-	MetricNATSExhaustedDeliveriesTotal = "aegisedge_control_plane_nats_exhausted_deliveries_total"
-	MetricRegisteredNodesCount         = "aegisedge_control_plane_registered_nodes_count"
-	MetricNATSAdvisoryStreamMessages   = "aegisedge_control_plane_nats_advisory_stream_messages"
-	MetricNATSAdvisoryStreamBytes      = "aegisedge_control_plane_nats_advisory_stream_bytes"
-	MetricNATSAdvisoryPendingBacklog   = "aegisedge_control_plane_nats_advisory_pending_backlog"
-	MetricNATSAdvisoryPendingAck       = "aegisedge_control_plane_nats_advisory_pending_ack"
-	MetricNATSAdvisoryFetchErrorsTotal = "aegisedge_control_plane_nats_advisory_fetch_errors_total"
-	MetricNATSAdvisoryEvictionsTotal   = "aegisedge_control_plane_nats_advisory_evictions_total"
-	MetricNATSQuarantinedTotal         = "aegisedge_control_plane_nats_quarantined_total"
-	MetricNATSRecoveredTotal           = "aegisedge_control_plane_nats_recovered_total"
+	MetricIngestedBatchesTotal               = "aegisedge_control_plane_ingested_batches_total"
+	MetricStorageProbeDurationSeconds        = "aegisedge_control_plane_storage_probe_duration_seconds"
+	MetricStorageProbeFailuresTotal          = "aegisedge_control_plane_storage_probe_failures_total"
+	MetricAuthFailuresTotal                  = "aegisedge_control_plane_auth_failures_total"
+	MetricNATSExhaustedDeliveriesTotal       = "aegisedge_control_plane_nats_exhausted_deliveries_total"
+	MetricRegisteredNodesCount               = "aegisedge_control_plane_registered_nodes_count"
+	MetricNATSAdvisoryStreamMessages         = "aegisedge_control_plane_nats_advisory_stream_messages"
+	MetricNATSAdvisoryStreamBytes            = "aegisedge_control_plane_nats_advisory_stream_bytes"
+	MetricNATSAdvisoryPendingBacklog         = "aegisedge_control_plane_nats_advisory_pending_backlog"
+	MetricNATSAdvisoryPendingAck             = "aegisedge_control_plane_nats_advisory_pending_ack"
+	MetricNATSAdvisoryFetchErrorsTotal       = "aegisedge_control_plane_nats_advisory_fetch_errors_total"
+	MetricNATSAdvisoryEvictionsTotal         = "aegisedge_control_plane_nats_advisory_evictions_total"
+	MetricNATSQuarantinedTotal               = "aegisedge_control_plane_nats_quarantined_total"
+	MetricNATSRecoveredTotal                 = "aegisedge_control_plane_nats_recovered_total"
+	MetricNATSStalledUnacknowledgedSequences = "aegisedge_control_plane_nats_stalled_unacknowledged_sequences"
 )
 
 // Bounded label values and allowlists.
@@ -56,32 +57,34 @@ var allowedAuthReasons = map[string]struct{}{
 type Metrics struct {
 	registry *Registry
 
-	ingestedBatches            *CounterVec
-	storageProbeDuration       *SingleHistogram
-	storageProbeFailures       *SingleCounter
-	authFailures               *CounterVec
-	natsExhaustedDeliveries    *FuncCounter
-	registeredNodes            *FuncGauge
-	natsAdvisoryStreamMsgs     *FuncGauge
-	natsAdvisoryStreamBytes    *FuncGauge
-	natsAdvisoryPendingBacklog *FuncGauge
-	natsAdvisoryPendingAck     *FuncGauge
-	natsAdvisoryFetchErrors    *FuncCounter
-	natsAdvisoryEvictions      *FuncCounter
-	natsQuarantined            *FuncCounter
-	natsRecovered              *FuncCounter
+	ingestedBatches                    *CounterVec
+	storageProbeDuration               *SingleHistogram
+	storageProbeFailures               *SingleCounter
+	authFailures                       *CounterVec
+	natsExhaustedDeliveries            *FuncCounter
+	registeredNodes                    *FuncGauge
+	natsAdvisoryStreamMsgs             *FuncGauge
+	natsAdvisoryStreamBytes            *FuncGauge
+	natsAdvisoryPendingBacklog         *FuncGauge
+	natsAdvisoryPendingAck             *FuncGauge
+	natsAdvisoryFetchErrors            *FuncCounter
+	natsAdvisoryEvictions              *FuncCounter
+	natsQuarantined                    *FuncCounter
+	natsRecovered                      *FuncCounter
+	natsStalledUnacknowledgedSequences *FuncGauge
 
-	mu                               sync.RWMutex
-	natsExhaustedSource              func() float64
-	registeredNodeSource             func() float64
-	natsAdvisoryStreamMsgsSource     func() float64
-	natsAdvisoryStreamBytesSource    func() float64
-	natsAdvisoryPendingBacklogSource func() float64
-	natsAdvisoryPendingAckSource     func() float64
-	natsAdvisoryFetchErrorsSource    func() float64
-	natsAdvisoryEvictionsSource      func() float64
-	natsQuarantinedSource            func() float64
-	natsRecoveredSource              func() float64
+	mu                                      sync.RWMutex
+	natsExhaustedSource                     func() float64
+	registeredNodeSource                    func() float64
+	natsAdvisoryStreamMsgsSource            func() float64
+	natsAdvisoryStreamBytesSource           func() float64
+	natsAdvisoryPendingBacklogSource        func() float64
+	natsAdvisoryPendingAckSource            func() float64
+	natsAdvisoryFetchErrorsSource           func() float64
+	natsAdvisoryEvictionsSource             func() float64
+	natsQuarantinedSource                   func() float64
+	natsRecoveredSource                     func() float64
+	natsStalledUnacknowledgedSequenceSource func() float64
 }
 
 // NewMetrics initializes and registers all control-plane operational metrics.
@@ -277,6 +280,21 @@ func NewMetrics() *Metrics {
 	)
 	_ = r.Register(m.natsRecovered)
 
+	m.natsStalledUnacknowledgedSequences = NewFuncGauge(
+		MetricNATSStalledUnacknowledgedSequences,
+		"Current number of distinct unacknowledged stream sequences observed as stalled without authoritative exhaustion evidence.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsStalledUnacknowledgedSequenceSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsStalledUnacknowledgedSequences)
+
 	return m
 }
 
@@ -444,5 +462,15 @@ func (m *Metrics) SetNATSRecoveredSource(fn func() float64) {
 	}
 	m.mu.Lock()
 	m.natsRecoveredSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSStalledUnacknowledgedSequencesSource registers a dynamic source for the stalled unacknowledged sequences gauge.
+func (m *Metrics) SetNATSStalledUnacknowledgedSequencesSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsStalledUnacknowledgedSequenceSource = fn
 	m.mu.Unlock()
 }

@@ -54,19 +54,20 @@ const (
 
 // ConsumerConfig holds configuration for the telemetry consumer.
 type ConsumerConfig struct {
-	NATSURL              string
-	StreamName           string
-	ConsumerName         string
-	AdvisoryStreamName   string                  // Dedicated JetStream stream capturing max-delivery advisories (default: "<StreamName>_ADVISORIES")
-	AdvisoryConsumerName string                  // Durable consumer name on the advisory stream (default: "<ConsumerName>-advisories")
-	MaxDeliver           int                     // Maximum delivery attempts for a message before broker advisory (default: 5)
-	AckWait              time.Duration           // Server acknowledgment timeout before redelivery (default: 30s)
-	MaxAckPending        int                     // Max outstanding unacknowledged messages (default: 1000)
-	RetryBackoff         time.Duration           // Base backoff delay for transient retries (default: 100ms)
-	QuarantineStore      storage.QuarantineStore // Durable quarantine store foundation
-	IdempotencyStore     IdempotencyChecker      // Authoritative idempotency store for checking already-ingested batches
-	MaxRecoveryBatch     int                     // Maximum sequences inspected per recovery pass (default: 100)
-	RecoveryScanInterval time.Duration           // Interval between recovery passes (default: 500ms)
+	NATSURL                 string
+	StreamName              string
+	ConsumerName            string
+	AdvisoryStreamName      string                  // Dedicated JetStream stream capturing max-delivery advisories (default: "<StreamName>_ADVISORIES")
+	AdvisoryConsumerName    string                  // Durable consumer name on the advisory stream (default: "<ConsumerName>-advisories")
+	MaxDeliver              int                     // Maximum delivery attempts for a message before broker advisory (default: 5)
+	AckWait                 time.Duration           // Server acknowledgment timeout before redelivery (default: 30s)
+	MaxAckPending           int                     // Max outstanding unacknowledged messages (default: 1000)
+	RetryBackoff            time.Duration           // Base backoff delay for transient retries (default: 100ms)
+	QuarantineStore         storage.QuarantineStore // Durable quarantine store foundation
+	IdempotencyStore        IdempotencyChecker      // Authoritative idempotency store for checking already-ingested batches
+	MaxRecoveryBatch        int                     // Maximum sequences inspected per recovery pass (default: 100)
+	RecoveryScanInterval    time.Duration           // Interval between recovery passes (default: 500ms)
+	StalledWarningThreshold time.Duration           // Elapsed duration before a stalled sequence emits a structured warning (default: 2*AckWait, min 60s)
 }
 
 // recoveryItem encapsulates an exhausted message queued for background recovery persistence.
@@ -89,6 +90,25 @@ type scanRetryItem struct {
 	attempts    int
 	lastAttempt time.Time
 	lastErr     error
+}
+
+// stalledSequenceItem tracks observation timestamps and warning state for an unacknowledged stream sequence
+// that returned ErrNotEligible during recovery inspection.
+type stalledSequenceItem struct {
+	seq           uint64
+	firstObserved time.Time
+	lastObserved  time.Time
+	warnEmitted   bool
+	lastWarnTime  time.Time
+}
+
+// StalledSequenceInfo represents tracking metadata for an unacknowledged sequence observed as stalled.
+type StalledSequenceInfo struct {
+	StreamSequence uint64        `json:"stream_sequence"`
+	FirstObserved  time.Time     `json:"first_observed"`
+	LastObserved   time.Time     `json:"last_observed"`
+	Elapsed        time.Duration `json:"elapsed"`
+	WarnEmitted    bool          `json:"warn_emitted"`
 }
 
 // MaxDeliverAdvisory represents the canonical NATS JetStream broker delivery-exhaustion advisory payload.
@@ -114,6 +134,13 @@ type RecoveryOption func(*recoveryOptions)
 func WithExhaustionEvidence() RecoveryOption {
 	return func(o *recoveryOptions) {
 		o.forceExhaustion = true
+	}
+}
+
+// WithForceExhaustion explicitly configures whether exhaustion evidence is forced for sequence recovery.
+func WithForceExhaustion(force bool) RecoveryOption {
+	return func(o *recoveryOptions) {
+		o.forceExhaustion = force
 	}
 }
 
@@ -170,6 +197,22 @@ func WithRecoveryScanInterval(interval time.Duration) ConsumerOption {
 	}
 }
 
+// WithStalledWarningThreshold sets the duration an unacknowledged sequence must remain stalled before warning.
+func WithStalledWarningThreshold(d time.Duration) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		if d > 0 {
+			c.config.StalledWarningThreshold = d
+		}
+	}
+}
+
+// WithClock provides an explicit time source for deterministic testing of timeouts and intervals.
+func WithClock(fn func() time.Time) ConsumerOption {
+	return func(c *TelemetryConsumer) {
+		c.clock = fn
+	}
+}
+
 // TelemetryConsumer subscribes to the AEGISEDGE_TELEMETRY JetStream stream
 // and processes telemetry events with at-least-once delivery, durable SQLite-backed
 // idempotency, and poison-message containment.
@@ -206,6 +249,9 @@ type TelemetryConsumer struct {
 	recoveryMu             sync.Mutex
 	pendingExhausted       map[uint64]*recoveryItem
 	pendingScanRetries     map[uint64]*scanRetryItem
+	stalledSeqs            map[uint64]*stalledSequenceItem
+	stalledSequencesCount  atomic.Int64
+	clock                  func() time.Time
 	exhaustedSeqs          map[uint64]bool
 	recoveryCursor         uint64
 	recoveryWg             sync.WaitGroup
@@ -324,6 +370,12 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 	}
 	if cfg.RecoveryScanInterval <= 0 {
 		cfg.RecoveryScanInterval = DefaultRecoveryScanInterval
+	}
+	if cfg.StalledWarningThreshold <= 0 {
+		cfg.StalledWarningThreshold = 2 * cfg.AckWait
+		if cfg.StalledWarningThreshold < 60*time.Second {
+			cfg.StalledWarningThreshold = 60 * time.Second
+		}
 	}
 
 	nc, err := nats.Connect(cfg.NATSURL,
@@ -487,6 +539,7 @@ func NewTelemetryConsumer(cfg ConsumerConfig, handler IngestionHandler, logger *
 		ownsStore:          ownsStore,
 		pendingExhausted:   make(map[uint64]*recoveryItem),
 		pendingScanRetries: make(map[uint64]*scanRetryItem),
+		stalledSeqs:        make(map[uint64]*stalledSequenceItem),
 		exhaustedSeqs:      make(map[uint64]bool),
 		ctx:                ctx,
 		cancel:             cancel,
@@ -752,6 +805,7 @@ func (c *TelemetryConsumer) handleAdvisoryData(data []byte, ackMsg jetstream.Msg
 		)
 		c.recoveryMu.Lock()
 		delete(c.pendingExhausted, seq)
+		c.clearStalledSequenceLocked(seq)
 		c.recoveryMu.Unlock()
 		if ackMsg != nil {
 			_ = ackMsg.Ack()
@@ -994,6 +1048,7 @@ func (c *TelemetryConsumer) processPendingRecoveryPass() {
 				}
 				c.recoveryMu.Lock()
 				delete(c.pendingExhausted, item.streamSeq)
+				c.clearStalledSequenceLocked(item.streamSeq)
 				c.recoveryMu.Unlock()
 				c.logger.Info("exhausted message successfully recovered into durable quarantine",
 					slog.Uint64("stream_seq", item.streamSeq),
@@ -1009,6 +1064,7 @@ func (c *TelemetryConsumer) processPendingRecoveryPass() {
 				)
 				c.recoveryMu.Lock()
 				delete(c.pendingExhausted, item.streamSeq)
+				c.clearStalledSequenceLocked(item.streamSeq)
 				c.recoveryMu.Unlock()
 				continue
 			}
@@ -1020,6 +1076,7 @@ func (c *TelemetryConsumer) processPendingRecoveryPass() {
 				)
 				c.recoveryMu.Lock()
 				delete(c.pendingExhausted, item.streamSeq)
+				c.clearStalledSequenceLocked(item.streamSeq)
 				c.recoveryMu.Unlock()
 				continue
 			}
@@ -1374,6 +1431,137 @@ func (c *TelemetryConsumer) Consumer() jetstream.Consumer {
 	return c.cons
 }
 
+// now returns the current time using the configured clock or system UTC time.
+func (c *TelemetryConsumer) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now().UTC()
+}
+
+// StalledUnacknowledgedSequences returns the current count of distinct unacknowledged sequences
+// observed as stalled without authoritative exhaustion evidence.
+func (c *TelemetryConsumer) StalledUnacknowledgedSequences() int64 {
+	return c.stalledSequencesCount.Load()
+}
+
+// StalledSequences returns a snapshot of currently tracked stalled sequence items.
+func (c *TelemetryConsumer) StalledSequences() []StalledSequenceInfo {
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+
+	now := c.now()
+	result := make([]StalledSequenceInfo, 0, len(c.stalledSeqs))
+	for _, item := range c.stalledSeqs {
+		result = append(result, StalledSequenceInfo{
+			StreamSequence: item.seq,
+			FirstObserved:  item.firstObserved,
+			LastObserved:   item.lastObserved,
+			Elapsed:        now.Sub(item.firstObserved),
+			WarnEmitted:    item.warnEmitted,
+		})
+	}
+	return result
+}
+
+// clearStalledSequenceLocked removes a sequence from stalled tracking when recoveryMu is held.
+func (c *TelemetryConsumer) clearStalledSequenceLocked(seq uint64) {
+	if _, exists := c.stalledSeqs[seq]; exists {
+		delete(c.stalledSeqs, seq)
+		c.stalledSequencesCount.Store(int64(len(c.stalledSeqs)))
+	}
+}
+
+// clearStalledSequence removes a sequence from stalled tracking when resolved or ingested.
+func (c *TelemetryConsumer) clearStalledSequence(seq uint64) {
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+	c.clearStalledSequenceLocked(seq)
+}
+
+// recordStalledSequence tracks or updates an unacknowledged sequence that returned ErrNotEligible.
+func (c *TelemetryConsumer) recordStalledSequence(seq uint64, info *jetstream.ConsumerInfo) {
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+
+	now := c.now()
+	item, exists := c.stalledSeqs[seq]
+	if !exists {
+		item = &stalledSequenceItem{
+			seq:           seq,
+			firstObserved: now,
+			lastObserved:  now,
+		}
+		c.stalledSeqs[seq] = item
+		c.stalledSequencesCount.Store(int64(len(c.stalledSeqs)))
+	} else {
+		item.lastObserved = now
+	}
+
+	threshold := c.config.StalledWarningThreshold
+	if threshold <= 0 {
+		threshold = 2 * c.config.AckWait
+		if threshold < 60*time.Second {
+			threshold = 60 * time.Second
+		}
+	}
+
+	elapsed := now.Sub(item.firstObserved)
+	if elapsed >= threshold {
+		shouldWarn := !item.warnEmitted || (!item.lastWarnTime.IsZero() && now.Sub(item.lastWarnTime) >= 10*time.Minute)
+		if shouldWarn {
+			item.warnEmitted = true
+			item.lastWarnTime = now
+
+			var ackFloor uint64
+			var numPending int
+			if info != nil {
+				ackFloor = info.AckFloor.Stream
+				numPending = info.NumAckPending
+			}
+
+			c.logger.Warn("unacknowledged stream sequence holding ack floor without authoritative exhaustion evidence",
+				slog.Uint64("stream_seq", seq),
+				slog.String("stream", c.config.StreamName),
+				slog.String("consumer", c.config.ConsumerName),
+				slog.Uint64("ack_floor", ackFloor),
+				slog.Int("num_ack_pending", numPending),
+				slog.Duration("elapsed", elapsed),
+				slog.String("reason", "missing authoritative exhaustion evidence (broker advisory evicted or missing; in-flight protection active)"),
+				slog.String("remediation", "verify sequence with quarantine runbook; if permanently exhausted, recover using RecoverStreamSequence with WithForceExhaustion(true)"),
+			)
+		}
+	}
+}
+
+// pruneStalledSequences removes sequences that are no longer pending or outside consumer delivered window.
+func (c *TelemetryConsumer) pruneStalledSequences(info *jetstream.ConsumerInfo) {
+	if info == nil {
+		return
+	}
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+
+	if info.NumAckPending == 0 || info.Delivered.Stream <= info.AckFloor.Stream {
+		if len(c.stalledSeqs) > 0 {
+			c.stalledSeqs = make(map[uint64]*stalledSequenceItem)
+			c.stalledSequencesCount.Store(0)
+		}
+		return
+	}
+
+	changed := false
+	for s := range c.stalledSeqs {
+		if s <= info.AckFloor.Stream || s > info.Delivered.Stream {
+			delete(c.stalledSeqs, s)
+			changed = true
+		}
+	}
+	if changed {
+		c.stalledSequencesCount.Store(int64(len(c.stalledSeqs)))
+	}
+}
+
 // RecoverStreamSequence retrieves the raw message directly from JetStream by stream sequence number,
 // inspects it, queries durable idempotency storage, and durably quarantines it if eligible.
 //
@@ -1498,7 +1686,11 @@ func (c *TelemetryConsumer) RecoverStreamSequence(ctx context.Context, seq uint6
 		c.recoveredTotal.Add(1)
 	}
 	c.recoveryMu.Lock()
+	if ro.forceExhaustion {
+		c.exhaustedSeqs[seq] = true
+	}
 	delete(c.pendingExhausted, seq)
+	c.clearStalledSequenceLocked(seq)
 	c.recoveryMu.Unlock()
 	return saved, nil
 }
@@ -1542,13 +1734,15 @@ func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, err
 		return 0, fmt.Errorf("failed to get consumer info: %w", err)
 	}
 
+	c.pruneStalledSequences(info)
+
 	recovered := 0
 	processed := make(map[uint64]bool)
 
 	// 1. Process pending scan retries from earlier transient errors with per-item backoff
 	c.recoveryMu.Lock()
 	var toRetry []*scanRetryItem
-	now := time.Now()
+	now := c.now()
 	for _, item := range c.pendingScanRetries {
 		backoff := 50 * time.Millisecond
 		if item.attempts > 0 {
@@ -1575,13 +1769,23 @@ func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, err
 		if rErr == nil {
 			recovered++
 			processed[item.seq] = true
+			c.clearStalledSequence(item.seq)
 			c.recoveryMu.Lock()
 			delete(c.pendingScanRetries, item.seq)
 			c.recoveryMu.Unlock()
 			continue
 		}
-		if errors.Is(rErr, ErrAlreadyIngested) || errors.Is(rErr, ErrNotEligible) || errors.Is(rErr, jetstream.ErrMsgNotFound) {
+		if errors.Is(rErr, ErrAlreadyIngested) || errors.Is(rErr, jetstream.ErrMsgNotFound) {
 			processed[item.seq] = true
+			c.clearStalledSequence(item.seq)
+			c.recoveryMu.Lock()
+			delete(c.pendingScanRetries, item.seq)
+			c.recoveryMu.Unlock()
+			continue
+		}
+		if errors.Is(rErr, ErrNotEligible) {
+			processed[item.seq] = true
+			c.recordStalledSequence(item.seq, info)
 			c.recoveryMu.Lock()
 			delete(c.pendingScanRetries, item.seq)
 			c.recoveryMu.Unlock()
@@ -1591,7 +1795,7 @@ func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, err
 		c.recoveryMu.Lock()
 		if cur, ok := c.pendingScanRetries[item.seq]; ok {
 			cur.attempts++
-			cur.lastAttempt = time.Now()
+			cur.lastAttempt = c.now()
 			cur.lastErr = rErr
 			if cur.attempts > 15 {
 				c.logger.Error("scan retry obligation exceeded maximum attempts; dropping retry",
@@ -1636,7 +1840,15 @@ func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, err
 		}
 		_, rErr := c.RecoverStreamSequence(ctx, seq)
 		if rErr != nil {
-			if errors.Is(rErr, ErrAlreadyIngested) || errors.Is(rErr, ErrNotEligible) || errors.Is(rErr, jetstream.ErrMsgNotFound) {
+			if errors.Is(rErr, ErrAlreadyIngested) || errors.Is(rErr, jetstream.ErrMsgNotFound) {
+				c.clearStalledSequence(seq)
+				c.recoveryMu.Lock()
+				delete(c.pendingScanRetries, seq)
+				c.recoveryMu.Unlock()
+				continue
+			}
+			if errors.Is(rErr, ErrNotEligible) {
+				c.recordStalledSequence(seq, info)
 				c.recoveryMu.Lock()
 				delete(c.pendingScanRetries, seq)
 				c.recoveryMu.Unlock()
@@ -1652,7 +1864,7 @@ func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, err
 				c.pendingScanRetries[seq] = &scanRetryItem{
 					seq:         seq,
 					attempts:    1,
-					lastAttempt: time.Now(),
+					lastAttempt: c.now(),
 					lastErr:     rErr,
 				}
 			}
@@ -1660,6 +1872,7 @@ func (c *TelemetryConsumer) RecoverUnacknowledged(ctx context.Context) (int, err
 			continue
 		}
 		recovered++
+		c.clearStalledSequence(seq)
 		c.recoveryMu.Lock()
 		delete(c.pendingScanRetries, seq)
 		c.recoveryMu.Unlock()
@@ -1690,6 +1903,10 @@ func (c *TelemetryConsumer) Stop() {
 	if c.conn != nil {
 		c.conn.Close()
 	}
+	c.recoveryMu.Lock()
+	c.stalledSeqs = make(map[uint64]*stalledSequenceItem)
+	c.stalledSequencesCount.Store(0)
+	c.recoveryMu.Unlock()
 	if c.ownsStore && c.quarantineStore != nil {
 		if closer, ok := c.quarantineStore.(io.Closer); ok {
 			_ = closer.Close()

@@ -296,6 +296,9 @@ func main() {
 		srvInstance.Metrics().SetNATSAdvisoryEvictionsSource(func() float64 {
 			return float64(consumer.AdvisoryEvictions())
 		})
+		srvInstance.Metrics().SetNATSStalledUnacknowledgedSequencesSource(func() float64 {
+			return float64(consumer.StalledUnacknowledgedSequences())
+		})
 		if err := consumer.Start(); err != nil {
 			logger.Error("failed to start NATS consumer", slog.Any("error", err))
 			os.Exit(1)
