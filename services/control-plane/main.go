@@ -392,6 +392,9 @@ func main() {
 		logger.Error("error during graceful shutdown", slog.Any("error", err))
 		os.Exit(1)
 	}
+	// Explicitly stop and drain the background pruner before closing storage
+	srvInstance.StopPruner()
+
 	if err := store.Close(); err != nil {
 		logger.Error("error closing storage", slog.Any("error", err))
 	}
