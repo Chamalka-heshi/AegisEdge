@@ -4149,3 +4149,90 @@ func TestServer_PrunerLifecycle(t *testing.T) {
 		t.Fatalf("srv.Close failed: %v", err)
 	}
 }
+
+// TestServer_PrunerShutdownHardening verifies:
+// 1. Stop-before-start is safe and returns immediately.
+// 2. Repeated StopPruner calls are safe and idempotent.
+// 3. StopPruner drains in-flight pruning passes before returning, so storage is not closed prematurely.
+func TestServer_PrunerShutdownHardening(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(newDiscardLogger(),
+		WithIdempotencyStore(store),
+		WithPruningConfig(PruningConfig{
+			Enabled:                true,
+			TelemetryRetentionDays: 30,
+			PruneInterval:          time.Hour,
+			PruneBatchSize:         100,
+		}),
+	)
+
+	// 1. Stop before start
+	srv.StopPruner()
+	srv.StopPruner() // Repeated stop
+
+	// 2. Controlled active prune pass drain verification
+	pruneStartedCh := make(chan struct{})
+	allowPruneFinishCh := make(chan struct{})
+	passCompletedCh := make(chan struct{})
+
+	// Launch a goroutine that runs a simulated prune pass holding the worker wait group
+	srv.pruneWg.Add(1)
+	go func() {
+		defer srv.pruneWg.Done()
+		close(pruneStartedCh)
+		<-allowPruneFinishCh
+		// Execute real prune pass while store is open
+		_, _ = srv.RunPrunePass(ctx)
+		close(passCompletedCh)
+	}()
+
+	// Wait until goroutine enters prune worker
+	<-pruneStartedCh
+
+	// In another goroutine, call StopPruner()
+	stopReturnedCh := make(chan struct{})
+	go func() {
+		srv.StopPruner()
+		close(stopReturnedCh)
+	}()
+
+	// Ensure StopPruner is actively waiting and has NOT returned yet
+	select {
+	case <-stopReturnedCh:
+		t.Fatalf("StopPruner returned before active prune pass finished")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: still waiting for pass to finish
+	}
+
+	// Release the prune pass
+	close(allowPruneFinishCh)
+
+	// Now StopPruner must unblock cleanly
+	select {
+	case <-stopReturnedCh:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatalf("StopPruner did not unblock after active prune pass completed")
+	}
+
+	// Verify the pass actually completed
+	select {
+	case <-passCompletedCh:
+	default:
+		t.Fatalf("expected passCompletedCh to be closed")
+	}
+
+	// Repeated StopPruner() after completion
+	srv.StopPruner()
+
+	// Safe to close store now
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close failed: %v", err)
+	}
+}
