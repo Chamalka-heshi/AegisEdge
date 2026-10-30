@@ -621,9 +621,8 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 // Invariants enforced:
 // 1. cp_ingested_batches metadata rows are strictly retained for permanent deduplication / idempotency.
 // 2. Batches currently in active quarantine ('quarantined') are never pruned to preserve diagnostic evidence.
-// 3. Batches that are the highest known sequence_number for an active registered node are preserved.
-// 4. Bounded: deletes at most limit records per pass.
-// 5. Returns (prunedCount, nil) on success.
+// 3. Bounded: deletes at most limit records per pass.
+// 4. Returns (prunedCount, nil) on success.
 func (s *SQLiteStore) PruneTelemetryPayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
 	if cutoff.IsZero() {
 		return 0, errors.New("cutoff timestamp cannot be zero")
@@ -646,7 +645,6 @@ func (s *SQLiteStore) PruneTelemetryPayloads(ctx context.Context, cutoff time.Ti
 	// Only delete from cp_telemetry_payloads where:
 	// - ingested_at < cutoff
 	// - (node_id, batch_id) is NOT actively quarantined in cp_telemetry_quarantine
-	// - sequence_number < MAX(sequence_number) for that node (keep at least the newest batch)
 	query := `
 	DELETE FROM cp_telemetry_payloads
 	WHERE (node_id, batch_id) IN (
@@ -658,11 +656,6 @@ func (s *SQLiteStore) PruneTelemetryPayloads(ctx context.Context, cutoff time.Ti
 			  WHERE q.node_id = p.node_id
 			    AND q.batch_id = p.batch_id
 			    AND q.status = 'quarantined'
-		  )
-		  AND p.sequence_number < (
-			  SELECT MAX(m.sequence_number)
-			  FROM cp_telemetry_payloads m
-			  WHERE m.node_id = p.node_id
 		  )
 		ORDER BY p.ingested_at ASC, p.rowid ASC
 		LIMIT ?
