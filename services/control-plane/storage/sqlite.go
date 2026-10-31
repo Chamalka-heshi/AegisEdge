@@ -46,6 +46,14 @@ type SQLiteStore struct {
 	// HookBeforeQuarantineStatusCommit is an optional test hook called inside UpdateQuarantineStatus
 	// after status update before transaction commit.
 	HookBeforeQuarantineStatusCommit func() error
+
+	// HookBeforeReplayStatusUpdate is an optional test hook called inside ReplayQuarantineRecord
+	// before executing the status update to 'replayed'.
+	HookBeforeReplayStatusUpdate func(tx *sql.Tx) error
+
+	// HookBeforeReplayCommit is an optional test hook called inside ReplayQuarantineRecord
+	// after batch ingestion and status update, before transaction commit.
+	HookBeforeReplayCommit func() error
 }
 
 var (
@@ -222,6 +230,9 @@ func (s *SQLiteStore) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_time
 		ON cp_telemetry_quarantine(last_quarantined_at DESC, id ASC);
+
+	CREATE INDEX IF NOT EXISTS idx_cp_quarantine_status_updated
+		ON cp_telemetry_quarantine(status, status_updated_at ASC);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -352,20 +363,60 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 	}
 	defer tx.Rollback() // Safe: no-op if tx.Commit() succeeds
 
+	inserted, err := s.recordBatchTx(ctx, tx, batch, ingestedAt, "")
+	if err != nil {
+		return false, err
+	}
+	if !inserted {
+		return false, nil
+	}
+
+	// Step 5: Commit batch metadata, payload, and node activity atomically in a single fsync
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("failed to commit batch transaction: %w", err)
+	}
+
+	return true, nil
+}
+
+// recordBatchTx executes the batch ingestion steps within an existing database transaction.
+// It checks active quarantine status, inserts idempotency metadata, serializes and inserts the payload,
+// and updates node activity if the node is registered.
+// If allowedQuarantineID is provided, any active quarantine record matching that ID is permitted (for replay).
+// Returns (true, nil) if newly inserted.
+// Returns (false, nil) if already recorded (idempotent duplicate).
+// Returns (false, err) on error.
+func (s *SQLiteStore) recordBatchTx(ctx context.Context, tx *sql.Tx, batch *types.TelemetryBatch, ingestedAt time.Time, allowedQuarantineID string) (bool, error) {
+	if batch == nil {
+		return false, fmt.Errorf("%w: batch cannot be nil", ErrInvalidMeta)
+	}
+	if err := batch.Validate(); err != nil {
+		return false, fmt.Errorf("%w: %v", ErrInvalidMeta, err)
+	}
+	if ingestedAt.IsZero() {
+		return false, fmt.Errorf("%w: ingested_at cannot be zero", ErrInvalidMeta)
+	}
+
 	// Step 0: Check if this batch is currently in active quarantine.
 	// A batch with an active quarantine status cannot be ingested simultaneously.
 	if batch.NodeID != "" && batch.BatchID != "" {
 		var quarantinedCount int
-		chkQErr := tx.QueryRowContext(ctx, `
-			SELECT COUNT(1) FROM cp_telemetry_quarantine
-			WHERE node_id = ? AND batch_id = ? AND status = 'quarantined';
-		`, batch.NodeID, batch.BatchID).Scan(&quarantinedCount)
+		var chkQErr error
+		if allowedQuarantineID != "" {
+			chkQErr = tx.QueryRowContext(ctx, `
+				SELECT COUNT(1) FROM cp_telemetry_quarantine
+				WHERE node_id = ? AND batch_id = ? AND status = 'quarantined' AND id != ?;
+			`, batch.NodeID, batch.BatchID, allowedQuarantineID).Scan(&quarantinedCount)
+		} else {
+			chkQErr = tx.QueryRowContext(ctx, `
+				SELECT COUNT(1) FROM cp_telemetry_quarantine
+				WHERE node_id = ? AND batch_id = ? AND status = 'quarantined';
+			`, batch.NodeID, batch.BatchID).Scan(&quarantinedCount)
+		}
 		if chkQErr != nil {
-			_ = tx.Rollback()
 			return false, fmt.Errorf("failed to check quarantine status in batch ingestion: %w", chkQErr)
 		}
 		if quarantinedCount > 0 {
-			_ = tx.Rollback()
 			return false, ErrStatusConflict
 		}
 	}
@@ -378,7 +429,7 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 	INSERT INTO cp_ingested_batches (node_id, batch_id, sequence_number, collected_at, ingested_at)
 	VALUES (?, ?, ?, ?, ?);
 	`
-	_, err = tx.ExecContext(ctx, queryMeta,
+	_, err := tx.ExecContext(ctx, queryMeta,
 		batch.NodeID,
 		batch.BatchID,
 		batch.SequenceNumber,
@@ -387,7 +438,6 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 	)
 	if err != nil {
 		if isDuplicateKeyError(err) {
-			_ = tx.Rollback()
 			return false, nil // Idempotent duplicate: already accepted previously
 		}
 		return false, fmt.Errorf("failed to record batch metadata: %w", err)
@@ -396,7 +446,6 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 	// Optional test hook for simulating crash between metadata and payload insert
 	if s.HookAfterMetaInsert != nil {
 		if err := s.HookAfterMetaInsert(); err != nil {
-			_ = tx.Rollback()
 			return false, fmt.Errorf("injected test failure after metadata insert: %w", err)
 		}
 	}
@@ -427,7 +476,6 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 	// Optional test hook for simulating failure after payload insert but before node activity update
 	if s.HookAfterPayloadInsert != nil {
 		if err := s.HookAfterPayloadInsert(); err != nil {
-			_ = tx.Rollback()
 			return false, fmt.Errorf("injected test failure after payload insert: %w", err)
 		}
 	}
@@ -471,11 +519,6 @@ func (s *SQLiteStore) RecordBatch(ctx context.Context, batch *types.TelemetryBat
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("failed to query node activity for batch transaction: %w", err)
-	}
-
-	// Step 5: Commit batch metadata, payload, and node activity atomically in a single fsync
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("failed to commit batch transaction: %w", err)
 	}
 
 	return true, nil
@@ -2104,4 +2147,220 @@ func (s *SQLiteStore) UpdateQuarantineStatus(ctx context.Context, update Quarant
 	}
 
 	return s.GetQuarantineRecord(ctx, update.ID)
+}
+
+// ReplayQuarantineRecord executes atomic replay of a quarantined batch within a single transaction.
+// It reconstructs the telemetry batch from the raw payload, validates it, ingests it into storage
+// (if not already ingested), updates the quarantine record status to 'replayed', and commits all changes atomically.
+func (s *SQLiteStore) ReplayQuarantineRecord(ctx context.Context, req QuarantineReplayRequest) (*QuarantineReplayResult, error) {
+	if strings.TrimSpace(req.ID) == "" {
+		return nil, fmt.Errorf("%w: id cannot be empty", ErrInvalidQuarantineRecord)
+	}
+	if len(req.Reason) > MaxStatusReasonLength {
+		return nil, fmt.Errorf("%w: status reason exceeds maximum length %d", ErrInvalidQuarantineRecord, MaxStatusReasonLength)
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	ts := req.Timestamp
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	} else {
+		ts = ts.UTC()
+	}
+
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "operator replay"
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin replay transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Step 1: Query quarantine record within the transaction
+	var (
+		currentStatusStr string
+		nodeID           string
+		batchID          string
+		payload          []byte
+	)
+	queryCheck := `SELECT status, node_id, batch_id, payload FROM cp_telemetry_quarantine WHERE id = ?;`
+	err = tx.QueryRowContext(ctx, queryCheck, req.ID).Scan(&currentStatusStr, &nodeID, &batchID, &payload)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrQuarantineNotFound
+		}
+		return nil, fmt.Errorf("failed to query quarantine record for replay: %w", err)
+	}
+
+	currentStatus := QuarantineStatus(currentStatusStr)
+	if currentStatus != StatusQuarantined {
+		return nil, fmt.Errorf("%w: quarantine record %q has status %q, only quarantined records can be replayed", ErrStatusConflict, req.ID, currentStatus)
+	}
+
+	// Step 2: Reconstruct TelemetryBatch from payload (supports TelemetryEvent envelope and direct TelemetryBatch)
+	var batch *types.TelemetryBatch
+	var event types.TelemetryEvent
+	if err := json.Unmarshal(payload, &event); err == nil && event.Payload != nil {
+		batch = event.Payload
+	} else {
+		var directBatch types.TelemetryBatch
+		if err := json.Unmarshal(payload, &directBatch); err == nil {
+			batch = &directBatch
+		} else {
+			return nil, fmt.Errorf("%w: failed to unmarshal quarantine payload: %v", ErrInvalidMeta, err)
+		}
+	}
+
+	if err := batch.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: invalid batch in quarantine payload: %v", ErrInvalidMeta, err)
+	}
+
+	// Step 3: Check if batch has already been ingested
+	var alreadyIngested bool
+	var existCount int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM cp_ingested_batches WHERE node_id = ? AND batch_id = ?;`, batch.NodeID, batch.BatchID).Scan(&existCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check existing batch in replay: %w", err)
+	}
+
+	if existCount > 0 {
+		alreadyIngested = true
+	} else {
+		inserted, err := s.recordBatchTx(ctx, tx, batch, ts, req.ID)
+		if err != nil {
+			return nil, err
+		}
+		if !inserted {
+			alreadyIngested = true
+		}
+	}
+
+	// Step 4: Update quarantine record status to 'replayed' conditionally
+	if s.HookBeforeReplayStatusUpdate != nil {
+		if err := s.HookBeforeReplayStatusUpdate(tx); err != nil {
+			return nil, fmt.Errorf("injected test failure in replay status hook: %w", err)
+		}
+	}
+
+	updateQuery := `
+	UPDATE cp_telemetry_quarantine
+	SET status = 'replayed',
+	    status_updated_at = ?,
+	    status_reason = ?,
+	    status_updated_by = ?,
+	    updated_at = CURRENT_TIMESTAMP
+	WHERE id = ? AND status = 'quarantined';
+	`
+	res, err := tx.ExecContext(ctx, updateQuery,
+		formatTimestamp(ts),
+		reason,
+		req.UpdatedBy,
+		req.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update quarantine record status during replay: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rows affected for quarantine replay: %w", err)
+	}
+	if rowsAffected == 0 {
+		return nil, fmt.Errorf("%w: status changed concurrently for record %q", ErrStatusConflict, req.ID)
+	}
+
+	// Step 5: Test hook
+	if s.HookBeforeReplayCommit != nil {
+		if err := s.HookBeforeReplayCommit(); err != nil {
+			return nil, fmt.Errorf("injected test failure before replay commit: %w", err)
+		}
+	}
+
+	// Step 6: Commit all changes atomically
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit replay transaction: %w", err)
+	}
+
+	// Step 7: Retrieve and return updated record
+	updatedRec, err := s.GetQuarantineRecord(ctx, req.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reload quarantine record after replay: %w", err)
+	}
+
+	return &QuarantineReplayResult{
+		Record:          updatedRec,
+		Batch:           batch,
+		AlreadyIngested: alreadyIngested,
+	}, nil
+}
+
+// DiscardQuarantineRecord marks an active quarantine record as 'discarded'.
+// Preserves the full payload and audit history, and returns ErrStatusConflict if the record is already terminal.
+func (s *SQLiteStore) DiscardQuarantineRecord(ctx context.Context, id, updatedBy, reason string) (*QuarantineRecord, error) {
+	return s.UpdateQuarantineStatus(ctx, QuarantineStatusUpdate{
+		ID:             id,
+		ExpectedStatus: StatusQuarantined,
+		NewStatus:      StatusDiscarded,
+		Reason:         reason,
+		UpdatedBy:      updatedBy,
+	})
+}
+
+// PruneQuarantinePayloads securely clears raw telemetry payload BLOBs for terminal quarantine records
+// older than the cutoff timestamp by setting payload = X'' (empty BLOB).
+// Audit metadata, idempotency keys, and error diagnostics are strictly retained.
+// Bounded: updates at most limit records per pass.
+// Returns (prunedCount, nil) on success.
+func (s *SQLiteStore) PruneQuarantinePayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, errors.New("cutoff timestamp cannot be zero")
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return 0, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 500
+	}
+
+	cutoffStr := formatTimestamp(cutoff)
+
+	query := `
+	UPDATE cp_telemetry_quarantine
+	SET payload = X'',
+	    updated_at = CURRENT_TIMESTAMP
+	WHERE id IN (
+		SELECT q.id
+		FROM cp_telemetry_quarantine q
+		WHERE q.status IN ('replayed', 'discarded')
+		  AND q.status_updated_at < ?
+		  AND LENGTH(q.payload) > 0
+		ORDER BY q.status_updated_at ASC, q.rowid ASC
+		LIMIT ?
+	);`
+
+	res, err := s.db.ExecContext(ctx, query, cutoffStr, limit)
+	if err != nil {
+		return 0, fmt.Errorf("pruning quarantine payloads failed: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("getting pruned quarantine rows affected failed: %w", err)
+	}
+
+	return rowsAffected, nil
 }
