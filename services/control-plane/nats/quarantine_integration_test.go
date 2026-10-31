@@ -70,6 +70,24 @@ func (m *mockFailingQuarantineStore) UpdateQuarantineStatus(ctx context.Context,
 	return m.underlying.UpdateQuarantineStatus(ctx, update)
 }
 
+func (m *mockFailingQuarantineStore) ReplayQuarantineRecord(ctx context.Context, req storage.QuarantineReplayRequest) (*storage.QuarantineReplayResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.underlying.ReplayQuarantineRecord(ctx, req)
+}
+
+func (m *mockFailingQuarantineStore) DiscardQuarantineRecord(ctx context.Context, id, updatedBy, reason string) (*storage.QuarantineRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.underlying.DiscardQuarantineRecord(ctx, id, updatedBy, reason)
+}
+
+func (m *mockFailingQuarantineStore) PruneQuarantinePayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.underlying.PruneQuarantinePayloads(ctx, cutoff, limit)
+}
+
 // 1. Test scenario: Malformed JSON is durably quarantined before source ACK/TERM
 func TestConsumer_Quarantine_MalformedJSON_DurableBeforeTerm(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
@@ -1515,6 +1533,18 @@ func (s *selectiveFailingStore) ListQuarantineRecords(ctx context.Context, filte
 
 func (s *selectiveFailingStore) UpdateQuarantineStatus(ctx context.Context, update storage.QuarantineStatusUpdate) (*storage.QuarantineRecord, error) {
 	return s.underlying.UpdateQuarantineStatus(ctx, update)
+}
+
+func (s *selectiveFailingStore) ReplayQuarantineRecord(ctx context.Context, req storage.QuarantineReplayRequest) (*storage.QuarantineReplayResult, error) {
+	return s.underlying.ReplayQuarantineRecord(ctx, req)
+}
+
+func (s *selectiveFailingStore) DiscardQuarantineRecord(ctx context.Context, id, updatedBy, reason string) (*storage.QuarantineRecord, error) {
+	return s.underlying.DiscardQuarantineRecord(ctx, id, updatedBy, reason)
+}
+
+func (s *selectiveFailingStore) PruneQuarantinePayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	return s.underlying.PruneQuarantinePayloads(ctx, cutoff, limit)
 }
 
 func TestConsumer_Recovery_SingleUnavailableItem_DoesNotBlockOthers(t *testing.T) {
