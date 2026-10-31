@@ -365,6 +365,21 @@ type QuarantineStatusUpdate struct {
 	Timestamp      time.Time        `json:"timestamp,omitempty"`
 }
 
+// QuarantineReplayRequest specifies parameters for an atomic quarantine replay operation.
+type QuarantineReplayRequest struct {
+	ID        string    `json:"id"`
+	Reason    string    `json:"reason,omitempty"`
+	UpdatedBy string    `json:"updated_by,omitempty"`
+	Timestamp time.Time `json:"timestamp,omitempty"`
+}
+
+// QuarantineReplayResult encapsulates the outcome of an atomic quarantine replay.
+type QuarantineReplayResult struct {
+	Record          *QuarantineRecord     `json:"record"`
+	Batch           *types.TelemetryBatch `json:"batch"`
+	AlreadyIngested bool                  `json:"already_ingested"`
+}
+
 // QuarantineStore defines the minimal contract for persisting, retrieving,
 // listing, and transitioning control-plane telemetry quarantine records.
 type QuarantineStore interface {
@@ -384,6 +399,20 @@ type QuarantineStore interface {
 	// UpdateQuarantineStatus updates a record's status using a validated, explicit transition.
 	// Prevents overwriting terminal states and returns ErrInvalidStatusTransition or ErrStatusConflict.
 	UpdateQuarantineStatus(ctx context.Context, update QuarantineStatusUpdate) (*QuarantineRecord, error)
+
+	// ReplayQuarantineRecord executes atomic replay of a quarantined batch within a single transaction.
+	// It ingests the telemetry batch if not already present, updates the quarantine record status to 'replayed',
+	// and commits all state changes atomically.
+	ReplayQuarantineRecord(ctx context.Context, req QuarantineReplayRequest) (*QuarantineReplayResult, error)
+
+	// DiscardQuarantineRecord marks an active quarantine record as 'discarded'.
+	// Preserves the full payload and audit history, and returns ErrStatusConflict if the record is already terminal.
+	DiscardQuarantineRecord(ctx context.Context, id, updatedBy, reason string) (*QuarantineRecord, error)
+
+	// PruneQuarantinePayloads securely clears raw telemetry payload BLOBs for terminal quarantine records
+	// older than the cutoff timestamp by setting payload = X'' (empty BLOB).
+	// Audit metadata and idempotency keys are strictly retained.
+	PruneQuarantinePayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error)
 }
 
 // DeriveDeduplicationKey computes a deterministic, collision-resistant identity for quarantine deduplication.
