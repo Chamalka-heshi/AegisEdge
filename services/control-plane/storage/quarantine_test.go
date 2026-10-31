@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -1461,5 +1462,828 @@ func TestQuarantine_UnexpectedDBErrorNotMistakenForAlreadyIngested(t *testing.T)
 	}
 	if errors.Is(err, ErrAlreadyIngested) {
 		t.Fatalf("unexpected DB error was mistakenly identified as ErrAlreadyIngested: %v", err)
+	}
+}
+
+// 1. TestQuarantine_AtomicReplay_Success
+func TestQuarantine_AtomicReplay_Success(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-replay-1", "batch-replay-1", 100)
+	payloadBytes, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "network timeout during delivery",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	res, err := store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID:        rec.ID,
+		Reason:    "approved replay",
+		UpdatedBy: "operator-alice",
+	})
+	if err != nil {
+		t.Fatalf("ReplayQuarantineRecord failed: %v", err)
+	}
+
+	if res.AlreadyIngested {
+		t.Errorf("expected AlreadyIngested=false, got true")
+	}
+	if res.Record.Status != StatusReplayed {
+		t.Errorf("expected status 'replayed', got %q", res.Record.Status)
+	}
+	if res.Record.StatusReason != "approved replay" {
+		t.Errorf("expected reason 'approved replay', got %q", res.Record.StatusReason)
+	}
+	if res.Record.StatusUpdatedBy != "operator-alice" {
+		t.Errorf("expected updated_by 'operator-alice', got %q", res.Record.StatusUpdatedBy)
+	}
+
+	// Verify batch is ingested
+	has, err := store.HasBatch(ctx, batch.NodeID, batch.BatchID)
+	if err != nil || !has {
+		t.Fatalf("expected HasBatch to be true, got %v (err: %v)", has, err)
+	}
+
+	retrievedPayload, err := store.GetPayload(ctx, batch.NodeID, batch.BatchID)
+	if err != nil {
+		t.Fatalf("GetPayload failed: %v", err)
+	}
+	if retrievedPayload.BatchID != batch.BatchID {
+		t.Errorf("expected payload batch ID %q, got %q", batch.BatchID, retrievedPayload.BatchID)
+	}
+}
+
+// 2. TestQuarantine_AtomicReplay_InvalidPayloadRollback
+func TestQuarantine_AtomicReplay_InvalidPayloadRollback(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          "node-inv",
+		BatchID:         "batch-inv",
+		Payload:         []byte(`{corrupt json...`),
+		FailureCategory: CategoryDeserialization,
+		FailureReason:   "corrupt json",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID: rec.ID,
+	})
+	if err == nil {
+		t.Fatal("expected ReplayQuarantineRecord to fail on corrupt payload")
+	}
+	if !errors.Is(err, ErrInvalidMeta) {
+		t.Errorf("expected ErrInvalidMeta, got %v", err)
+	}
+
+	// Verify rollback: status must still be quarantined
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if fresh.Status != StatusQuarantined {
+		t.Errorf("expected status 'quarantined', got %q", fresh.Status)
+	}
+
+	has, err := store.HasBatch(ctx, "node-inv", "batch-inv")
+	if err != nil || has {
+		t.Errorf("expected HasBatch to be false, got %v", has)
+	}
+}
+
+// 3. TestQuarantine_AtomicReplay_DatabaseFailureRollback
+func TestQuarantine_AtomicReplay_DatabaseFailureRollback(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-fail-1", "batch-fail-1", 10)
+	payloadBytes, _ := json.Marshal(batch)
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
+		Payload:         payloadBytes,
+		FailureCategory: CategoryStorageFailure,
+		FailureReason:   "disk error",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	store.HookBeforeReplayCommit = func() error {
+		return errors.New("simulated database failure before commit")
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID: rec.ID,
+	})
+	if err == nil {
+		t.Fatal("expected error from injected failure")
+	}
+
+	// Verify full rollback
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if fresh.Status != StatusQuarantined {
+		t.Errorf("expected status to remain 'quarantined', got %q", fresh.Status)
+	}
+
+	has, err := store.HasBatch(ctx, batch.NodeID, batch.BatchID)
+	if err != nil || has {
+		t.Errorf("expected HasBatch to remain false after rollback, got %v", has)
+	}
+}
+
+// 4. TestQuarantine_AtomicReplay_StatusUpdateFailureRollback
+func TestQuarantine_AtomicReplay_StatusUpdateFailureRollback(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-stat-fail", "batch-stat-fail", 11)
+	payloadBytes, _ := json.Marshal(batch)
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "test",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	// Simulate concurrent status update inside the transaction before replay update executes
+	store.HookBeforeReplayStatusUpdate = func(tx *sql.Tx) error {
+		_, execErr := tx.ExecContext(ctx, "UPDATE cp_telemetry_quarantine SET status = 'discarded' WHERE id = ?;", rec.ID)
+		return execErr
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID: rec.ID,
+	})
+	if err == nil {
+		t.Fatal("expected error due to concurrent status change")
+	}
+	if !errors.Is(err, ErrStatusConflict) {
+		t.Errorf("expected ErrStatusConflict, got %v", err)
+	}
+
+	// Reset hook
+	store.HookBeforeReplayStatusUpdate = nil
+
+	// Verify rollback: batch was not ingested, and record remained quarantined
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if fresh.Status != StatusQuarantined {
+		t.Errorf("expected status 'quarantined', got %q", fresh.Status)
+	}
+
+	has, err := store.HasBatch(ctx, batch.NodeID, batch.BatchID)
+	if err != nil || has {
+		t.Errorf("expected HasBatch to be false, got %v", has)
+	}
+}
+
+// 5. TestQuarantine_AtomicReplay_DuplicateReplay
+func TestQuarantine_AtomicReplay_DuplicateReplay(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-dup-rep", "batch-dup-rep", 12)
+	payloadBytes, _ := json.Marshal(batch)
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "test",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{ID: rec.ID})
+	if err != nil {
+		t.Fatalf("first ReplayQuarantineRecord failed: %v", err)
+	}
+
+	// Second replay must return ErrStatusConflict
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{ID: rec.ID})
+	if err == nil {
+		t.Fatal("expected second ReplayQuarantineRecord to fail")
+	}
+	if !errors.Is(err, ErrStatusConflict) {
+		t.Errorf("expected ErrStatusConflict, got %v", err)
+	}
+}
+
+// 6. TestQuarantine_AtomicReplay_Concurrent
+func TestQuarantine_AtomicReplay_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-conc", "batch-conc", 50)
+	payloadBytes, _ := json.Marshal(batch)
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "concurrent test",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	var successCount int64
+	var failureCount int64
+	var mu sync.Mutex
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			_, rErr := store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+				ID:        rec.ID,
+				UpdatedBy: fmt.Sprintf("operator-%d", idx),
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if rErr == nil {
+				successCount++
+			} else {
+				failureCount++
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if successCount != 1 {
+		t.Errorf("expected exactly 1 success, got %d (failures: %d)", successCount, failureCount)
+	}
+	if failureCount != goroutines-1 {
+		t.Errorf("expected %d failures, got %d", goroutines-1, failureCount)
+	}
+
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if fresh.Status != StatusReplayed {
+		t.Errorf("expected status 'replayed', got %q", fresh.Status)
+	}
+}
+
+// 7. TestQuarantine_Concurrent_ReplayVsDiscard
+func TestQuarantine_Concurrent_ReplayVsDiscard(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-race", "batch-race", 55)
+	payloadBytes, _ := json.Marshal(batch)
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "race test",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var replayErr, discardErr error
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, replayErr = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+			ID:        rec.ID,
+			UpdatedBy: "replay-op",
+		})
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, discardErr = store.DiscardQuarantineRecord(ctx, rec.ID, "discard-op", "discarded during race")
+	}()
+
+	wg.Wait()
+
+	// Exactly one of (replay, discard) must succeed
+	if (replayErr == nil && discardErr == nil) || (replayErr != nil && discardErr != nil) {
+		t.Fatalf("expected exactly one operation to succeed, got replayErr: %v, discardErr: %v", replayErr, discardErr)
+	}
+
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+
+	hasBatch, _ := store.HasBatch(ctx, batch.NodeID, batch.BatchID)
+	if fresh.Status == StatusReplayed {
+		if !hasBatch {
+			t.Errorf("expected batch to be ingested when replay won the race")
+		}
+	} else if fresh.Status == StatusDiscarded {
+		if hasBatch {
+			t.Errorf("expected batch NOT to be ingested when discard won the race")
+		}
+	} else {
+		t.Errorf("unexpected terminal status: %q", fresh.Status)
+	}
+}
+
+// 8. TestQuarantine_AtomicReplay_AlreadyIngestedBatch
+func TestQuarantine_AtomicReplay_AlreadyIngestedBatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-preingest", "batch-preingest", 60)
+	payloadBytes, _ := json.Marshal(batch)
+
+	// Quarantine record created before extraction or with unindexed batch headers
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "unindexed delivery retry",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	// Normal ingestion of the batch succeeds because quarantine record has no node/batch filter
+	recorded, err := store.RecordBatch(ctx, batch, time.Now().UTC())
+	if err != nil || !recorded {
+		t.Fatalf("RecordBatch failed: recorded=%v, err=%v", recorded, err)
+	}
+
+	// Replay should succeed idempotently with AlreadyIngested: true
+	res, err := store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID:        rec.ID,
+		Reason:    "already ingested replay",
+		UpdatedBy: "operator-sync",
+	})
+	if err != nil {
+		t.Fatalf("ReplayQuarantineRecord failed: %v", err)
+	}
+	if !res.AlreadyIngested {
+		t.Errorf("expected AlreadyIngested=true, got false")
+	}
+	if res.Record.Status != StatusReplayed {
+		t.Errorf("expected status 'replayed', got %q", res.Record.Status)
+	}
+}
+
+// 9. TestQuarantine_AtomicReplay_NodeSequenceMonotonicity
+func TestQuarantine_AtomicReplay_NodeSequenceMonotonicity(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	nodeID := "node-seq-mono"
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	_, err = store.RegisterNode(ctx, &NodeRecord{
+		NodeID:       nodeID,
+		Status:       types.NodeStatusHealthy,
+		RegisteredAt: now,
+		LastSeen:     now,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode failed: %v", err)
+	}
+
+	// Ingest batch with sequence number 100
+	batch100 := sampleBatch(nodeID, "batch-100", 100)
+	_, err = store.RecordBatch(ctx, batch100, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RecordBatch 100 failed: %v", err)
+	}
+
+	node, err := store.GetNode(ctx, nodeID)
+	if err != nil || node.SequenceNumber != 100 {
+		t.Fatalf("expected node sequence 100, got %d (err: %v)", node.SequenceNumber, err)
+	}
+
+	// Create and replay quarantine record with older sequence 50
+	batch50 := sampleBatch(nodeID, "batch-50", 50)
+	p50, _ := json.Marshal(batch50)
+	rec50, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          nodeID,
+		BatchID:         batch50.BatchID,
+		Payload:         p50,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "replaying old batch",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 50 failed: %v", err)
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{ID: rec50.ID})
+	if err != nil {
+		t.Fatalf("ReplayQuarantineRecord 50 failed: %v", err)
+	}
+
+	// Verify sequence was NOT downgraded
+	node, err = store.GetNode(ctx, nodeID)
+	if err != nil || node.SequenceNumber != 100 {
+		t.Fatalf("expected node sequence to remain 100, got %d", node.SequenceNumber)
+	}
+
+	// Create and replay quarantine record with newer sequence 200
+	batch200 := sampleBatch(nodeID, "batch-200", 200)
+	p200, _ := json.Marshal(batch200)
+	rec200, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          nodeID,
+		BatchID:         batch200.BatchID,
+		Payload:         p200,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "replaying newer batch",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 200 failed: %v", err)
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{ID: rec200.ID})
+	if err != nil {
+		t.Fatalf("ReplayQuarantineRecord 200 failed: %v", err)
+	}
+
+	// Verify sequence was monotonically updated to 200
+	node, err = store.GetNode(ctx, nodeID)
+	if err != nil || node.SequenceNumber != 200 {
+		t.Fatalf("expected node sequence to update to 200, got %d", node.SequenceNumber)
+	}
+}
+
+// 10. TestQuarantine_PrunePayloads_TerminalCleanup
+func TestQuarantine_PrunePayloads_TerminalCleanup(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	oldTime := time.Now().UTC().Add(-48 * time.Hour)
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+
+	// Record 1: replayed
+	batch1 := sampleBatch("node-p1", "batch-p1", 1)
+	p1, _ := json.Marshal(batch1)
+	rec1, _ := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:             "node-p1",
+		BatchID:            "batch-p1",
+		Payload:            p1,
+		FailureCategory:    CategoryDeliveryExhausted,
+		FailureReason:      "reason 1",
+		FirstQuarantinedAt: oldTime,
+		LastQuarantinedAt:  oldTime,
+	})
+	_, _ = store.UpdateQuarantineStatus(ctx, QuarantineStatusUpdate{
+		ID:        rec1.ID,
+		NewStatus: StatusReplayed,
+		Timestamp: oldTime,
+	})
+
+	// Record 2: discarded
+	rec2, _ := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:             "node-p2",
+		BatchID:            "batch-p2",
+		Payload:            []byte("discard payload content"),
+		FailureCategory:    CategorySchemaValidation,
+		FailureReason:      "reason 2",
+		FirstQuarantinedAt: oldTime,
+		LastQuarantinedAt:  oldTime,
+	})
+	_, _ = store.UpdateQuarantineStatus(ctx, QuarantineStatusUpdate{
+		ID:        rec2.ID,
+		NewStatus: StatusDiscarded,
+		Timestamp: oldTime,
+	})
+
+	pruned, err := store.PruneQuarantinePayloads(ctx, cutoff, 100)
+	if err != nil {
+		t.Fatalf("PruneQuarantinePayloads failed: %v", err)
+	}
+	if pruned != 2 {
+		t.Errorf("expected 2 records pruned, got %d", pruned)
+	}
+
+	// Verify both records have empty payload and retain metadata
+	for _, id := range []string{rec1.ID, rec2.ID} {
+		r, err := store.GetQuarantineRecord(ctx, id)
+		if err != nil {
+			t.Fatalf("GetQuarantineRecord %s failed: %v", id, err)
+		}
+		if len(r.Payload) != 0 {
+			t.Errorf("expected empty payload for %s, got %d bytes", id, len(r.Payload))
+		}
+		if r.FailureReason == "" {
+			t.Errorf("expected metadata failure reason preserved for %s", id)
+		}
+	}
+}
+
+// 11. TestQuarantine_PrunePayloads_ActiveProtection
+func TestQuarantine_PrunePayloads_ActiveProtection(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	oldTime := time.Now().UTC().Add(-48 * time.Hour)
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+
+	// Active quarantined record (older than cutoff)
+	activeRec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:             "node-active",
+		BatchID:            "batch-active",
+		Payload:            []byte("active payload evidence"),
+		FailureCategory:    CategoryDeliveryExhausted,
+		FailureReason:      "active quarantine reason",
+		FirstQuarantinedAt: oldTime,
+		LastQuarantinedAt:  oldTime,
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	// Manually ensure status_updated_at is older than cutoff
+	_, _ = store.db.Exec(`UPDATE cp_telemetry_quarantine SET status_updated_at = ? WHERE id = ?;`, formatTimestamp(oldTime), activeRec.ID)
+
+	pruned, err := store.PruneQuarantinePayloads(ctx, cutoff, 100)
+	if err != nil {
+		t.Fatalf("PruneQuarantinePayloads failed: %v", err)
+	}
+	if pruned != 0 {
+		t.Errorf("expected 0 active records pruned, got %d", pruned)
+	}
+
+	fresh, err := store.GetQuarantineRecord(ctx, activeRec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if string(fresh.Payload) != "active payload evidence" {
+		t.Errorf("expected active payload preserved, got %q", string(fresh.Payload))
+	}
+}
+
+// 12. TestQuarantine_PrunePayloads_BoundedLimit
+func TestQuarantine_PrunePayloads_BoundedLimit(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	oldTime := time.Now().UTC().Add(-48 * time.Hour)
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+
+	for i := 0; i < 5; i++ {
+		rec, _ := store.RecordQuarantine(ctx, &QuarantineRecord{
+			NodeID:             fmt.Sprintf("node-bound-%d", i),
+			BatchID:            fmt.Sprintf("batch-bound-%d", i),
+			Payload:            fmt.Appendf(nil, "payload-%d", i),
+			FailureCategory:    CategoryDeliveryExhausted,
+			FailureReason:      "bounded test",
+			FirstQuarantinedAt: oldTime,
+			LastQuarantinedAt:  oldTime,
+		})
+		_, _ = store.UpdateQuarantineStatus(ctx, QuarantineStatusUpdate{
+			ID:        rec.ID,
+			NewStatus: StatusDiscarded,
+			Timestamp: oldTime,
+		})
+	}
+
+	// Limit 2: should prune exactly 2
+	p1, err := store.PruneQuarantinePayloads(ctx, cutoff, 2)
+	if err != nil || p1 != 2 {
+		t.Errorf("expected 2 pruned on pass 1, got %d (err: %v)", p1, err)
+	}
+
+	// Pass 2: should prune 2
+	p2, err := store.PruneQuarantinePayloads(ctx, cutoff, 2)
+	if err != nil || p2 != 2 {
+		t.Errorf("expected 2 pruned on pass 2, got %d (err: %v)", p2, err)
+	}
+
+	// Pass 3: should prune remaining 1
+	p3, err := store.PruneQuarantinePayloads(ctx, cutoff, 2)
+	if err != nil || p3 != 1 {
+		t.Errorf("expected 1 pruned on pass 3, got %d (err: %v)", p3, err)
+	}
+
+	// Pass 4: should prune 0 (all already pruned)
+	p4, err := store.PruneQuarantinePayloads(ctx, cutoff, 2)
+	if err != nil || p4 != 0 {
+		t.Errorf("expected 0 pruned on pass 4, got %d (err: %v)", p4, err)
+	}
+}
+
+// 13. TestQuarantine_PrunePayloads_MetadataPreservation
+func TestQuarantine_PrunePayloads_MetadataPreservation(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	oldTime := time.Now().UTC().Add(-48 * time.Hour)
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	seq := uint64(777)
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		SourceStream:        "TEST_STREAM",
+		SourceSequence:      &seq,
+		SourceSubject:       "test.subject",
+		NodeID:              "node-preserve",
+		BatchID:             "batch-preserve",
+		Payload:             []byte("critical payload to be pruned"),
+		FailureCategory:     CategoryDeserialization,
+		FailureReason:       "initial failure reason",
+		LastFailureCategory: CategoryDeliveryExhausted,
+		LastFailureReason:   "last failure reason",
+		DeliveryCount:       3,
+		FirstQuarantinedAt:  oldTime,
+		LastQuarantinedAt:   oldTime,
+		ReplayMetadata: map[string]any{
+			"env": "staging",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	_, err = store.DiscardQuarantineRecord(ctx, rec.ID, "operator-audit", "preservation audit")
+	if err != nil {
+		t.Fatalf("DiscardQuarantineRecord failed: %v", err)
+	}
+
+	// Backdate status_updated_at so it passes cutoff
+	_, _ = store.db.Exec(`UPDATE cp_telemetry_quarantine SET status_updated_at = ? WHERE id = ?;`, formatTimestamp(oldTime), rec.ID)
+
+	pruned, err := store.PruneQuarantinePayloads(ctx, cutoff, 10)
+	if err != nil || pruned != 1 {
+		t.Fatalf("PruneQuarantinePayloads failed: pruned=%d, err=%v", pruned, err)
+	}
+
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+
+	// Check payload is empty
+	if len(fresh.Payload) != 0 {
+		t.Errorf("expected empty payload, got %d bytes", len(fresh.Payload))
+	}
+
+	// Verify all metadata is preserved
+	if fresh.ID != rec.ID {
+		t.Errorf("ID mismatch: got %s, want %s", fresh.ID, rec.ID)
+	}
+	if fresh.NodeID != "node-preserve" {
+		t.Errorf("NodeID mismatch: got %s", fresh.NodeID)
+	}
+	if fresh.BatchID != "batch-preserve" {
+		t.Errorf("BatchID mismatch: got %s", fresh.BatchID)
+	}
+	if fresh.SourceStream != "TEST_STREAM" {
+		t.Errorf("SourceStream mismatch: got %s", fresh.SourceStream)
+	}
+	if fresh.SourceSequence == nil || *fresh.SourceSequence != 777 {
+		t.Errorf("SourceSequence mismatch")
+	}
+	if fresh.FailureCategory != CategoryDeserialization {
+		t.Errorf("FailureCategory mismatch: got %s", fresh.FailureCategory)
+	}
+	if fresh.FailureReason != "initial failure reason" {
+		t.Errorf("FailureReason mismatch: got %s", fresh.FailureReason)
+	}
+	if fresh.LastFailureCategory != CategoryDeliveryExhausted {
+		t.Errorf("LastFailureCategory mismatch: got %s", fresh.LastFailureCategory)
+	}
+	if fresh.LastFailureReason != "last failure reason" {
+		t.Errorf("LastFailureReason mismatch: got %s", fresh.LastFailureReason)
+	}
+	if fresh.Status != StatusDiscarded {
+		t.Errorf("Status mismatch: got %s", fresh.Status)
+	}
+	if fresh.StatusUpdatedBy != "operator-audit" {
+		t.Errorf("StatusUpdatedBy mismatch: got %s", fresh.StatusUpdatedBy)
+	}
+	if fresh.StatusReason != "preservation audit" {
+		t.Errorf("StatusReason mismatch: got %s", fresh.StatusReason)
+	}
+}
+
+// 14. TestQuarantine_OrdinaryIngestion_Unchanged
+func TestQuarantine_OrdinaryIngestion_Unchanged(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	batch := sampleBatch("node-ord", "batch-ord", 1)
+	p, _ := json.Marshal(batch)
+
+	// 1. Quarantined batch cannot be ingested normally
+	_, err = store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
+		Payload:         p,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "active quarantine",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	_, err = store.RecordBatch(ctx, batch, time.Now().UTC())
+	if err == nil {
+		t.Fatal("expected RecordBatch to fail due to active quarantine")
+	}
+	if !errors.Is(err, ErrStatusConflict) {
+		t.Errorf("expected ErrStatusConflict, got %v", err)
+	}
+
+	// 2. Different batch can be ingested normally
+	diffBatch := sampleBatch("node-ord", "batch-ord-other", 2)
+	ok, err := store.RecordBatch(ctx, diffBatch, time.Now().UTC())
+	if err != nil || !ok {
+		t.Fatalf("RecordBatch for unquarantined batch failed: ok=%v, err=%v", ok, err)
+	}
+
+	// 3. Duplicate ingestion returns (false, nil)
+	ok, err = store.RecordBatch(ctx, diffBatch, time.Now().UTC())
+	if err != nil || ok {
+		t.Fatalf("duplicate RecordBatch should return (false, nil), got (%v, %v)", ok, err)
 	}
 }
