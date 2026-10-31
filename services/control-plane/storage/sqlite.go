@@ -2224,6 +2224,14 @@ func (s *SQLiteStore) ReplayQuarantineRecord(ctx context.Context, req Quarantine
 		return nil, fmt.Errorf("%w: invalid batch in quarantine payload: %v", ErrInvalidMeta, err)
 	}
 
+	// Enforce strict identity equivalence between reconstructed batch and stored quarantine row
+	if batch.NodeID != nodeID {
+		return nil, fmt.Errorf("%w: payload node_id %q does not match quarantine record node_id %q", ErrInvalidMeta, batch.NodeID, nodeID)
+	}
+	if batch.BatchID != batchID {
+		return nil, fmt.Errorf("%w: payload batch_id %q does not match quarantine record batch_id %q", ErrInvalidMeta, batch.BatchID, batchID)
+	}
+
 	// Step 3: Check if batch has already been ingested
 	var alreadyIngested bool
 	var existCount int
