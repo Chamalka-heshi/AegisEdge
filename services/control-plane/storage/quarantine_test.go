@@ -1859,20 +1859,27 @@ func TestQuarantine_AtomicReplay_AlreadyIngestedBatch(t *testing.T) {
 	batch := sampleBatch("node-preingest", "batch-preingest", 60)
 	payloadBytes, _ := json.Marshal(batch)
 
-	// Quarantine record created before extraction or with unindexed batch headers
+	// Quarantine record created with matching batch identifiers
 	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          batch.NodeID,
+		BatchID:         batch.BatchID,
 		Payload:         payloadBytes,
 		FailureCategory: CategoryDeliveryExhausted,
-		FailureReason:   "unindexed delivery retry",
+		FailureReason:   "prior delivery failure",
 	})
 	if err != nil {
 		t.Fatalf("RecordQuarantine failed: %v", err)
 	}
 
-	// Normal ingestion of the batch succeeds because quarantine record has no node/batch filter
-	recorded, err := store.RecordBatch(ctx, batch, time.Now().UTC())
-	if err != nil || !recorded {
-		t.Fatalf("RecordBatch failed: recorded=%v, err=%v", recorded, err)
+	// Directly insert batch into cp_ingested_batches to simulate alternate successful ingestion path
+	collectedAtStr := formatTimestamp(batch.CollectedAt)
+	ingestedAtStr := formatTimestamp(time.Now().UTC())
+	_, err = store.db.ExecContext(ctx, `
+		INSERT INTO cp_ingested_batches (node_id, batch_id, sequence_number, collected_at, ingested_at)
+		VALUES (?, ?, ?, ?, ?);
+	`, batch.NodeID, batch.BatchID, batch.SequenceNumber, collectedAtStr, ingestedAtStr)
+	if err != nil {
+		t.Fatalf("failed to insert batch into cp_ingested_batches: %v", err)
 	}
 
 	// Replay should succeed idempotently with AlreadyIngested: true
@@ -2285,5 +2292,218 @@ func TestQuarantine_OrdinaryIngestion_Unchanged(t *testing.T) {
 	ok, err = store.RecordBatch(ctx, diffBatch, time.Now().UTC())
 	if err != nil || ok {
 		t.Fatalf("duplicate RecordBatch should return (false, nil), got (%v, %v)", ok, err)
+	}
+}
+
+// 15. TestQuarantine_AtomicReplay_PayloadNodeIDMismatch
+func TestQuarantine_AtomicReplay_PayloadNodeIDMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	payloadBatch := sampleBatch("node-beta", "batch-common", 10)
+	payloadBytes, err := json.Marshal(payloadBatch)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          "node-alpha",
+		BatchID:         "batch-common",
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "node mismatch test",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID:        rec.ID,
+		Reason:    "attempt replay with mismatched node",
+		UpdatedBy: "operator-test",
+	})
+	if err == nil {
+		t.Fatal("expected ReplayQuarantineRecord to fail with NodeID mismatch")
+	}
+	if !errors.Is(err, ErrInvalidMeta) {
+		t.Errorf("expected ErrInvalidMeta, got %v", err)
+	}
+
+	// 1. No unintended cp_ingested_batches record exists
+	var ingestedCount int
+	err = store.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cp_ingested_batches;`).Scan(&ingestedCount)
+	if err != nil || ingestedCount != 0 {
+		t.Errorf("expected 0 ingested batches, got %d (err: %v)", ingestedCount, err)
+	}
+
+	// 2. No unintended cp_telemetry_payloads record exists
+	var payloadCount int
+	err = store.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cp_telemetry_payloads;`).Scan(&payloadCount)
+	if err != nil || payloadCount != 0 {
+		t.Errorf("expected 0 payloads stored, got %d (err: %v)", payloadCount, err)
+	}
+
+	// 3. Quarantine record remains quarantined with unchanged payload and metadata
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if fresh.Status != StatusQuarantined {
+		t.Errorf("expected status 'quarantined', got %q", fresh.Status)
+	}
+	if fresh.NodeID != "node-alpha" || fresh.BatchID != "batch-common" {
+		t.Errorf("expected identity (node-alpha, batch-common), got (%s, %s)", fresh.NodeID, fresh.BatchID)
+	}
+	if !bytes.Equal(fresh.Payload, payloadBytes) {
+		t.Errorf("expected payload bytes preserved unchanged")
+	}
+	if fresh.FailureReason != "node mismatch test" {
+		t.Errorf("expected failure reason preserved, got %q", fresh.FailureReason)
+	}
+}
+
+// 16. TestQuarantine_AtomicReplay_PayloadBatchIDMismatch
+func TestQuarantine_AtomicReplay_PayloadBatchIDMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	payloadBatch := sampleBatch("node-common", "batch-200", 20)
+	payloadBytes, err := json.Marshal(payloadBatch)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          "node-common",
+		BatchID:         "batch-100",
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "batch mismatch test",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID:        rec.ID,
+		Reason:    "attempt replay with mismatched batch",
+		UpdatedBy: "operator-test",
+	})
+	if err == nil {
+		t.Fatal("expected ReplayQuarantineRecord to fail with BatchID mismatch")
+	}
+	if !errors.Is(err, ErrInvalidMeta) {
+		t.Errorf("expected ErrInvalidMeta, got %v", err)
+	}
+
+	// 1. No unintended cp_ingested_batches record exists
+	var ingestedCount int
+	err = store.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cp_ingested_batches;`).Scan(&ingestedCount)
+	if err != nil || ingestedCount != 0 {
+		t.Errorf("expected 0 ingested batches, got %d (err: %v)", ingestedCount, err)
+	}
+
+	// 2. No unintended cp_telemetry_payloads record exists
+	var payloadCount int
+	err = store.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cp_telemetry_payloads;`).Scan(&payloadCount)
+	if err != nil || payloadCount != 0 {
+		t.Errorf("expected 0 payloads stored, got %d (err: %v)", payloadCount, err)
+	}
+
+	// 3. Quarantine record remains quarantined with unchanged payload and metadata
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if fresh.Status != StatusQuarantined {
+		t.Errorf("expected status 'quarantined', got %q", fresh.Status)
+	}
+	if fresh.NodeID != "node-common" || fresh.BatchID != "batch-100" {
+		t.Errorf("expected identity (node-common, batch-100), got (%s, %s)", fresh.NodeID, fresh.BatchID)
+	}
+	if !bytes.Equal(fresh.Payload, payloadBytes) {
+		t.Errorf("expected payload bytes preserved unchanged")
+	}
+	if fresh.FailureReason != "batch mismatch test" {
+		t.Errorf("expected failure reason preserved, got %q", fresh.FailureReason)
+	}
+}
+
+// 17. TestQuarantine_AtomicReplay_PayloadBothIdentitiesMismatch
+func TestQuarantine_AtomicReplay_PayloadBothIdentitiesMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	payloadBatch := sampleBatch("node-beta", "batch-200", 30)
+	payloadBytes, err := json.Marshal(payloadBatch)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	rec, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		NodeID:          "node-alpha",
+		BatchID:         "batch-100",
+		Payload:         payloadBytes,
+		FailureCategory: CategoryDeliveryExhausted,
+		FailureReason:   "both identities mismatch test",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine failed: %v", err)
+	}
+
+	_, err = store.ReplayQuarantineRecord(ctx, QuarantineReplayRequest{
+		ID:        rec.ID,
+		Reason:    "attempt replay with both mismatched",
+		UpdatedBy: "operator-test",
+	})
+	if err == nil {
+		t.Fatal("expected ReplayQuarantineRecord to fail with both identities mismatch")
+	}
+	if !errors.Is(err, ErrInvalidMeta) {
+		t.Errorf("expected ErrInvalidMeta, got %v", err)
+	}
+
+	// 1. No unintended cp_ingested_batches record exists
+	var ingestedCount int
+	err = store.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cp_ingested_batches;`).Scan(&ingestedCount)
+	if err != nil || ingestedCount != 0 {
+		t.Errorf("expected 0 ingested batches, got %d (err: %v)", ingestedCount, err)
+	}
+
+	// 2. No unintended cp_telemetry_payloads record exists
+	var payloadCount int
+	err = store.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cp_telemetry_payloads;`).Scan(&payloadCount)
+	if err != nil || payloadCount != 0 {
+		t.Errorf("expected 0 payloads stored, got %d (err: %v)", payloadCount, err)
+	}
+
+	// 3. Quarantine record remains quarantined with unchanged payload and metadata
+	fresh, err := store.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if fresh.Status != StatusQuarantined {
+		t.Errorf("expected status 'quarantined', got %q", fresh.Status)
+	}
+	if fresh.NodeID != "node-alpha" || fresh.BatchID != "batch-100" {
+		t.Errorf("expected identity (node-alpha, batch-100), got (%s, %s)", fresh.NodeID, fresh.BatchID)
+	}
+	if !bytes.Equal(fresh.Payload, payloadBytes) {
+		t.Errorf("expected payload bytes preserved unchanged")
+	}
+	if fresh.FailureReason != "both identities mismatch test" {
+		t.Errorf("expected failure reason preserved, got %q", fresh.FailureReason)
 	}
 }
