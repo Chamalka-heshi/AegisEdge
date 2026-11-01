@@ -169,8 +169,15 @@ verified:
 	if rec.FailureCategory != storage.CategoryDeserialization {
 		t.Errorf("expected CategoryDeserialization, got %s", rec.FailureCategory)
 	}
-	if string(rec.Payload) != string(badPayload) {
-		t.Errorf("payload mismatch: expected %s, got %s", string(badPayload), string(rec.Payload))
+	if rec.PayloadSizeBytes != len(badPayload) {
+		t.Errorf("payload size mismatch: expected %d, got %d", len(badPayload), rec.PayloadSizeBytes)
+	}
+	fetched, err := qstore.GetQuarantineRecord(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("GetQuarantineRecord failed: %v", err)
+	}
+	if string(fetched.Payload) != string(badPayload) {
+		t.Errorf("payload mismatch: expected %s, got %s", string(badPayload), string(fetched.Payload))
 	}
 	if rec.Status != storage.StatusQuarantined {
 		t.Errorf("expected status quarantined, got %s", rec.Status)
