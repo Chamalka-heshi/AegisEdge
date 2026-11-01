@@ -717,6 +717,13 @@ func (s *SQLiteStore) PruneTelemetryPayloads(ctx context.Context, cutoff time.Ti
 	return rowsAffected, nil
 }
 
+// DB returns the underlying sql.DB instance for testing and advanced diagnostics.
+func (s *SQLiteStore) DB() *sql.DB {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.db
+}
+
 // Ping verifies that the SQLite database connection is open and responsive.
 // It executes a lightweight SELECT 1 probe against the database.
 // Note: Ping checks basic database responsiveness only; it does not guarantee
@@ -1916,11 +1923,14 @@ func (s *SQLiteStore) GetQuarantineRecord(ctx context.Context, id string) (*Quar
 		_ = json.Unmarshal([]byte(replayMetaJSON), &rec.ReplayMetadata)
 	}
 
+	rec.PayloadSizeBytes = len(rec.Payload)
+
 	return &rec, nil
 }
 
 // ListQuarantineRecords returns a deterministic paginated list of quarantine records,
-// optionally filtered by status or node ID, ordered by last_quarantined_at DESC, id ASC.
+// optionally filtered by status, node ID, or failure category, ordered by last_quarantined_at DESC, id ASC.
+// Raw payload BLOBs are excluded from retrieval; only payload byte lengths are selected.
 func (s *SQLiteStore) ListQuarantineRecords(ctx context.Context, filter QuarantineFilter) ([]*QuarantineRecord, error) {
 	s.mu.RLock()
 	if s.closed {
@@ -1931,6 +1941,9 @@ func (s *SQLiteStore) ListQuarantineRecords(ctx context.Context, filter Quaranti
 
 	if filter.Status != "" && !filter.Status.Valid() {
 		return nil, fmt.Errorf("%w: invalid filter status %q", ErrInvalidQuarantineRecord, filter.Status)
+	}
+	if filter.FailureCategory != "" && !filter.FailureCategory.Valid() {
+		return nil, fmt.Errorf("%w: invalid filter failure category %q", ErrInvalidQuarantineRecord, filter.FailureCategory)
 	}
 
 	limit := filter.Limit
@@ -1947,7 +1960,7 @@ func (s *SQLiteStore) ListQuarantineRecords(ctx context.Context, filter Quaranti
 	var sb strings.Builder
 	sb.WriteString(`
 	SELECT id, dedup_key, source_stream, source_sequence, source_subject,
-	       node_id, batch_id, payload, failure_category, failure_reason,
+	       node_id, batch_id, COALESCE(LENGTH(payload), 0) AS payload_size, failure_category, failure_reason,
 	       last_failure_category, last_failure_reason,
 	       delivery_count, attempts, first_quarantined_at, last_quarantined_at,
 	       status, status_updated_at, status_reason, status_updated_by,
@@ -1964,6 +1977,10 @@ func (s *SQLiteStore) ListQuarantineRecords(ctx context.Context, filter Quaranti
 	if strings.TrimSpace(filter.NodeID) != "" {
 		sb.WriteString(" AND node_id = ?")
 		args = append(args, strings.TrimSpace(filter.NodeID))
+	}
+	if filter.FailureCategory != "" {
+		sb.WriteString(" AND failure_category = ?")
+		args = append(args, string(filter.FailureCategory))
 	}
 
 	sb.WriteString(" ORDER BY last_quarantined_at DESC, id ASC LIMIT ? OFFSET ?;")
@@ -1995,7 +2012,7 @@ func (s *SQLiteStore) ListQuarantineRecords(ctx context.Context, filter Quaranti
 			&rec.SourceSubject,
 			&rec.NodeID,
 			&rec.BatchID,
-			&rec.Payload,
+			&rec.PayloadSizeBytes,
 			&categoryStr,
 			&rec.FailureReason,
 			&lastCategoryStr,
