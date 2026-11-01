@@ -4055,20 +4055,33 @@ func TestServer_PrunerLifecycle(t *testing.T) {
 
 	// 1. Validation test
 	invalidCfg := PruningConfig{
-		Enabled:                true,
-		TelemetryRetentionDays: 0,
-		PruneInterval:          time.Hour,
-		PruneBatchSize:         100,
+		Enabled:                 true,
+		TelemetryRetentionDays:  0,
+		QuarantineRetentionDays: 30,
+		PruneInterval:           time.Hour,
+		PruneBatchSize:          100,
 	}
 	if err := invalidCfg.Validate(); err == nil {
-		t.Fatalf("expected error for non-positive retention days")
+		t.Fatalf("expected error for non-positive telemetry retention days")
+	}
+
+	invalidQuarantineCfg := PruningConfig{
+		Enabled:                 true,
+		TelemetryRetentionDays:  30,
+		QuarantineRetentionDays: 0,
+		PruneInterval:           time.Hour,
+		PruneBatchSize:          100,
+	}
+	if err := invalidQuarantineCfg.Validate(); err == nil {
+		t.Fatalf("expected error for non-positive quarantine retention days")
 	}
 
 	validCfg := PruningConfig{
-		Enabled:                true,
-		TelemetryRetentionDays: 30,
-		PruneInterval:          50 * time.Millisecond,
-		PruneBatchSize:         500,
+		Enabled:                 true,
+		TelemetryRetentionDays:  30,
+		QuarantineRetentionDays: 30,
+		PruneInterval:           50 * time.Millisecond,
+		PruneBatchSize:          500,
 	}
 	if err := validCfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got: %v", err)
@@ -4165,10 +4178,11 @@ func TestServer_PrunerShutdownHardening(t *testing.T) {
 	srv := NewServer(newDiscardLogger(),
 		WithIdempotencyStore(store),
 		WithPruningConfig(PruningConfig{
-			Enabled:                true,
-			TelemetryRetentionDays: 30,
-			PruneInterval:          time.Hour,
-			PruneBatchSize:         100,
+			Enabled:                 true,
+			TelemetryRetentionDays:  30,
+			QuarantineRetentionDays: 30,
+			PruneInterval:           time.Hour,
+			PruneBatchSize:          100,
 		}),
 	)
 
