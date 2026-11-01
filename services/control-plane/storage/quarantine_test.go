@@ -675,15 +675,18 @@ func TestQuarantine_ListAndPagination(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		seq := uint64(i)
 		nodeID := "node-1"
+		cat := CategoryDeserialization
 		if i > 5 {
 			nodeID = "node-2"
+			cat = CategorySchemaValidation
 		}
 		_, err := store.RecordQuarantine(ctx, &QuarantineRecord{
-			SourceStream:   "AEGISEDGE_TELEMETRY",
-			SourceSequence: &seq,
-			NodeID:         nodeID,
-			Payload:        fmt.Appendf(nil, "batch %d", i),
-			DeliveryCount:  i,
+			SourceStream:    "AEGISEDGE_TELEMETRY",
+			SourceSequence:  &seq,
+			NodeID:          nodeID,
+			FailureCategory: cat,
+			Payload:         fmt.Appendf(nil, "batch %d", i),
+			DeliveryCount:   i,
 		})
 		if err != nil {
 			t.Fatalf("RecordQuarantine %d failed: %v", i, err)
@@ -742,6 +745,40 @@ func TestQuarantine_ListAndPagination(t *testing.T) {
 	}
 	if len(byReplayed) != 0 || byReplayed == nil {
 		t.Errorf("expected empty non-nil slice, got %v", byReplayed)
+	}
+
+	// Filter by failure_category = CategoryDeserialization
+	byCategory, err := store.ListQuarantineRecords(ctx, QuarantineFilter{FailureCategory: CategoryDeserialization})
+	if err != nil {
+		t.Fatalf("List by category failed: %v", err)
+	}
+	if len(byCategory) != 5 {
+		t.Errorf("expected 5 records for CategoryDeserialization, got %d", len(byCategory))
+	}
+
+	// Filter by unused category
+	byUnusedCategory, err := store.ListQuarantineRecords(ctx, QuarantineFilter{FailureCategory: CategoryStorageFailure})
+	if err != nil {
+		t.Fatalf("List by unused category failed: %v", err)
+	}
+	if len(byUnusedCategory) != 0 {
+		t.Errorf("expected 0 records for unused category, got %d", len(byUnusedCategory))
+	}
+
+	// Bogus failure_category in filter -> error
+	_, err = store.ListQuarantineRecords(ctx, QuarantineFilter{FailureCategory: "bogus"})
+	if !errors.Is(err, ErrInvalidQuarantineRecord) {
+		t.Errorf("expected ErrInvalidQuarantineRecord for bogus filter category, got %v", err)
+	}
+
+	// Verify that list records do not load raw payload bytes and populate PayloadSizeBytes
+	for idx, r := range p1 {
+		if r.Payload != nil {
+			t.Errorf("expected list record %d payload to be nil (not loaded), got %d bytes", idx, len(r.Payload))
+		}
+		if r.PayloadSizeBytes <= 0 {
+			t.Errorf("expected list record %d PayloadSizeBytes to be positive, got %d", idx, r.PayloadSizeBytes)
+		}
 	}
 
 	// Invalid status in filter -> error
@@ -1834,15 +1871,16 @@ func TestQuarantine_Concurrent_ReplayVsDiscard(t *testing.T) {
 	}
 
 	hasBatch, _ := store.HasBatch(ctx, batch.NodeID, batch.BatchID)
-	if fresh.Status == StatusReplayed {
+	switch fresh.Status {
+case StatusReplayed:
 		if !hasBatch {
 			t.Errorf("expected batch to be ingested when replay won the race")
 		}
-	} else if fresh.Status == StatusDiscarded {
+	case StatusDiscarded:
 		if hasBatch {
 			t.Errorf("expected batch NOT to be ingested when discard won the race")
 		}
-	} else {
+	default:
 		t.Errorf("unexpected terminal status: %q", fresh.Status)
 	}
 }
