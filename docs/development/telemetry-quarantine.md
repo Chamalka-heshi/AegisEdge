@@ -487,3 +487,86 @@ Following resolution of a stalled sequence, verify complete recovery across all 
    - Remember that `stalledSeqs` tracking and the gauge are **process-local**. If the control-plane service was restarted, a gauge reading of 0 does not prove durable resolution.
    - If an unacknowledged sequence remains unresolved in JetStream, subsequent periodic recovery scans will observe `ErrNotEligible` again, re-track the sequence, and re-issue warnings once `StalledWarningThreshold` elapses.
    - The authoritative, durable audit history resides exclusively in `cp_telemetry_quarantine` and `cp_ingested_batches`.
+
+---
+
+## 9. Control-Plane Terminal Quarantine Retention and Pruning
+
+To prevent unbounded SQLite database growth while preserving strict audit compliance, the AegisEdge control plane integrates automated retention pruning for terminal quarantine payloads into its background pruning lifecycle.
+
+### 9.1 Retention Overview and Invariants
+
+Quarantined telemetry batches in `cp_telemetry_quarantine` contain large raw payload BLOBs (`payload`). Over long operational periods, resolved quarantine records can accumulate substantial storage overhead.
+
+The retention pruner enforces strict architectural invariants:
+
+1. **Payload Clearing Only (`payload = X''`)**:
+   - Pruning clears the raw telemetry binary data by setting `payload = X''` and updating `updated_at = CURRENT_TIMESTAMP`.
+   - **No rows are deleted**: all record identifiers, timestamps, failure categories, diagnostic error strings, delivery counts, operator identities, and resolution notes remain permanently available in `cp_telemetry_quarantine`.
+   - The idempotency mapping in `cp_ingested_batches` is completely untouched.
+2. **Strict Protection for Active Quarantines**:
+   - Records with `status = 'quarantined'` are **never pruned**, regardless of age. Their full payload remains accessible until an operator explicitly acts on them.
+3. **Terminal Records Only**:
+   - Only records with terminal status `replayed` or `discarded` are eligible for payload pruning.
+4. **Cutoff Timestamp Semantics**:
+   - Eligibility is governed by `status_updated_at < cutoff` (where `cutoff = now - QuarantineRetentionDays`).
+   - A newly resolved record (replayed or discarded within the retention window) retains its full payload until the retention period elapses.
+5. **Bounded Execution**:
+   - Pruning passes are bounded by `PruneBatchSize` (default: 500) via `LIMIT ?` to avoid transaction starvation and SQLite database lock contention.
+6. **Failure Isolation**:
+   - A failure in quarantine pruning is logged as a warning and does not crash the control plane or disrupt active telemetry ingestion.
+
+### 9.2 Configuration Reference
+
+Terminal quarantine payload pruning is controlled by the following parameters:
+
+| Parameter | CLI Flag | Environment Variable | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **Pruning Master Switch** | `--retention-enabled` | `STORAGE_RETENTION_ENABLED` | `false` | Master toggle to enable background retention pruner worker. |
+| **Quarantine Retention** | `--quarantine-retention-days` | `STORAGE_QUARANTINE_RETENTION_DAYS` | `30` | Days to retain payload BLOBs for terminal (`replayed`, `discarded`) records. |
+| **Telemetry Retention** | `--retention-days` | `STORAGE_RETENTION_DAYS` | `30` | Days to retain historical ingested telemetry payloads. |
+| **Prune Interval** | `--prune-interval` | `STORAGE_PRUNE_INTERVAL` | `1h` | Interval between background storage pruning cycles. |
+| **Prune Batch Size** | `--prune-batch-size` | `STORAGE_PRUNE_BATCH_SIZE` | `500` | Maximum number of records pruned per pass per table. |
+
+#### Precedence Order
+1. Explicit CLI flags (e.g. `--quarantine-retention-days=60`)
+2. Environment variables (e.g. `STORAGE_QUARANTINE_RETENTION_DAYS=45`)
+3. Built-in defaults (`server.DefaultQuarantineRetentionDays = 30`)
+
+### 9.3 Eligibility SQL Logic
+
+The pruning query executed against SQLite durable storage is:
+
+```sql
+UPDATE cp_telemetry_quarantine
+SET payload = X'',
+    updated_at = CURRENT_TIMESTAMP
+WHERE id IN (
+    SELECT q.id
+    FROM cp_telemetry_quarantine q
+    WHERE q.status IN ('replayed', 'discarded')
+      AND q.status_updated_at < ?
+      AND LENGTH(q.payload) > 0
+    ORDER BY q.status_updated_at ASC, q.rowid ASC
+    LIMIT ?
+);
+```
+
+### 9.4 Prometheus Observability
+
+Operators monitor quarantine pruning performance and progress through Prometheus metrics exposed on the control-plane `/metrics` endpoint:
+
+- **`aegisedge_quarantine_pruned_payloads_total`** (Counter):
+  - Incremented strictly on successful pruning passes by the exact number of terminal quarantine payloads cleared.
+  - Failures do not increment the counter.
+  - Repeated passes on already-cleared records return 0 rows affected and do not double-count.
+
+#### Scraping Example
+
+```powershell
+curl -s http://127.0.0.1:8080/metrics | findstr "aegisedge_quarantine_pruned_payloads_total"
+# Output:
+# # HELP aegisedge_quarantine_pruned_payloads_total Total number of historical terminal quarantine payloads successfully pruned from durable storage.
+# # TYPE aegisedge_quarantine_pruned_payloads_total counter
+# aegisedge_quarantine_pruned_payloads_total 14
+```
