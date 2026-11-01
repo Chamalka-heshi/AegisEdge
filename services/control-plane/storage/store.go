@@ -307,6 +307,7 @@ type QuarantineRecord struct {
 	StatusReason        string             `json:"status_reason,omitempty"`
 	StatusUpdatedBy     string             `json:"status_updated_by,omitempty"`
 	ReplayMetadata      map[string]any     `json:"replay_metadata,omitempty"`
+	PayloadSizeBytes    int                `json:"payload_size_bytes"`
 }
 
 // Validate verifies mandatory constraints and bounds on the quarantine record.
@@ -349,10 +350,11 @@ func (r *QuarantineRecord) Validate() error {
 
 // QuarantineFilter defines criteria for paginated listing of quarantined records.
 type QuarantineFilter struct {
-	Status QuarantineStatus `json:"status,omitempty"`
-	NodeID string           `json:"node_id,omitempty"`
-	Limit  int              `json:"limit,omitempty"`
-	Offset int              `json:"offset,omitempty"`
+	Status          QuarantineStatus   `json:"status,omitempty"`
+	NodeID          string             `json:"node_id,omitempty"`
+	FailureCategory QuarantineCategory `json:"failure_category,omitempty"`
+	Limit           int                `json:"limit,omitempty"`
+	Offset          int                `json:"offset,omitempty"`
 }
 
 // QuarantineStatusUpdate specifies a validated state transition request.
