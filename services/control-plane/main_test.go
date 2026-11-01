@@ -277,3 +277,102 @@ func TestBuildServerConfig_DBPath(t *testing.T) {
 		t.Errorf("expected CLI precedence '/custom/cli-path.db', got %q", cfg3.DBPath)
 	}
 }
+
+func TestBuildServerConfig_RetentionConfig(t *testing.T) {
+	baseCfg := ServerConfig{Host: "127.0.0.1", Port: 8080}
+
+	// 1. Defaults when unset
+	cfg1, _, err := BuildServerConfig(baseCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig failed: %v", err)
+	}
+	if cfg1.RetentionEnabled != false {
+		t.Errorf("expected RetentionEnabled false, got %v", cfg1.RetentionEnabled)
+	}
+	if cfg1.TelemetryRetentionDays != server.DefaultTelemetryRetentionDays {
+		t.Errorf("expected default TelemetryRetentionDays %d, got %d", server.DefaultTelemetryRetentionDays, cfg1.TelemetryRetentionDays)
+	}
+	if cfg1.QuarantineRetentionDays != server.DefaultQuarantineRetentionDays {
+		t.Errorf("expected default QuarantineRetentionDays %d, got %d", server.DefaultQuarantineRetentionDays, cfg1.QuarantineRetentionDays)
+	}
+	if cfg1.PruneInterval != server.DefaultPruneInterval {
+		t.Errorf("expected default PruneInterval %v, got %v", server.DefaultPruneInterval, cfg1.PruneInterval)
+	}
+	if cfg1.PruneBatchSize != server.DefaultPruneBatchSize {
+		t.Errorf("expected default PruneBatchSize %d, got %d", server.DefaultPruneBatchSize, cfg1.PruneBatchSize)
+	}
+
+	// 2. Environment variable overrides
+	t.Setenv("STORAGE_RETENTION_ENABLED", "true")
+	t.Setenv("STORAGE_RETENTION_DAYS", "45")
+	t.Setenv("STORAGE_QUARANTINE_RETENTION_DAYS", "60")
+	t.Setenv("STORAGE_PRUNE_INTERVAL", "2h")
+	t.Setenv("STORAGE_PRUNE_BATCH_SIZE", "250")
+
+	cfg2, _, err := BuildServerConfig(baseCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig with env failed: %v", err)
+	}
+	if !cfg2.RetentionEnabled {
+		t.Errorf("expected RetentionEnabled true from env")
+	}
+	if cfg2.TelemetryRetentionDays != 45 {
+		t.Errorf("expected TelemetryRetentionDays 45, got %d", cfg2.TelemetryRetentionDays)
+	}
+	if cfg2.QuarantineRetentionDays != 60 {
+		t.Errorf("expected QuarantineRetentionDays 60, got %d", cfg2.QuarantineRetentionDays)
+	}
+	if cfg2.PruneInterval != 2*time.Hour {
+		t.Errorf("expected PruneInterval 2h, got %v", cfg2.PruneInterval)
+	}
+	if cfg2.PruneBatchSize != 250 {
+		t.Errorf("expected PruneBatchSize 250, got %d", cfg2.PruneBatchSize)
+	}
+
+	// 3. CLI flag precedence over env variable
+	cliCfg := baseCfg
+	cliCfg.TelemetryRetentionDays = 15
+	cliCfg.QuarantineRetentionDays = 20
+	cliCfg.PruneInterval = 30 * time.Minute
+	cliCfg.PruneBatchSize = 100
+
+	cfg3, _, err := BuildServerConfig(cliCfg, false)
+	if err != nil {
+		t.Fatalf("BuildServerConfig with CLI overrides failed: %v", err)
+	}
+	if cfg3.TelemetryRetentionDays != 15 {
+		t.Errorf("expected CLI precedence 15, got %d", cfg3.TelemetryRetentionDays)
+	}
+	if cfg3.QuarantineRetentionDays != 20 {
+		t.Errorf("expected CLI precedence 20, got %d", cfg3.QuarantineRetentionDays)
+	}
+	if cfg3.PruneInterval != 30*time.Minute {
+		t.Errorf("expected CLI precedence 30m, got %v", cfg3.PruneInterval)
+	}
+	if cfg3.PruneBatchSize != 100 {
+		t.Errorf("expected CLI precedence 100, got %d", cfg3.PruneBatchSize)
+	}
+
+	// 4. Invalid values
+	t.Setenv("STORAGE_QUARANTINE_RETENTION_DAYS", "invalid")
+	if _, _, err := BuildServerConfig(baseCfg, false); err == nil {
+		t.Errorf("expected error for invalid STORAGE_QUARANTINE_RETENTION_DAYS")
+	}
+
+	t.Setenv("STORAGE_QUARANTINE_RETENTION_DAYS", "-10")
+	if _, _, err := BuildServerConfig(baseCfg, false); err == nil {
+		t.Errorf("expected error for negative STORAGE_QUARANTINE_RETENTION_DAYS")
+	}
+
+	t.Setenv("STORAGE_QUARANTINE_RETENTION_DAYS", "30")
+	negCfg := baseCfg
+	negCfg.QuarantineRetentionDays = -5
+	if _, _, err := BuildServerConfig(negCfg, false); err == nil {
+		t.Errorf("expected error for negative QuarantineRetentionDays in CLI flags")
+	}
+
+	t.Setenv("STORAGE_RETENTION_DAYS", "bad-value")
+	if _, _, err := BuildServerConfig(baseCfg, false); err == nil {
+		t.Errorf("expected error for invalid STORAGE_RETENTION_DAYS")
+	}
+}
