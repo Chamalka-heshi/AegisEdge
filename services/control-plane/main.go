@@ -43,10 +43,11 @@ type ServerConfig struct {
 	DBPath            string
 
 	// Storage Retention & Pruning
-	RetentionEnabled       bool
-	TelemetryRetentionDays int
-	PruneInterval          time.Duration
-	PruneBatchSize         int
+	RetentionEnabled        bool
+	TelemetryRetentionDays  int
+	QuarantineRetentionDays int
+	PruneInterval           time.Duration
+	PruneBatchSize          int
 }
 
 // BuildServerConfig constructs and validates ServerConfig and AuthConfig from CLI flags and environment variables.
@@ -120,15 +121,35 @@ func BuildServerConfig(flags ServerConfig, isProduction bool) (ServerConfig, ser
 			}
 		}
 	}
-	if cfg.TelemetryRetentionDays <= 0 {
+	if cfg.TelemetryRetentionDays < 0 {
+		return cfg, server.AuthConfig{}, fmt.Errorf("telemetry retention days cannot be negative: %d", cfg.TelemetryRetentionDays)
+	}
+	if cfg.TelemetryRetentionDays == 0 {
 		if daysStr := strings.TrimSpace(os.Getenv("STORAGE_RETENTION_DAYS")); daysStr != "" {
-			if val, err := strconv.Atoi(daysStr); err == nil && val > 0 {
-				cfg.TelemetryRetentionDays = val
+			val, err := strconv.Atoi(daysStr)
+			if err != nil || val <= 0 {
+				return cfg, server.AuthConfig{}, fmt.Errorf("invalid STORAGE_RETENTION_DAYS: %q (must be a positive integer)", daysStr)
 			}
+			cfg.TelemetryRetentionDays = val
 		}
 	}
 	if cfg.TelemetryRetentionDays <= 0 {
 		cfg.TelemetryRetentionDays = server.DefaultTelemetryRetentionDays
+	}
+	if cfg.QuarantineRetentionDays < 0 {
+		return cfg, server.AuthConfig{}, fmt.Errorf("quarantine retention days cannot be negative: %d", cfg.QuarantineRetentionDays)
+	}
+	if cfg.QuarantineRetentionDays == 0 {
+		if qDaysStr := strings.TrimSpace(os.Getenv("STORAGE_QUARANTINE_RETENTION_DAYS")); qDaysStr != "" {
+			val, err := strconv.Atoi(qDaysStr)
+			if err != nil || val <= 0 {
+				return cfg, server.AuthConfig{}, fmt.Errorf("invalid STORAGE_QUARANTINE_RETENTION_DAYS: %q (must be a positive integer)", qDaysStr)
+			}
+			cfg.QuarantineRetentionDays = val
+		}
+	}
+	if cfg.QuarantineRetentionDays <= 0 {
+		cfg.QuarantineRetentionDays = server.DefaultQuarantineRetentionDays
 	}
 	if cfg.PruneInterval <= 0 {
 		if intvStr := strings.TrimSpace(os.Getenv("STORAGE_PRUNE_INTERVAL")); intvStr != "" {
@@ -195,10 +216,11 @@ func main() {
 		tlsKeyFile        = flag.String("tls-key", "", "Path to TLS private key file")
 		maxHistoryBatches = flag.Int("max-history-batches", server.DefaultMaxHistoryBatches, "Maximum number of recent telemetry batch payloads retained in memory")
 		dbPath            = flag.String("db-path", DefaultDBPath, "Path to SQLite database file for durable idempotency tracking")
-		retentionEnabled  = flag.Bool("retention-enabled", false, "Enable background telemetry payload retention and pruning")
-		retentionDays     = flag.Int("retention-days", server.DefaultTelemetryRetentionDays, "Days to retain historical telemetry payloads")
-		pruneInterval     = flag.Duration("prune-interval", server.DefaultPruneInterval, "Interval between background storage pruning cycles")
-		pruneBatchSize    = flag.Int("prune-batch-size", server.DefaultPruneBatchSize, "Maximum payloads pruned per pass")
+		retentionEnabled        = flag.Bool("retention-enabled", false, "Enable background telemetry payload retention and pruning")
+		retentionDays           = flag.Int("retention-days", server.DefaultTelemetryRetentionDays, "Days to retain historical telemetry payloads")
+		quarantineRetentionDays = flag.Int("quarantine-retention-days", server.DefaultQuarantineRetentionDays, "Days to retain historical terminal quarantine payloads")
+		pruneInterval           = flag.Duration("prune-interval", server.DefaultPruneInterval, "Interval between background storage pruning cycles")
+		pruneBatchSize          = flag.Int("prune-batch-size", server.DefaultPruneBatchSize, "Maximum payloads pruned per pass")
 	)
 	flag.Parse()
 
@@ -208,22 +230,23 @@ func main() {
 	}
 
 	rawFlags := ServerConfig{
-		Host:                   *host,
-		Port:                   *port,
-		LogLevel:               *logLevel,
-		AuthEnabled:            *authEnabled,
-		SharedSecret:           *sharedSecret,
-		NodeSecretsFile:        *nodeSecretsFile,
-		AdminToken:             *adminToken,
-		MaxClockSkew:           *maxClockSkew,
-		TLSCertFile:            *tlsCertFile,
-		TLSKeyFile:             *tlsKeyFile,
-		MaxHistoryBatches:      *maxHistoryBatches,
-		DBPath:                 *dbPath,
-		RetentionEnabled:       *retentionEnabled,
-		TelemetryRetentionDays: *retentionDays,
-		PruneInterval:          *pruneInterval,
-		PruneBatchSize:         *pruneBatchSize,
+		Host:                    *host,
+		Port:                    *port,
+		LogLevel:                *logLevel,
+		AuthEnabled:             *authEnabled,
+		SharedSecret:            *sharedSecret,
+		NodeSecretsFile:         *nodeSecretsFile,
+		AdminToken:              *adminToken,
+		MaxClockSkew:            *maxClockSkew,
+		TLSCertFile:             *tlsCertFile,
+		TLSKeyFile:              *tlsKeyFile,
+		MaxHistoryBatches:       *maxHistoryBatches,
+		DBPath:                  *dbPath,
+		RetentionEnabled:        *retentionEnabled,
+		TelemetryRetentionDays:  *retentionDays,
+		QuarantineRetentionDays: *quarantineRetentionDays,
+		PruneInterval:           *pruneInterval,
+		PruneBatchSize:          *pruneBatchSize,
 	}
 
 	// Environment posture check
@@ -271,10 +294,11 @@ func main() {
 		server.WithIdempotencyStore(store),
 		server.WithMaxHistory(cfg.MaxHistoryBatches),
 		server.WithPruningConfig(server.PruningConfig{
-			Enabled:                cfg.RetentionEnabled,
-			TelemetryRetentionDays: cfg.TelemetryRetentionDays,
-			PruneInterval:          cfg.PruneInterval,
-			PruneBatchSize:         cfg.PruneBatchSize,
+			Enabled:                 cfg.RetentionEnabled,
+			TelemetryRetentionDays:  cfg.TelemetryRetentionDays,
+			QuarantineRetentionDays: cfg.QuarantineRetentionDays,
+			PruneInterval:           cfg.PruneInterval,
+			PruneBatchSize:          cfg.PruneBatchSize,
 		}),
 	)
 	if err := srvInstance.InitError(); err != nil {
