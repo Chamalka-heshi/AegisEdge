@@ -232,6 +232,7 @@ func TestControlPlaneMetrics(t *testing.T) {
 	m.RecordStorageProbeDuration(50 * time.Millisecond)
 	m.RecordStorageProbeDurationSeconds(0.012)
 	m.RecordStorageProbeFailure()
+	m.RecordQuarantinePrunedPayloads(7)
 
 	// Record Auth Failures
 	m.RecordAuthFailure(ReasonInvalidSignature)
@@ -295,6 +296,7 @@ func TestControlPlaneMetrics(t *testing.T) {
 		MetricNATSStalledUnacknowledgedSequences,
 		MetricStoragePrunedPayloadsTotal,
 		MetricStoragePruneFailuresTotal,
+		MetricQuarantinePrunedPayloadsTotal,
 	}
 	for _, name := range requiredMetrics {
 		if !strings.Contains(output, name) {
@@ -324,6 +326,7 @@ func TestControlPlaneMetrics(t *testing.T) {
 		`aegisedge_control_plane_nats_quarantined_total 7`,
 		`aegisedge_control_plane_nats_recovered_total 6`,
 		`aegisedge_control_plane_nats_stalled_unacknowledged_sequences 3`,
+		`aegisedge_quarantine_pruned_payloads_total 7`,
 	}
 	for _, sub := range expectedSubstrings {
 		if !strings.Contains(output, sub) {
@@ -525,5 +528,33 @@ func TestNameAndLabelValidation(t *testing.T) {
 		if err := r.Register(cv); err == nil {
 			t.Fatalf("expected error for invalid labels %v, got nil", labels)
 		}
+	}
+}
+
+func TestMetrics_RecordQuarantinePrunedPayloads(t *testing.T) {
+	// 1. Nil safety
+	var nilMetrics *Metrics
+	nilMetrics.RecordQuarantinePrunedPayloads(10) // should not panic
+
+	// 2. Normal increments and non-positive ignored
+	m := NewMetrics()
+	m.RecordQuarantinePrunedPayloads(0)
+	m.RecordQuarantinePrunedPayloads(-5)
+
+	out := m.Registry().FormatPrometheus()
+	if !strings.Contains(out, "aegisedge_quarantine_pruned_payloads_total 0") {
+		t.Fatalf("expected initial 0, got:\n%s", out)
+	}
+
+	m.RecordQuarantinePrunedPayloads(12)
+	out = m.Registry().FormatPrometheus()
+	if !strings.Contains(out, "aegisedge_quarantine_pruned_payloads_total 12") {
+		t.Fatalf("expected 12 after increment, got:\n%s", out)
+	}
+
+	m.RecordQuarantinePrunedPayloads(8)
+	out = m.Registry().FormatPrometheus()
+	if !strings.Contains(out, "aegisedge_quarantine_pruned_payloads_total 20") {
+		t.Fatalf("expected 20 after second increment, got:\n%s", out)
 	}
 }
