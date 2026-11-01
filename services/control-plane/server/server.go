@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,6 +247,17 @@ func WithIdempotencyStore(store storage.IdempotencyStore) ServerOption {
 	}
 }
 
+// WithQuarantineStore configures the quarantine store for managing failed batches.
+func WithQuarantineStore(qs storage.QuarantineStore) ServerOption {
+	return func(s *Server) error {
+		if qs == nil {
+			return errors.New("quarantine store cannot be nil")
+		}
+		s.quarantineStore = qs
+		return nil
+	}
+}
+
 // WithMetrics configures the operational metrics instance for the server.
 func WithMetrics(m *metrics.Metrics) ServerOption {
 	return func(s *Server) error {
@@ -267,6 +280,7 @@ func WithMetrics(m *metrics.Metrics) ServerOption {
 type Server struct {
 	mu                  sync.RWMutex
 	store               storage.IdempotencyStore
+	quarantineStore     storage.QuarantineStore
 	history             *historyRingBuffer
 	nodes               map[string]*NodeRecord
 	nodesList           []*NodeRecord
@@ -372,6 +386,11 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 			s.logger.Error("failed to initialize default in-memory sqlite store", slog.Any("error", err))
 		} else {
 			s.store = memStore
+			s.quarantineStore = memStore
+		}
+	} else if s.quarantineStore == nil {
+		if qs, ok := s.store.(storage.QuarantineStore); ok {
+			s.quarantineStore = qs
 		}
 	}
 
@@ -594,6 +613,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/v1/telemetry/batches", s.handleTelemetryBatches)
+	mux.HandleFunc("/api/v1/telemetry/quarantine", s.handleQuarantineRoute)
+	mux.HandleFunc("/api/v1/telemetry/quarantine/", s.handleQuarantineRoute)
 	mux.HandleFunc("/api/v1/nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("/api/v1/nodes/heartbeat", s.handleNodeHeartbeat)
 	mux.HandleFunc("/api/v1/nodes/", s.handleNodes)
@@ -1644,4 +1665,663 @@ func (s *Server) GetNodes() []*NodeRecord {
 		out[i] = &cp
 	}
 	return out
+}
+
+// QuarantineStore returns the server's configured quarantine store.
+func (s *Server) QuarantineStore() storage.QuarantineStore {
+	return s.quarantineStore
+}
+
+// QuarantineListItem represents a single quarantine record in list query responses without raw payload BLOB.
+type QuarantineListItem struct {
+	ID                  string                     `json:"id"`
+	DeduplicationKey    string                     `json:"deduplication_key"`
+	SourceStream        string                     `json:"source_stream,omitempty"`
+	SourceSequence      *uint64                    `json:"source_sequence,omitempty"`
+	SourceSubject       string                     `json:"source_subject,omitempty"`
+	NodeID              string                     `json:"node_id,omitempty"`
+	BatchID             string                     `json:"batch_id,omitempty"`
+	FailureCategory     storage.QuarantineCategory `json:"failure_category"`
+	FailureReason       string                     `json:"failure_reason"`
+	LastFailureCategory storage.QuarantineCategory `json:"last_failure_category,omitempty"`
+	LastFailureReason   string                     `json:"last_failure_reason,omitempty"`
+	DeliveryCount       int                        `json:"delivery_count"`
+	Attempts            int                        `json:"attempts"`
+	FirstQuarantinedAt  time.Time                  `json:"first_quarantined_at"`
+	LastQuarantinedAt   time.Time                  `json:"last_quarantined_at"`
+	Status              storage.QuarantineStatus   `json:"status"`
+	StatusUpdatedAt     time.Time                  `json:"status_updated_at"`
+	StatusReason        string                     `json:"status_reason,omitempty"`
+	StatusUpdatedBy     string                     `json:"status_updated_by,omitempty"`
+	PayloadSizeBytes    int                        `json:"payload_size_bytes"`
+}
+
+// QuarantineDetailResponse represents the complete quarantine record including raw base64 payload and parsed batch.
+type QuarantineDetailResponse struct {
+	ID                  string                     `json:"id"`
+	DeduplicationKey    string                     `json:"deduplication_key"`
+	SourceStream        string                     `json:"source_stream,omitempty"`
+	SourceSequence      *uint64                    `json:"source_sequence,omitempty"`
+	SourceSubject       string                     `json:"source_subject,omitempty"`
+	NodeID              string                     `json:"node_id,omitempty"`
+	BatchID             string                     `json:"batch_id,omitempty"`
+	FailureCategory     storage.QuarantineCategory `json:"failure_category"`
+	FailureReason       string                     `json:"failure_reason"`
+	LastFailureCategory storage.QuarantineCategory `json:"last_failure_category,omitempty"`
+	LastFailureReason   string                     `json:"last_failure_reason,omitempty"`
+	DeliveryCount       int                        `json:"delivery_count"`
+	Attempts            int                        `json:"attempts"`
+	FirstQuarantinedAt  time.Time                  `json:"first_quarantined_at"`
+	LastQuarantinedAt   time.Time                  `json:"last_quarantined_at"`
+	Status              storage.QuarantineStatus   `json:"status"`
+	StatusUpdatedAt     time.Time                  `json:"status_updated_at"`
+	StatusReason        string                     `json:"status_reason,omitempty"`
+	StatusUpdatedBy     string                     `json:"status_updated_by,omitempty"`
+	ReplayMetadata      map[string]any             `json:"replay_metadata,omitempty"`
+	Payload             string                     `json:"payload"`
+	PayloadSizeBytes    int                        `json:"payload_size_bytes"`
+	ParsedBatch         *types.TelemetryBatch      `json:"parsed_batch"`
+}
+
+// QuarantineReplayResponse represents the outcome of a quarantine replay operation.
+type QuarantineReplayResponse struct {
+	ID              string                   `json:"id"`
+	Status          storage.QuarantineStatus `json:"status"`
+	AlreadyIngested bool                     `json:"already_ingested"`
+	NodeID          string                   `json:"node_id,omitempty"`
+	BatchID         string                   `json:"batch_id,omitempty"`
+}
+
+// QuarantineDiscardResponse represents the outcome of a quarantine discard operation.
+type QuarantineDiscardResponse struct {
+	ID     string                   `json:"id"`
+	Status storage.QuarantineStatus `json:"status"`
+}
+
+type quarantineActionRequestBody struct {
+	Reason    string `json:"reason,omitempty"`
+	UpdatedBy string `json:"updated_by,omitempty"`
+}
+
+// parseQuarantinePayload attempts to reconstruct a valid TelemetryBatch from stored quarantine payload bytes.
+// It supports both canonical TelemetryEvent JSON envelopes and direct TelemetryBatch JSON representations.
+func parseQuarantinePayload(payload []byte) *types.TelemetryBatch {
+	if len(payload) == 0 {
+		return nil
+	}
+	var event types.TelemetryEvent
+	if err := json.Unmarshal(payload, &event); err == nil && event.Payload != nil {
+		if err := event.Payload.Validate(); err == nil {
+			return event.Payload
+		}
+	}
+	var directBatch types.TelemetryBatch
+	if err := json.Unmarshal(payload, &directBatch); err == nil {
+		if err := directBatch.Validate(); err == nil {
+			return &directBatch
+		}
+	}
+	return nil
+}
+
+// requireAdminAuth enforces administrator Bearer token authentication for quarantine endpoints.
+// It returns (ok, httpStatus, errMessage).
+func (s *Server) requireAdminAuth(r *http.Request) (bool, int, string) {
+	s.mu.RLock()
+	cfg := s.authConfig
+	s.mu.RUnlock()
+
+	if cfg.AdminToken == "" {
+		return false, http.StatusServiceUnavailable, "admin token not configured"
+	}
+
+	if !cfg.Enabled {
+		authHeader := r.Header.Get(types.HeaderAuthorization)
+		if authHeader == "" || !types.VerifyAdminToken(cfg.AdminToken, authHeader) {
+			if s.metrics != nil {
+				s.metrics.RecordAuthFailure("unauthorized")
+			}
+			return false, http.StatusUnauthorized, "unauthorized: admin bearer token required"
+		}
+		return true, http.StatusOK, ""
+	}
+
+	authCtx, err := s.AuthenticateRequest(r, nil)
+	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("unauthorized")
+		}
+		return false, http.StatusUnauthorized, "unauthorized: admin bearer token required"
+	}
+
+	if !authCtx.IsAdmin {
+		if s.metrics != nil {
+			s.metrics.RecordAuthFailure("forbidden")
+		}
+		return false, http.StatusForbidden, "administrative authorization required"
+	}
+
+	return true, http.StatusOK, ""
+}
+
+func (s *Server) checkAdminAuth(w http.ResponseWriter, r *http.Request) bool {
+	ok, status, msg := s.requireAdminAuth(r)
+	if !ok {
+		errCode := "unauthorized"
+		if status == http.StatusForbidden {
+			errCode = "forbidden"
+		} else if status == http.StatusServiceUnavailable {
+			errCode = "service_unavailable"
+		}
+		s.writeJSON(w, status, ErrorResponse{
+			Error:   errCode,
+			Message: msg,
+		})
+		return false
+	}
+	return true
+}
+
+func (s *Server) handleQuarantineRoute(w http.ResponseWriter, r *http.Request) {
+	if s.initErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_uninitialized",
+			Message: fmt.Sprintf("server failed initialization: %v", s.initErr),
+		})
+		return
+	}
+
+	subpath := strings.TrimPrefix(r.URL.Path, "/api/v1/telemetry/quarantine")
+	if subpath == "" || subpath == "/" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+				Error:   "method_not_allowed",
+				Message: "quarantine collection endpoint accepts GET only",
+			})
+			return
+		}
+		s.handleListQuarantine(w, r)
+		return
+	}
+
+	tail := strings.TrimPrefix(subpath, "/")
+	parts := strings.Split(tail, "/")
+
+	if len(parts) == 1 {
+		id := strings.TrimSpace(parts[0])
+		if id == "" {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: "quarantine record ID cannot be blank",
+			})
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+				Error:   "method_not_allowed",
+				Message: "quarantine detail endpoint accepts GET only",
+			})
+			return
+		}
+		s.handleGetQuarantine(w, r, id)
+		return
+	}
+
+	if len(parts) == 2 {
+		id := strings.TrimSpace(parts[0])
+		action := parts[1]
+		if id == "" {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: "quarantine record ID cannot be blank",
+			})
+			return
+		}
+
+		switch action {
+		case "replay":
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+					Error:   "method_not_allowed",
+					Message: "quarantine replay endpoint accepts POST only",
+				})
+				return
+			}
+			s.handleReplayQuarantine(w, r, id)
+			return
+
+		case "discard":
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				s.writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+					Error:   "method_not_allowed",
+					Message: "quarantine discard endpoint accepts POST only",
+				})
+				return
+			}
+			s.handleDiscardQuarantine(w, r, id)
+			return
+
+		default:
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+				Error:   "not_found",
+				Message: fmt.Sprintf("unknown quarantine action %q", action),
+			})
+			return
+		}
+	}
+
+	s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+		Error:   "not_found",
+		Message: "unexpected extra path segments",
+	})
+}
+
+func (s *Server) handleListQuarantine(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+	if s.quarantineStore == nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_unavailable",
+			Message: "quarantine store is not configured",
+		})
+		return
+	}
+
+	q := r.URL.Query()
+	var filter storage.QuarantineFilter
+
+	statusStr := strings.TrimSpace(q.Get("status"))
+	if statusStr != "" {
+		st := storage.QuarantineStatus(statusStr)
+		if !st.Valid() {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: fmt.Sprintf("invalid status filter %q", statusStr),
+			})
+			return
+		}
+		filter.Status = st
+	}
+
+	catStr := strings.TrimSpace(q.Get("failure_category"))
+	if catStr != "" {
+		cat := storage.QuarantineCategory(catStr)
+		if !cat.Valid() {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: fmt.Sprintf("invalid failure_category filter %q", catStr),
+			})
+			return
+		}
+		filter.FailureCategory = cat
+	}
+
+	nodeID := strings.TrimSpace(q.Get("node_id"))
+	if nodeID != "" {
+		filter.NodeID = nodeID
+	}
+
+	limit := 50
+	if limitStr := strings.TrimSpace(q.Get("limit")); limitStr != "" {
+		val, err := strconv.Atoi(limitStr)
+		if err != nil || val <= 0 || val > 500 {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: "limit must be an integer between 1 and 500",
+			})
+			return
+		}
+		limit = val
+	}
+	filter.Limit = limit
+
+	offset := 0
+	if offsetStr := strings.TrimSpace(q.Get("offset")); offsetStr != "" {
+		val, err := strconv.Atoi(offsetStr)
+		if err != nil || val < 0 {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: "offset must be a non-negative integer",
+			})
+			return
+		}
+		offset = val
+	}
+	filter.Offset = offset
+
+	records, err := s.quarantineStore.ListQuarantineRecords(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("failed to list quarantine records", slog.Any("error", err))
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "storage_error",
+			Message: "internal storage error listing quarantine records",
+		})
+		return
+	}
+
+	out := make([]*QuarantineListItem, 0, len(records))
+	for _, rec := range records {
+		out = append(out, &QuarantineListItem{
+			ID:                  rec.ID,
+			DeduplicationKey:    rec.DeduplicationKey,
+			SourceStream:        rec.SourceStream,
+			SourceSequence:      rec.SourceSequence,
+			SourceSubject:       rec.SourceSubject,
+			NodeID:              rec.NodeID,
+			BatchID:             rec.BatchID,
+			FailureCategory:     rec.FailureCategory,
+			FailureReason:       rec.FailureReason,
+			LastFailureCategory: rec.LastFailureCategory,
+			LastFailureReason:   rec.LastFailureReason,
+			DeliveryCount:       rec.DeliveryCount,
+			Attempts:            rec.Attempts,
+			FirstQuarantinedAt:  rec.FirstQuarantinedAt,
+			LastQuarantinedAt:   rec.LastQuarantinedAt,
+			Status:              rec.Status,
+			StatusUpdatedAt:     rec.StatusUpdatedAt,
+			StatusReason:        rec.StatusReason,
+			StatusUpdatedBy:     rec.StatusUpdatedBy,
+			PayloadSizeBytes:    rec.PayloadSizeBytes,
+		})
+	}
+
+	s.writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleGetQuarantine(w http.ResponseWriter, r *http.Request, id string) {
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+	if s.quarantineStore == nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_unavailable",
+			Message: "quarantine store is not configured",
+		})
+		return
+	}
+
+	rec, err := s.quarantineStore.GetQuarantineRecord(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+				Error:   "quarantine_not_found",
+				Message: fmt.Sprintf("quarantine record %q not found", id),
+			})
+			return
+		}
+		s.logger.Error("failed to get quarantine record", slog.String("id", id), slog.Any("error", err))
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "storage_error",
+			Message: "internal storage error retrieving quarantine record",
+		})
+		return
+	}
+
+	var payloadB64 string
+	if len(rec.Payload) > 0 {
+		payloadB64 = base64.StdEncoding.EncodeToString(rec.Payload)
+	}
+
+	parsedBatch := parseQuarantinePayload(rec.Payload)
+
+	resp := QuarantineDetailResponse{
+		ID:                  rec.ID,
+		DeduplicationKey:    rec.DeduplicationKey,
+		SourceStream:        rec.SourceStream,
+		SourceSequence:      rec.SourceSequence,
+		SourceSubject:       rec.SourceSubject,
+		NodeID:              rec.NodeID,
+		BatchID:             rec.BatchID,
+		FailureCategory:     rec.FailureCategory,
+		FailureReason:       rec.FailureReason,
+		LastFailureCategory: rec.LastFailureCategory,
+		LastFailureReason:   rec.LastFailureReason,
+		DeliveryCount:       rec.DeliveryCount,
+		Attempts:            rec.Attempts,
+		FirstQuarantinedAt:  rec.FirstQuarantinedAt,
+		LastQuarantinedAt:   rec.LastQuarantinedAt,
+		Status:              rec.Status,
+		StatusUpdatedAt:     rec.StatusUpdatedAt,
+		StatusReason:        rec.StatusReason,
+		StatusUpdatedBy:     rec.StatusUpdatedBy,
+		ReplayMetadata:      rec.ReplayMetadata,
+		Payload:             payloadB64,
+		PayloadSizeBytes:    rec.PayloadSizeBytes,
+		ParsedBatch:         parsedBatch,
+	}
+
+	s.writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, id string) {
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+	if s.quarantineStore == nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_unavailable",
+			Message: "quarantine store is not configured",
+		})
+		return
+	}
+
+	var reqBody quarantineActionRequestBody
+	if r.Body != nil {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+		if err != nil {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: "failed to read request body",
+			})
+			return
+		}
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+				s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+					Error:   "bad_request",
+					Message: "malformed JSON request body",
+				})
+				return
+			}
+		}
+	}
+
+	if len(reqBody.Reason) > storage.MaxStatusReasonLength {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "bad_request",
+			Message: fmt.Sprintf("status reason exceeds maximum length %d", storage.MaxStatusReasonLength),
+		})
+		return
+	}
+
+	rec, err := s.quarantineStore.GetQuarantineRecord(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+				Error:   "quarantine_not_found",
+				Message: fmt.Sprintf("quarantine record %q not found", id),
+			})
+			return
+		}
+		s.logger.Error("failed to retrieve quarantine record for replay", slog.String("id", id), slog.Any("error", err))
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "storage_error",
+			Message: "internal storage error retrieving quarantine record",
+		})
+		return
+	}
+
+	if rec.Status != storage.StatusQuarantined {
+		s.writeJSON(w, http.StatusConflict, ErrorResponse{
+			Error:   "quarantine_status_conflict",
+			Message: fmt.Sprintf("cannot replay record with status %q; only quarantined records can be replayed", rec.Status),
+		})
+		return
+	}
+
+	unlock := s.lockNode(rec.NodeID)
+	defer unlock()
+
+	replayReq := storage.QuarantineReplayRequest{
+		ID:        id,
+		Reason:    reqBody.Reason,
+		UpdatedBy: "admin-token",
+		Timestamp: time.Now().UTC(),
+	}
+
+	result, err := s.quarantineStore.ReplayQuarantineRecord(r.Context(), replayReq)
+	if err != nil {
+		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+				Error:   "quarantine_not_found",
+				Message: fmt.Sprintf("quarantine record %q not found", id),
+			})
+			return
+		}
+		if errors.Is(err, storage.ErrStatusConflict) || errors.Is(err, storage.ErrInvalidStatusTransition) {
+			s.writeJSON(w, http.StatusConflict, ErrorResponse{
+				Error:   "quarantine_status_conflict",
+				Message: "cannot replay quarantine record: record is already in a terminal state",
+			})
+			return
+		}
+		if errors.Is(err, storage.ErrInvalidMeta) || errors.Is(err, storage.ErrCorruptPayload) {
+			s.writeJSON(w, http.StatusUnprocessableEntity, ErrorResponse{
+				Error:   "invalid_replay_payload",
+				Message: "quarantined payload is invalid or identity does not match quarantine record",
+			})
+			return
+		}
+		s.logger.Error("failed to replay quarantine record", slog.String("id", id), slog.Any("error", err))
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "storage_error",
+			Message: "internal storage error during quarantine replay",
+		})
+		return
+	}
+
+	if !result.AlreadyIngested && result.Batch != nil {
+		s.mu.Lock()
+		s.history.push(&IngestedBatch{
+			Batch:      *result.Batch,
+			IngestedAt: replayReq.Timestamp,
+		})
+		s.mu.Unlock()
+	}
+
+	resp := QuarantineReplayResponse{
+		ID:              result.Record.ID,
+		Status:          result.Record.Status,
+		AlreadyIngested: result.AlreadyIngested,
+		NodeID:          result.Record.NodeID,
+		BatchID:         result.Record.BatchID,
+	}
+
+	s.writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request, id string) {
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+	if s.quarantineStore == nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "service_unavailable",
+			Message: "quarantine store is not configured",
+		})
+		return
+	}
+
+	var reqBody quarantineActionRequestBody
+	if r.Body != nil {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+		if err != nil {
+			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:   "bad_request",
+				Message: "failed to read request body",
+			})
+			return
+		}
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+				s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+					Error:   "bad_request",
+					Message: "malformed JSON request body",
+				})
+				return
+			}
+		}
+	}
+
+	if len(reqBody.Reason) > storage.MaxStatusReasonLength {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "bad_request",
+			Message: fmt.Sprintf("status reason exceeds maximum length %d", storage.MaxStatusReasonLength),
+		})
+		return
+	}
+
+	rec, err := s.quarantineStore.GetQuarantineRecord(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+				Error:   "quarantine_not_found",
+				Message: fmt.Sprintf("quarantine record %q not found", id),
+			})
+			return
+		}
+		s.logger.Error("failed to retrieve quarantine record for discard", slog.String("id", id), slog.Any("error", err))
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "storage_error",
+			Message: "internal storage error retrieving quarantine record",
+		})
+		return
+	}
+
+	if rec.Status != storage.StatusQuarantined {
+		s.writeJSON(w, http.StatusConflict, ErrorResponse{
+			Error:   "quarantine_status_conflict",
+			Message: fmt.Sprintf("cannot discard record with status %q; only quarantined records can be discarded", rec.Status),
+		})
+		return
+	}
+
+	unlock := s.lockNode(rec.NodeID)
+	defer unlock()
+
+	result, err := s.quarantineStore.DiscardQuarantineRecord(r.Context(), id, "admin-token", reqBody.Reason)
+	if err != nil {
+		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
+				Error:   "quarantine_not_found",
+				Message: fmt.Sprintf("quarantine record %q not found", id),
+			})
+			return
+		}
+		if errors.Is(err, storage.ErrStatusConflict) || errors.Is(err, storage.ErrInvalidStatusTransition) {
+			s.writeJSON(w, http.StatusConflict, ErrorResponse{
+				Error:   "quarantine_status_conflict",
+				Message: "cannot discard quarantine record: record is already in a terminal state",
+			})
+			return
+		}
+		s.logger.Error("failed to discard quarantine record", slog.String("id", id), slog.Any("error", err))
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "storage_error",
+			Message: "internal storage error during quarantine discard",
+		})
+		return
+	}
+
+	resp := QuarantineDiscardResponse{
+		ID:     result.ID,
+		Status: result.Status,
+	}
+
+	s.writeJSON(w, http.StatusOK, resp)
 }
