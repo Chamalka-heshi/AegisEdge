@@ -174,26 +174,29 @@ const DefaultStorageProbeTimeout = 2 * time.Second
 
 // Storage Retention & Pruning defaults
 const (
-	DefaultTelemetryRetentionDays = 30
-	DefaultPruneInterval          = 1 * time.Hour
-	DefaultPruneBatchSize         = 500
+	DefaultTelemetryRetentionDays  = 30
+	DefaultQuarantineRetentionDays = 30
+	DefaultPruneInterval           = 1 * time.Hour
+	DefaultPruneBatchSize          = 500
 )
 
 // PruningConfig defines parameters for automated control-plane storage retention pruning.
 type PruningConfig struct {
-	Enabled                bool
-	TelemetryRetentionDays int
-	PruneInterval          time.Duration
-	PruneBatchSize         int
+	Enabled                 bool
+	TelemetryRetentionDays  int
+	QuarantineRetentionDays int
+	PruneInterval           time.Duration
+	PruneBatchSize          int
 }
 
 // DefaultPruningConfig returns the canonical production pruning configuration.
 func DefaultPruningConfig() PruningConfig {
 	return PruningConfig{
-		Enabled:                false, // opt-in via configuration or flag
-		TelemetryRetentionDays: DefaultTelemetryRetentionDays,
-		PruneInterval:          DefaultPruneInterval,
-		PruneBatchSize:         DefaultPruneBatchSize,
+		Enabled:                 false, // opt-in via configuration or flag
+		TelemetryRetentionDays:  DefaultTelemetryRetentionDays,
+		QuarantineRetentionDays: DefaultQuarantineRetentionDays,
+		PruneInterval:           DefaultPruneInterval,
+		PruneBatchSize:          DefaultPruneBatchSize,
 	}
 }
 
@@ -204,6 +207,9 @@ func (c PruningConfig) Validate() error {
 	}
 	if c.TelemetryRetentionDays <= 0 {
 		return fmt.Errorf("telemetry retention days must be greater than zero, got %d", c.TelemetryRetentionDays)
+	}
+	if c.QuarantineRetentionDays <= 0 {
+		return fmt.Errorf("quarantine retention days must be greater than zero, got %d", c.QuarantineRetentionDays)
 	}
 	if c.PruneInterval <= 0 {
 		return fmt.Errorf("prune interval must be greater than zero, got %v", c.PruneInterval)
@@ -217,6 +223,9 @@ func (c PruningConfig) Validate() error {
 // WithPruningConfig configures telemetry payload retention and background pruning.
 func WithPruningConfig(cfg PruningConfig) ServerOption {
 	return func(s *Server) error {
+		if cfg.Enabled && cfg.QuarantineRetentionDays == 0 {
+			cfg.QuarantineRetentionDays = DefaultQuarantineRetentionDays
+		}
 		if err := cfg.Validate(); err != nil {
 			return err
 		}
@@ -476,6 +485,7 @@ func (s *Server) StartPruner(parentCtx context.Context) error {
 
 	s.logger.Info("starting control-plane storage retention pruner",
 		slog.Int("retention_days", s.pruneConfig.TelemetryRetentionDays),
+		slog.Int("quarantine_retention_days", s.pruneConfig.QuarantineRetentionDays),
 		slog.Duration("interval", s.pruneConfig.PruneInterval),
 		slog.Int("batch_size", s.pruneConfig.PruneBatchSize),
 	)
@@ -512,7 +522,48 @@ func (s *Server) pruneLoop(ctx context.Context) {
 	}
 }
 
-// RunPrunePass executes a single bounded retention pruning pass.
+// RunQuarantinePrunePass executes a single bounded retention pruning pass on terminal quarantine records.
+// It clears payload BLOBs (payload = X'') for records in 'replayed' or 'discarded' status older than the cutoff,
+// while strictly preserving all audit metadata and idempotency keys. Active 'quarantined' records are never pruned.
+// A pass failure is logged without crashing the server or halting ingestion.
+func (s *Server) RunQuarantinePrunePass(ctx context.Context) (int64, error) {
+	if s.quarantineStore == nil || s.IsShuttingDown() {
+		return 0, nil
+	}
+
+	retentionDays := s.pruneConfig.QuarantineRetentionDays
+	if retentionDays <= 0 {
+		retentionDays = DefaultQuarantineRetentionDays
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+
+	pruned, err := s.quarantineStore.PruneQuarantinePayloads(ctx, cutoff, s.pruneConfig.PruneBatchSize)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, storage.ErrStoreClosed) {
+			return 0, err
+		}
+		s.logger.Warn("quarantine storage retention pruning pass failed",
+			slog.Any("error", err),
+			slog.Time("cutoff", cutoff),
+		)
+		return 0, err
+	}
+
+	if pruned > 0 {
+		s.logger.Info("pruned historical terminal quarantine payloads from durable storage",
+			slog.Int64("pruned_payloads", pruned),
+			slog.Time("cutoff", cutoff),
+			slog.Int("limit", s.pruneConfig.PruneBatchSize),
+		)
+		if s.metrics != nil {
+			s.metrics.RecordQuarantinePrunedPayloads(pruned)
+		}
+	}
+
+	return pruned, nil
+}
+
+// RunPrunePass executes a single bounded retention pruning pass for both telemetry and quarantine payloads.
 // A pass failure is logged and recorded to metrics without crashing the server or halting ingestion.
 func (s *Server) RunPrunePass(ctx context.Context) (int64, error) {
 	if s.store == nil || s.IsShuttingDown() {
@@ -522,7 +573,7 @@ func (s *Server) RunPrunePass(ctx context.Context) (int64, error) {
 	retentionDuration := time.Duration(s.pruneConfig.TelemetryRetentionDays) * 24 * time.Hour
 	cutoff := time.Now().UTC().Add(-retentionDuration)
 
-	pruned, err := s.store.PruneTelemetryPayloads(ctx, cutoff, s.pruneConfig.PruneBatchSize)
+	prunedTelemetry, err := s.store.PruneTelemetryPayloads(ctx, cutoff, s.pruneConfig.PruneBatchSize)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, storage.ErrStoreClosed) {
 			return 0, err
@@ -537,18 +588,27 @@ func (s *Server) RunPrunePass(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 
-	if pruned > 0 {
+	if prunedTelemetry > 0 {
 		s.logger.Info("pruned historical telemetry payloads from durable storage",
-			slog.Int64("pruned_payloads", pruned),
+			slog.Int64("pruned_payloads", prunedTelemetry),
 			slog.Time("cutoff", cutoff),
 			slog.Int("limit", s.pruneConfig.PruneBatchSize),
 		)
 		if s.metrics != nil {
-			s.metrics.RecordStoragePrunedPayloads(pruned)
+			s.metrics.RecordStoragePrunedPayloads(prunedTelemetry)
 		}
 	}
 
-	return pruned, nil
+	var prunedQuarantine int64
+	if s.quarantineStore != nil && !s.IsShuttingDown() {
+		var qErr error
+		prunedQuarantine, qErr = s.RunQuarantinePrunePass(ctx)
+		if qErr != nil {
+			return prunedTelemetry, qErr
+		}
+	}
+
+	return prunedTelemetry + prunedQuarantine, nil
 }
 
 // Close gracefully closes the server's underlying persistent storage.
