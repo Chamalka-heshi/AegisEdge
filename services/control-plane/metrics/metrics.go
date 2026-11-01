@@ -24,6 +24,7 @@ const (
 	MetricNATSStalledUnacknowledgedSequences = "aegisedge_control_plane_nats_stalled_unacknowledged_sequences"
 	MetricStoragePrunedPayloadsTotal         = "aegisedge_control_plane_storage_pruned_payloads_total"
 	MetricStoragePruneFailuresTotal          = "aegisedge_control_plane_storage_prune_failures_total"
+	MetricQuarantinePrunedPayloadsTotal      = "aegisedge_quarantine_pruned_payloads_total"
 )
 
 // Bounded label values and allowlists.
@@ -76,6 +77,7 @@ type Metrics struct {
 	natsStalledUnacknowledgedSequences *FuncGauge
 	storagePrunedPayloads              *SingleCounter
 	storagePruneFailures               *SingleCounter
+	quarantinePrunedPayloads           *SingleCounter
 
 	mu                                      sync.RWMutex
 	natsExhaustedSource                     func() float64
@@ -311,6 +313,12 @@ func NewMetrics() *Metrics {
 	)
 	_ = r.Register(m.storagePruneFailures)
 
+	m.quarantinePrunedPayloads = NewSingleCounter(
+		MetricQuarantinePrunedPayloadsTotal,
+		"Total number of historical terminal quarantine payloads successfully pruned from durable storage.",
+	)
+	_ = r.Register(m.quarantinePrunedPayloads)
+
 	return m
 }
 
@@ -373,6 +381,14 @@ func (m *Metrics) RecordStoragePruneFailure() {
 		return
 	}
 	m.storagePruneFailures.Inc()
+}
+
+// RecordQuarantinePrunedPayloads increments the pruned quarantine payloads counter by count.
+func (m *Metrics) RecordQuarantinePrunedPayloads(count int64) {
+	if m == nil || count <= 0 {
+		return
+	}
+	m.quarantinePrunedPayloads.Add(float64(count))
 }
 
 // SanitizeAuthReason maps an arbitrary auth error string to the bounded allowlist.
