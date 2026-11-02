@@ -262,6 +262,7 @@ type TelemetryConsumer struct {
 	consumed               atomic.Int64
 	exhaustedDeliveries    atomic.Int64
 	quarantinedTotal       atomic.Int64
+	terminatedTotal        atomic.Int64
 	recoveredTotal         atomic.Int64
 	advisoryStreamMsgs     atomic.Int64
 	advisoryStreamBytes    atomic.Int64
@@ -622,10 +623,19 @@ func (c *TelemetryConsumer) consumeLoop() {
 
 // termMessage terminates a permanently poisoned message to prevent infinite redelivery loops.
 // Uses TermWithReason if supported, falling back to Term.
-func termMessage(msg jetstream.Msg, reason string) {
-	if err := msg.TermWithReason(reason); err != nil {
-		_ = msg.Term()
+// Increments terminatedTotal only when the termination operation succeeds.
+func (c *TelemetryConsumer) termMessage(msg jetstream.Msg, reason string) error {
+	if msg == nil {
+		return errors.New("cannot terminate nil message")
 	}
+	var err error
+	if err = msg.TermWithReason(reason); err != nil {
+		err = msg.Term()
+	}
+	if err == nil {
+		c.terminatedTotal.Add(1)
+	}
+	return err
 }
 
 // extractNodeIDFromSubject extracts the trailing node identifier from a standard telemetry subject.
@@ -1169,7 +1179,7 @@ func (c *TelemetryConsumer) processMessage(msg jetstream.Msg) {
 		err := c.recordQuarantine(c.ctx, msg, streamName, streamSeq, nodeID, batchID, category, reason, int(deliveryCount))
 		if err == nil {
 			c.quarantinedTotal.Add(1)
-			termMessage(msg, reason)
+			_ = c.termMessage(msg, reason)
 			return
 		}
 
@@ -1379,6 +1389,12 @@ func (c *TelemetryConsumer) ExhaustedDeliveries() int64 {
 // Quarantined returns the total number of messages recorded into quarantine by this consumer instance.
 func (c *TelemetryConsumer) Quarantined() int64 {
 	return c.quarantinedTotal.Load()
+}
+
+// TerminatedMessages returns the total number of permanently unprocessable messages
+// successfully terminated via JetStream Term by this consumer instance.
+func (c *TelemetryConsumer) TerminatedMessages() int64 {
+	return c.terminatedTotal.Load()
 }
 
 // Recovered returns the total number of messages recovered through the exhaustion recovery mechanism.
