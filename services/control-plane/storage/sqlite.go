@@ -2389,3 +2389,28 @@ func (s *SQLiteStore) PruneQuarantinePayloads(ctx context.Context, cutoff time.T
 
 	return rowsAffected, nil
 }
+
+// CountActiveQuarantineRecords returns the total number of durable quarantine records
+// whose status is currently 'quarantined'. Queries the index directly without loading
+// payload BLOBs.
+func (s *SQLiteStore) CountActiveQuarantineRecords(ctx context.Context) (int64, error) {
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return 0, ErrStoreClosed
+	}
+	s.mu.RUnlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	query := `SELECT COUNT(*) FROM cp_telemetry_quarantine WHERE status = 'quarantined'`
+	var count int64
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("counting active quarantine records failed: %w", err)
+	}
+
+	return count, nil
+}
