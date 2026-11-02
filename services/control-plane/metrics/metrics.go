@@ -25,6 +25,8 @@ const (
 	MetricStoragePrunedPayloadsTotal         = "aegisedge_control_plane_storage_pruned_payloads_total"
 	MetricStoragePruneFailuresTotal          = "aegisedge_control_plane_storage_prune_failures_total"
 	MetricQuarantinePrunedPayloadsTotal      = "aegisedge_quarantine_pruned_payloads_total"
+	MetricQuarantineReplaysTotal             = "aegisedge_quarantine_replays_total"
+	MetricQuarantineDiscardsTotal            = "aegisedge_quarantine_discards_total"
 )
 
 // Bounded label values and allowlists.
@@ -43,7 +45,21 @@ const (
 	ReasonForbidden        = "forbidden"
 	ReasonUnauthorized     = "unauthorized"
 	ReasonUnknown          = "unknown"
+
+	QuarantineOutcomeSuccess  = "success"
+	QuarantineOutcomeNotFound = "not_found"
+	QuarantineOutcomeConflict = "conflict"
+	QuarantineOutcomeInvalid  = "invalid"
+	QuarantineOutcomeError    = "error"
 )
+
+var allowedQuarantineOutcomes = map[string]struct{}{
+	QuarantineOutcomeSuccess:  {},
+	QuarantineOutcomeNotFound: {},
+	QuarantineOutcomeConflict: {},
+	QuarantineOutcomeInvalid:  {},
+	QuarantineOutcomeError:    {},
+}
 
 var allowedAuthReasons = map[string]struct{}{
 	ReasonInvalidSignature: {},
@@ -78,6 +94,8 @@ type Metrics struct {
 	storagePrunedPayloads              *SingleCounter
 	storagePruneFailures               *SingleCounter
 	quarantinePrunedPayloads           *SingleCounter
+	quarantineReplays                  *CounterVec
+	quarantineDiscards                 *CounterVec
 
 	mu                                      sync.RWMutex
 	natsExhaustedSource                     func() float64
@@ -319,6 +337,29 @@ func NewMetrics() *Metrics {
 	)
 	_ = r.Register(m.quarantinePrunedPayloads)
 
+	m.quarantineReplays = NewCounterVec(
+		MetricQuarantineReplaysTotal,
+		"Total number of administrative quarantine replay operations processed by the control plane.",
+		[]string{"outcome"},
+	)
+	m.quarantineDiscards = NewCounterVec(
+		MetricQuarantineDiscardsTotal,
+		"Total number of administrative quarantine discard operations processed by the control plane.",
+		[]string{"outcome"},
+	)
+	for _, outcome := range []string{
+		QuarantineOutcomeSuccess,
+		QuarantineOutcomeNotFound,
+		QuarantineOutcomeConflict,
+		QuarantineOutcomeInvalid,
+		QuarantineOutcomeError,
+	} {
+		m.quarantineReplays.WithLabelValues(outcome)
+		m.quarantineDiscards.WithLabelValues(outcome)
+	}
+	_ = r.Register(m.quarantineReplays)
+	_ = r.Register(m.quarantineDiscards)
+
 	return m
 }
 
@@ -389,6 +430,32 @@ func (m *Metrics) RecordQuarantinePrunedPayloads(count int64) {
 		return
 	}
 	m.quarantinePrunedPayloads.Add(float64(count))
+}
+
+// SanitizeQuarantineOutcome maps an arbitrary quarantine action outcome string to the bounded allowlist.
+func SanitizeQuarantineOutcome(raw string) string {
+	if _, ok := allowedQuarantineOutcomes[raw]; ok {
+		return raw
+	}
+	return QuarantineOutcomeError
+}
+
+// RecordQuarantineReplay increments the quarantine replays counter for a discrete sanitized outcome.
+func (m *Metrics) RecordQuarantineReplay(rawOutcome string) {
+	if m == nil {
+		return
+	}
+	outcome := SanitizeQuarantineOutcome(rawOutcome)
+	m.quarantineReplays.WithLabelValues(outcome).Inc()
+}
+
+// RecordQuarantineDiscard increments the quarantine discards counter for a discrete sanitized outcome.
+func (m *Metrics) RecordQuarantineDiscard(rawOutcome string) {
+	if m == nil {
+		return
+	}
+	outcome := SanitizeQuarantineOutcome(rawOutcome)
+	m.quarantineDiscards.WithLabelValues(outcome).Inc()
 }
 
 // SanitizeAuthReason maps an arbitrary auth error string to the bounded allowlist.
