@@ -2162,6 +2162,13 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 	if !s.checkAdminAuth(w, r) {
 		return
 	}
+	outcome := metrics.QuarantineOutcomeError
+	defer func() {
+		if s.metrics != nil {
+			s.metrics.RecordQuarantineReplay(outcome)
+		}
+	}()
+
 	if s.quarantineStore == nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
 			Error:   "service_unavailable",
@@ -2174,6 +2181,7 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 	if r.Body != nil {
 		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
 		if err != nil {
+			outcome = metrics.QuarantineOutcomeInvalid
 			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 				Error:   "bad_request",
 				Message: "failed to read request body",
@@ -2182,6 +2190,7 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 		}
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+				outcome = metrics.QuarantineOutcomeInvalid
 				s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 					Error:   "bad_request",
 					Message: "malformed JSON request body",
@@ -2192,6 +2201,7 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if len(reqBody.Reason) > storage.MaxStatusReasonLength {
+		outcome = metrics.QuarantineOutcomeInvalid
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "bad_request",
 			Message: fmt.Sprintf("status reason exceeds maximum length %d", storage.MaxStatusReasonLength),
@@ -2202,12 +2212,14 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 	rec, err := s.quarantineStore.GetQuarantineRecord(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			outcome = metrics.QuarantineOutcomeNotFound
 			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
 				Error:   "quarantine_not_found",
 				Message: fmt.Sprintf("quarantine record %q not found", id),
 			})
 			return
 		}
+		outcome = metrics.QuarantineOutcomeError
 		s.logger.Error("failed to retrieve quarantine record for replay", slog.String("id", id), slog.Any("error", err))
 		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "storage_error",
@@ -2217,6 +2229,7 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if rec.Status != storage.StatusQuarantined {
+		outcome = metrics.QuarantineOutcomeConflict
 		s.writeJSON(w, http.StatusConflict, ErrorResponse{
 			Error:   "quarantine_status_conflict",
 			Message: fmt.Sprintf("cannot replay record with status %q; only quarantined records can be replayed", rec.Status),
@@ -2237,6 +2250,7 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 	result, err := s.quarantineStore.ReplayQuarantineRecord(r.Context(), replayReq)
 	if err != nil {
 		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			outcome = metrics.QuarantineOutcomeNotFound
 			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
 				Error:   "quarantine_not_found",
 				Message: fmt.Sprintf("quarantine record %q not found", id),
@@ -2244,6 +2258,7 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		if errors.Is(err, storage.ErrStatusConflict) || errors.Is(err, storage.ErrInvalidStatusTransition) {
+			outcome = metrics.QuarantineOutcomeConflict
 			s.writeJSON(w, http.StatusConflict, ErrorResponse{
 				Error:   "quarantine_status_conflict",
 				Message: "cannot replay quarantine record: record is already in a terminal state",
@@ -2251,12 +2266,14 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		if errors.Is(err, storage.ErrInvalidMeta) || errors.Is(err, storage.ErrCorruptPayload) {
+			outcome = metrics.QuarantineOutcomeInvalid
 			s.writeJSON(w, http.StatusUnprocessableEntity, ErrorResponse{
 				Error:   "invalid_replay_payload",
 				Message: "quarantined payload is invalid or identity does not match quarantine record",
 			})
 			return
 		}
+		outcome = metrics.QuarantineOutcomeError
 		s.logger.Error("failed to replay quarantine record", slog.String("id", id), slog.Any("error", err))
 		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "storage_error",
@@ -2282,6 +2299,7 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request, 
 		BatchID:         result.Record.BatchID,
 	}
 
+	outcome = metrics.QuarantineOutcomeSuccess
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
@@ -2289,6 +2307,13 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 	if !s.checkAdminAuth(w, r) {
 		return
 	}
+	outcome := metrics.QuarantineOutcomeError
+	defer func() {
+		if s.metrics != nil {
+			s.metrics.RecordQuarantineDiscard(outcome)
+		}
+	}()
+
 	if s.quarantineStore == nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
 			Error:   "service_unavailable",
@@ -2301,6 +2326,7 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 	if r.Body != nil {
 		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
 		if err != nil {
+			outcome = metrics.QuarantineOutcomeInvalid
 			s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 				Error:   "bad_request",
 				Message: "failed to read request body",
@@ -2309,6 +2335,7 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 		}
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+				outcome = metrics.QuarantineOutcomeInvalid
 				s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 					Error:   "bad_request",
 					Message: "malformed JSON request body",
@@ -2319,6 +2346,7 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 	}
 
 	if len(reqBody.Reason) > storage.MaxStatusReasonLength {
+		outcome = metrics.QuarantineOutcomeInvalid
 		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "bad_request",
 			Message: fmt.Sprintf("status reason exceeds maximum length %d", storage.MaxStatusReasonLength),
@@ -2329,12 +2357,14 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 	rec, err := s.quarantineStore.GetQuarantineRecord(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			outcome = metrics.QuarantineOutcomeNotFound
 			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
 				Error:   "quarantine_not_found",
 				Message: fmt.Sprintf("quarantine record %q not found", id),
 			})
 			return
 		}
+		outcome = metrics.QuarantineOutcomeError
 		s.logger.Error("failed to retrieve quarantine record for discard", slog.String("id", id), slog.Any("error", err))
 		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "storage_error",
@@ -2344,6 +2374,7 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 	}
 
 	if rec.Status != storage.StatusQuarantined {
+		outcome = metrics.QuarantineOutcomeConflict
 		s.writeJSON(w, http.StatusConflict, ErrorResponse{
 			Error:   "quarantine_status_conflict",
 			Message: fmt.Sprintf("cannot discard record with status %q; only quarantined records can be discarded", rec.Status),
@@ -2357,6 +2388,7 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 	result, err := s.quarantineStore.DiscardQuarantineRecord(r.Context(), id, "admin-token", reqBody.Reason)
 	if err != nil {
 		if errors.Is(err, storage.ErrQuarantineNotFound) {
+			outcome = metrics.QuarantineOutcomeNotFound
 			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
 				Error:   "quarantine_not_found",
 				Message: fmt.Sprintf("quarantine record %q not found", id),
@@ -2364,12 +2396,14 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		if errors.Is(err, storage.ErrStatusConflict) || errors.Is(err, storage.ErrInvalidStatusTransition) {
+			outcome = metrics.QuarantineOutcomeConflict
 			s.writeJSON(w, http.StatusConflict, ErrorResponse{
 				Error:   "quarantine_status_conflict",
 				Message: "cannot discard quarantine record: record is already in a terminal state",
 			})
 			return
 		}
+		outcome = metrics.QuarantineOutcomeError
 		s.logger.Error("failed to discard quarantine record", slog.String("id", id), slog.Any("error", err))
 		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "storage_error",
@@ -2383,5 +2417,6 @@ func (s *Server) handleDiscardQuarantine(w http.ResponseWriter, r *http.Request,
 		Status: result.Status,
 	}
 
+	outcome = metrics.QuarantineOutcomeSuccess
 	s.writeJSON(w, http.StatusOK, resp)
 }
