@@ -240,6 +240,13 @@ func TestControlPlaneMetrics(t *testing.T) {
 	m.RecordAuthFailure("missing_auth_headers")         // maps to missing_auth
 	m.RecordAuthFailure("arbitrary_unknown_reason_123") // maps to unknown
 
+	// Record Quarantine Replays and Discards
+	m.RecordQuarantineReplay(QuarantineOutcomeSuccess)
+	m.RecordQuarantineReplay(QuarantineOutcomeConflict)
+	m.RecordQuarantineDiscard(QuarantineOutcomeSuccess)
+	m.RecordQuarantineDiscard(QuarantineOutcomeNotFound)
+	m.RecordQuarantineReplay("unexpected_outcome") // maps to error
+
 	// Dynamic sources
 	m.SetNATSExhaustedDeliveriesSource(func() float64 {
 		return 3
@@ -297,6 +304,8 @@ func TestControlPlaneMetrics(t *testing.T) {
 		MetricStoragePrunedPayloadsTotal,
 		MetricStoragePruneFailuresTotal,
 		MetricQuarantinePrunedPayloadsTotal,
+		MetricQuarantineReplaysTotal,
+		MetricQuarantineDiscardsTotal,
 	}
 	for _, name := range requiredMetrics {
 		if !strings.Contains(output, name) {
@@ -315,6 +324,11 @@ func TestControlPlaneMetrics(t *testing.T) {
 		`aegisedge_control_plane_auth_failures_total{reason="forbidden"} 1`,
 		`aegisedge_control_plane_auth_failures_total{reason="missing_auth"} 1`,
 		`aegisedge_control_plane_auth_failures_total{reason="unknown"} 1`,
+		`aegisedge_quarantine_replays_total{outcome="success"} 1`,
+		`aegisedge_quarantine_replays_total{outcome="conflict"} 1`,
+		`aegisedge_quarantine_replays_total{outcome="error"} 1`,
+		`aegisedge_quarantine_discards_total{outcome="success"} 1`,
+		`aegisedge_quarantine_discards_total{outcome="not_found"} 1`,
 		`aegisedge_control_plane_nats_exhausted_deliveries_total 3`,
 		`aegisedge_control_plane_registered_nodes_count 15`,
 		`aegisedge_control_plane_nats_advisory_stream_messages 42`,
@@ -556,5 +570,100 @@ func TestMetrics_RecordQuarantinePrunedPayloads(t *testing.T) {
 	out = m.Registry().FormatPrometheus()
 	if !strings.Contains(out, "aegisedge_quarantine_pruned_payloads_total 20") {
 		t.Fatalf("expected 20 after second increment, got:\n%s", out)
+	}
+}
+
+func TestMetrics_QuarantineReplayAndDiscard(t *testing.T) {
+	// 1. Nil safety
+	var nilMetrics *Metrics
+	nilMetrics.RecordQuarantineReplay(QuarantineOutcomeSuccess)
+	nilMetrics.RecordQuarantineDiscard(QuarantineOutcomeSuccess)
+
+	// 2. Pre-population check: all 5 label values exist with 0 initially
+	m := NewMetrics()
+	initialOut := m.Registry().FormatPrometheus()
+	expectedZeroes := []string{
+		`aegisedge_quarantine_replays_total{outcome="success"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="not_found"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="conflict"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="invalid"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="error"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="success"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="not_found"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="conflict"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="invalid"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="error"} 0`,
+	}
+	for _, expected := range expectedZeroes {
+		if !strings.Contains(initialOut, expected) {
+			t.Fatalf("expected initial metric series %q in output:\n%s", expected, initialOut)
+		}
+	}
+
+	// 3. Test each canonical outcome for replay
+	m.RecordQuarantineReplay(QuarantineOutcomeSuccess)
+	m.RecordQuarantineReplay(QuarantineOutcomeNotFound)
+	m.RecordQuarantineReplay(QuarantineOutcomeConflict)
+	m.RecordQuarantineReplay(QuarantineOutcomeInvalid)
+	m.RecordQuarantineReplay(QuarantineOutcomeError)
+
+	// 4. Test unmapped outcome fallback to "error"
+	m.RecordQuarantineReplay("something_completely_unknown")
+	m.RecordQuarantineReplay("")
+
+	// 5. Test each canonical outcome for discard
+	m.RecordQuarantineDiscard(QuarantineOutcomeSuccess)
+	m.RecordQuarantineDiscard(QuarantineOutcomeNotFound)
+	m.RecordQuarantineDiscard(QuarantineOutcomeConflict)
+	m.RecordQuarantineDiscard(QuarantineOutcomeInvalid)
+	m.RecordQuarantineDiscard(QuarantineOutcomeError)
+	m.RecordQuarantineDiscard("unknown_discard_reason")
+
+	out := m.Registry().FormatPrometheus()
+
+	// Replays:
+	// success: 1
+	// not_found: 1
+	// conflict: 1
+	// invalid: 1
+	// error: 1 (direct) + 2 (fallbacks) = 3
+	expectedReplays := []string{
+		`aegisedge_quarantine_replays_total{outcome="success"} 1`,
+		`aegisedge_quarantine_replays_total{outcome="not_found"} 1`,
+		`aegisedge_quarantine_replays_total{outcome="conflict"} 1`,
+		`aegisedge_quarantine_replays_total{outcome="invalid"} 1`,
+		`aegisedge_quarantine_replays_total{outcome="error"} 3`,
+	}
+	for _, exp := range expectedReplays {
+		if !strings.Contains(out, exp) {
+			t.Fatalf("expected replay output to contain %q, but got:\n%s", exp, out)
+		}
+	}
+
+	// Discards:
+	// success: 1
+	// not_found: 1
+	// conflict: 1
+	// invalid: 1
+	// error: 1 (direct) + 1 (fallback) = 2
+	expectedDiscards := []string{
+		`aegisedge_quarantine_discards_total{outcome="success"} 1`,
+		`aegisedge_quarantine_discards_total{outcome="not_found"} 1`,
+		`aegisedge_quarantine_discards_total{outcome="conflict"} 1`,
+		`aegisedge_quarantine_discards_total{outcome="invalid"} 1`,
+		`aegisedge_quarantine_discards_total{outcome="error"} 2`,
+	}
+	for _, exp := range expectedDiscards {
+		if !strings.Contains(out, exp) {
+			t.Fatalf("expected discard output to contain %q, but got:\n%s", exp, out)
+		}
+	}
+
+	// 6. Test SanitizeQuarantineOutcome unit mapping
+	if got := SanitizeQuarantineOutcome(QuarantineOutcomeSuccess); got != QuarantineOutcomeSuccess {
+		t.Fatalf("expected success, got %s", got)
+	}
+	if got := SanitizeQuarantineOutcome("invalid_val"); got != QuarantineOutcomeError {
+		t.Fatalf("expected fallback to error, got %s", got)
 	}
 }
