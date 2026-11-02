@@ -3,6 +3,7 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -281,6 +282,15 @@ func TestControlPlaneMetrics(t *testing.T) {
 	m.SetNATSStalledUnacknowledgedSequencesSource(func() float64 {
 		return 3
 	})
+	m.SetQuarantineActiveRecordsSource(func() float64 {
+		return 11
+	})
+	m.SetNATSPendingRecoverySource(func() float64 {
+		return 8
+	})
+	m.SetNATSTerminatedMessagesSource(func() float64 {
+		return 19
+	})
 
 	output := m.Registry().FormatPrometheus()
 
@@ -306,6 +316,9 @@ func TestControlPlaneMetrics(t *testing.T) {
 		MetricQuarantinePrunedPayloadsTotal,
 		MetricQuarantineReplaysTotal,
 		MetricQuarantineDiscardsTotal,
+		MetricQuarantineActiveRecords,
+		MetricNATSPendingRecoveryItems,
+		MetricNATSTerminatedMessagesTotal,
 	}
 	for _, name := range requiredMetrics {
 		if !strings.Contains(output, name) {
@@ -341,6 +354,9 @@ func TestControlPlaneMetrics(t *testing.T) {
 		`aegisedge_control_plane_nats_recovered_total 6`,
 		`aegisedge_control_plane_nats_stalled_unacknowledged_sequences 3`,
 		`aegisedge_quarantine_pruned_payloads_total 7`,
+		`aegisedge_quarantine_active_records 11`,
+		`aegisedge_nats_pending_recovery_items 8`,
+		`aegisedge_nats_terminated_messages_total 19`,
 	}
 	for _, sub := range expectedSubstrings {
 		if !strings.Contains(output, sub) {
@@ -665,5 +681,53 @@ func TestMetrics_QuarantineReplayAndDiscard(t *testing.T) {
 	}
 	if got := SanitizeQuarantineOutcome("invalid_val"); got != QuarantineOutcomeError {
 		t.Fatalf("expected fallback to error, got %s", got)
+	}
+}
+
+func TestMetrics_ActiveQuarantineAndNATSObservability(t *testing.T) {
+	// 1. Nil receiver safety
+	var nilMetrics *Metrics
+	nilMetrics.SetQuarantineActiveRecordsSource(func() float64 { return 1 })
+	nilMetrics.SetNATSPendingRecoverySource(func() float64 { return 2 })
+	nilMetrics.SetNATSTerminatedMessagesSource(func() float64 { return 3 })
+
+	// 2. Default state: no dynamic sources wired -> reports 0
+	m := NewMetrics()
+	out := m.Registry().FormatPrometheus()
+	if !strings.Contains(out, "aegisedge_quarantine_active_records 0") {
+		t.Fatalf("expected 0 for unwired active records, got:\n%s", out)
+	}
+	if !strings.Contains(out, "aegisedge_nats_pending_recovery_items 0") {
+		t.Fatalf("expected 0 for unwired pending recovery, got:\n%s", out)
+	}
+	if !strings.Contains(out, "aegisedge_nats_terminated_messages_total 0") {
+		t.Fatalf("expected 0 for unwired terminated messages, got:\n%s", out)
+	}
+
+	// 3. Dynamic values reflect correctly
+	activeRecordsVal := 42.0
+	pendingRecoveryVal := 5.0
+	terminatedVal := 17.0
+
+	m.SetQuarantineActiveRecordsSource(func() float64 { return activeRecordsVal })
+	m.SetNATSPendingRecoverySource(func() float64 { return pendingRecoveryVal })
+	m.SetNATSTerminatedMessagesSource(func() float64 { return terminatedVal })
+
+	out = m.Registry().FormatPrometheus()
+	if !strings.Contains(out, "aegisedge_quarantine_active_records 42") {
+		t.Fatalf("expected 42 active records, got:\n%s", out)
+	}
+	if !strings.Contains(out, "aegisedge_nats_pending_recovery_items 5") {
+		t.Fatalf("expected 5 pending recovery items, got:\n%s", out)
+	}
+	if !strings.Contains(out, "aegisedge_nats_terminated_messages_total 17") {
+		t.Fatalf("expected 17 terminated messages, got:\n%s", out)
+	}
+
+	// 4. Storage error reporting: NaN is formatted instead of a false successful 0
+	m.SetQuarantineActiveRecordsSource(func() float64 { return math.NaN() })
+	out = m.Registry().FormatPrometheus()
+	if !strings.Contains(out, "aegisedge_quarantine_active_records NaN") {
+		t.Fatalf("expected NaN for errored active records, got:\n%s", out)
 	}
 }
