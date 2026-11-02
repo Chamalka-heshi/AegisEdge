@@ -27,6 +27,9 @@ const (
 	MetricQuarantinePrunedPayloadsTotal      = "aegisedge_quarantine_pruned_payloads_total"
 	MetricQuarantineReplaysTotal             = "aegisedge_quarantine_replays_total"
 	MetricQuarantineDiscardsTotal            = "aegisedge_quarantine_discards_total"
+	MetricQuarantineActiveRecords            = "aegisedge_quarantine_active_records"
+	MetricNATSPendingRecoveryItems           = "aegisedge_nats_pending_recovery_items"
+	MetricNATSTerminatedMessagesTotal        = "aegisedge_nats_terminated_messages_total"
 )
 
 // Bounded label values and allowlists.
@@ -96,6 +99,9 @@ type Metrics struct {
 	quarantinePrunedPayloads           *SingleCounter
 	quarantineReplays                  *CounterVec
 	quarantineDiscards                 *CounterVec
+	quarantineActiveRecords            *FuncGauge
+	natsPendingRecovery                *FuncGauge
+	natsTerminatedMessages             *FuncCounter
 
 	mu                                      sync.RWMutex
 	natsExhaustedSource                     func() float64
@@ -109,6 +115,9 @@ type Metrics struct {
 	natsQuarantinedSource                   func() float64
 	natsRecoveredSource                     func() float64
 	natsStalledUnacknowledgedSequenceSource func() float64
+	quarantineActiveRecordsSource           func() float64
+	natsPendingRecoverySource               func() float64
+	natsTerminatedMessagesSource            func() float64
 }
 
 // NewMetrics initializes and registers all control-plane operational metrics.
@@ -360,6 +369,51 @@ func NewMetrics() *Metrics {
 	_ = r.Register(m.quarantineReplays)
 	_ = r.Register(m.quarantineDiscards)
 
+	m.quarantineActiveRecords = NewFuncGauge(
+		MetricQuarantineActiveRecords,
+		"Current number of active durable quarantine records in quarantined status awaiting operator review or replay.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.quarantineActiveRecordsSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.quarantineActiveRecords)
+
+	m.natsPendingRecovery = NewFuncGauge(
+		MetricNATSPendingRecoveryItems,
+		"Current number of exhausted NATS messages awaiting recovery persistence in the consumer queue.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsPendingRecoverySource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsPendingRecovery)
+
+	m.natsTerminatedMessages = NewFuncCounter(
+		MetricNATSTerminatedMessagesTotal,
+		"Total number of permanently unprocessable NATS messages successfully terminated via JetStream Term.",
+		func() float64 {
+			m.mu.RLock()
+			fn := m.natsTerminatedMessagesSource
+			m.mu.RUnlock()
+			if fn == nil {
+				return 0
+			}
+			return fn()
+		},
+	)
+	_ = r.Register(m.natsTerminatedMessages)
+
 	return m
 }
 
@@ -587,5 +641,35 @@ func (m *Metrics) SetNATSStalledUnacknowledgedSequencesSource(fn func() float64)
 	}
 	m.mu.Lock()
 	m.natsStalledUnacknowledgedSequenceSource = fn
+	m.mu.Unlock()
+}
+
+// SetQuarantineActiveRecordsSource registers a dynamic source for the active quarantine records gauge.
+func (m *Metrics) SetQuarantineActiveRecordsSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.quarantineActiveRecordsSource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSPendingRecoverySource registers a dynamic source for the pending recovery items gauge.
+func (m *Metrics) SetNATSPendingRecoverySource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsPendingRecoverySource = fn
+	m.mu.Unlock()
+}
+
+// SetNATSTerminatedMessagesSource registers a dynamic source for the terminated messages counter.
+func (m *Metrics) SetNATSTerminatedMessagesSource(fn func() float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.natsTerminatedMessagesSource = fn
 	m.mu.Unlock()
 }
