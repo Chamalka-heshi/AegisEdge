@@ -554,18 +554,61 @@ WHERE id IN (
 
 ### 9.4 Prometheus Observability
 
-Operators monitor quarantine pruning performance and progress through Prometheus metrics exposed on the control-plane `/metrics` endpoint:
+Operators monitor quarantine lifecycle, administrative operations, storage retention, and NATS message handling through Prometheus metrics exposed on the control-plane `/metrics` endpoint:
+
+#### 9.4.1 Storage Retention & Pruning Metrics
 
 - **`aegisedge_quarantine_pruned_payloads_total`** (Counter):
-  - Incremented strictly on successful pruning passes by the exact number of terminal quarantine payloads cleared.
+  - **Lifecycle**: Process-local counter incremented strictly on successful pruning passes by the exact number of terminal quarantine payloads cleared.
   - Failures do not increment the counter.
   - Repeated passes on already-cleared records return 0 rows affected and do not double-count.
 
-#### Scraping Example
+#### 9.4.2 Administrative Replay and Discard Operations (Stage 6.31B.10A)
+
+- **`aegisedge_quarantine_replays_total`** (CounterVec, label: `outcome`):
+  - Total number of administrative quarantine replay operations processed by the control plane.
+  - Strictly bounded outcome labels: `success`, `not_found`, `conflict`, `invalid`, `error`.
+  - Incremented exactly once per completed handler invocation. Unauthenticated requests are rejected before metric invocation and counted under `aegisedge_control_plane_auth_failures_total`.
+- **`aegisedge_quarantine_discards_total`** (CounterVec, label: `outcome`):
+  - Total number of administrative quarantine discard operations processed by the control plane.
+  - Strictly bounded outcome labels: `success`, `not_found`, `conflict`, `invalid`, `error`.
+
+#### 9.4.3 Active Quarantine Backlog Gauge (Stage 6.31B.10B)
+
+- **`aegisedge_quarantine_active_records`** (Gauge):
+  - **What it measures**: The exact number of durable quarantine records in SQLite whose lifecycle status is currently `quarantined`.
+  - **Terminal state exclusion**: Records in `replayed` or `discarded` status are strictly excluded.
+  - **Durability**: **Durable across restarts**. Backed by durable SQLite database state; retains accuracy after control-plane restarts.
+  - **Collection & Freshness**: Evaluated dynamically at scrape time. Uses a covering index (`idx_cp_quarantine_status_updated` / `idx_cp_quarantine_status_time`) to count rows matching `WHERE status = 'quarantined'`. It **never** loads or deserializes raw payload BLOBs.
+  - **Bounded Execution & Error Handling**: Executed with a bounded 2-second query timeout. If SQLite is unavailable or queries encounter storage errors, the metric emits `NaN` (standard Prometheus floating-point representation for invalid/uncomputable measurements) rather than silently returning a false successful `0`.
+
+#### 9.4.4 NATS Recovery & Termination Observability (Stage 6.31B.10B)
+
+- **`aegisedge_nats_pending_recovery_items`** (Gauge):
+  - **What it measures**: Current count of exhausted NATS JetStream messages queued in the consumer's in-memory `pendingExhausted` map awaiting asynchronous durable quarantine persistence.
+  - **Durability**: **Process-local and in-memory**. Resets to 0 upon control-plane restart; durable recovery is subsequently rehydrated from JetStream unacknowledged sequences and broker advisories.
+  - **Operator Interpretation**: Under normal operation, this gauge should be 0 or small transient spikes. An elevated or growing value indicates that messages have exceeded `MaxDeliver` but their insertion into SQLite quarantine is contending or retrying due to database lock contention or disk latency.
+  - **Safety**: Evaluated thread-safely via `c.PendingRecoveryCount()`. When NATS is unconfigured or disabled, reports `0` safely without panic.
+- **`aegisedge_nats_terminated_messages_total`** (Counter):
+  - **What it measures**: Cumulative number of permanently unprocessable messages successfully terminated in NATS JetStream via `TermWithReason` (or fallback `Term`).
+  - **Durability**: **Process-local and in-memory**.
+  - **Exact Event Measured**: Represents broker message state transitions to terminated status, permanently halting JetStream redeliveries. It is triggered only after the message is confirmed durably persisted to quarantine storage (or identified as already ingested).
+  - **Error Semantics**: Incremented strictly when the termination operation succeeds. If `TermWithReason` and fallback `Term` return errors (e.g. broker disconnection), the counter does **not** increment. Does not double-count redeliveries.
+
+#### 9.4.5 Scraping Example
 
 ```powershell
-curl -s http://127.0.0.1:8080/metrics | findstr "aegisedge_quarantine_pruned_payloads_total"
-# Output:
+curl -s http://127.0.0.1:8080/metrics | findstr /i "quarantine nats"
+# Output sample:
+# # HELP aegisedge_quarantine_active_records Current number of active durable quarantine records in quarantined status awaiting operator review or replay.
+# # TYPE aegisedge_quarantine_active_records gauge
+# aegisedge_quarantine_active_records 3
+# # HELP aegisedge_nats_pending_recovery_items Current number of exhausted NATS messages awaiting recovery persistence in the consumer queue.
+# # TYPE aegisedge_nats_pending_recovery_items gauge
+# aegisedge_nats_pending_recovery_items 0
+# # HELP aegisedge_nats_terminated_messages_total Total number of permanently unprocessable NATS messages successfully terminated via JetStream Term.
+# # TYPE aegisedge_nats_terminated_messages_total counter
+# aegisedge_nats_terminated_messages_total 5
 # # HELP aegisedge_quarantine_pruned_payloads_total Total number of historical terminal quarantine payloads successfully pruned from durable storage.
 # # TYPE aegisedge_quarantine_pruned_payloads_total counter
 # aegisedge_quarantine_pruned_payloads_total 14
