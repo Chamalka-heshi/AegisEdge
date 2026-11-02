@@ -1245,3 +1245,159 @@ func TestTelemetryConsumer_ExhaustedDeliveriesMetric(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+type mockMsgForTerm struct {
+	termWithReasonErr    error
+	termErr              error
+	termWithReasonCalled int
+	termCalled           int
+	reasonReceived       string
+}
+
+func (m *mockMsgForTerm) Metadata() (*jetstream.MsgMetadata, error)        { return nil, nil }
+func (m *mockMsgForTerm) Data() []byte                                    { return nil }
+func (m *mockMsgForTerm) Headers() nats.Header                            { return nil }
+func (m *mockMsgForTerm) Subject() string                                 { return "test.subject" }
+func (m *mockMsgForTerm) Reply() string                                   { return "" }
+func (m *mockMsgForTerm) Ack() error                                      { return nil }
+func (m *mockMsgForTerm) DoubleAck(context.Context) error                 { return nil }
+func (m *mockMsgForTerm) Nak() error                                      { return nil }
+func (m *mockMsgForTerm) NakWithDelay(time.Duration) error                { return nil }
+func (m *mockMsgForTerm) InProgress() error                               { return nil }
+func (m *mockMsgForTerm) Term() error {
+	m.termCalled++
+	return m.termErr
+}
+func (m *mockMsgForTerm) TermWithReason(reason string) error {
+	m.termWithReasonCalled++
+	m.reasonReceived = reason
+	return m.termWithReasonErr
+}
+
+func TestTelemetryConsumer_PendingRecoveryCount(t *testing.T) {
+	consumer := &TelemetryConsumer{
+		pendingExhausted: make(map[uint64]*recoveryItem),
+		exhaustedSeqs:    make(map[uint64]bool),
+		logger:           silentLogger(),
+	}
+
+	// 1. Initial count must be 0
+	if consumer.PendingRecoveryCount() != 0 {
+		t.Fatalf("expected initial PendingRecoveryCount to be 0, got %d", consumer.PendingRecoveryCount())
+	}
+
+	// 2. Add sequence 101 -> count = 1
+	seq101 := uint64(101)
+	consumer.markExhausted(&seq101, 5, storage.CategoryDeliveryExhausted, "exhausted", "subj.1", "node-1", "b-1", []byte("data-1"))
+	if consumer.PendingRecoveryCount() != 1 {
+		t.Fatalf("expected PendingRecoveryCount=1, got %d", consumer.PendingRecoveryCount())
+	}
+
+	// 3. Add sequence 102 -> count = 2
+	seq102 := uint64(102)
+	consumer.markExhausted(&seq102, 5, storage.CategoryDeliveryExhausted, "exhausted", "subj.2", "node-2", "b-2", []byte("data-2"))
+	if consumer.PendingRecoveryCount() != 2 {
+		t.Fatalf("expected PendingRecoveryCount=2, got %d", consumer.PendingRecoveryCount())
+	}
+
+	// 4. Duplicate markExhausted on sequence 101 does not double-count
+	consumer.markExhausted(&seq101, 5, storage.CategoryDeliveryExhausted, "exhausted", "subj.1", "node-1", "b-1", []byte("data-1"))
+	if consumer.PendingRecoveryCount() != 2 {
+		t.Fatalf("expected PendingRecoveryCount=2 after duplicate, got %d", consumer.PendingRecoveryCount())
+	}
+
+	// 5. Remove recovered sequence -> count decreases to 1
+	consumer.recoveryMu.Lock()
+	delete(consumer.pendingExhausted, seq101)
+	consumer.recoveryMu.Unlock()
+	if consumer.PendingRecoveryCount() != 1 {
+		t.Fatalf("expected PendingRecoveryCount=1 after deletion, got %d", consumer.PendingRecoveryCount())
+	}
+
+	// 6. Remove remaining sequence -> count decreases to 0
+	consumer.recoveryMu.Lock()
+	delete(consumer.pendingExhausted, seq102)
+	consumer.recoveryMu.Unlock()
+	if consumer.PendingRecoveryCount() != 0 {
+		t.Fatalf("expected PendingRecoveryCount=0 after clearing all, got %d", consumer.PendingRecoveryCount())
+	}
+
+	// 7. Unconfigured/nil consumer handling does not panic
+	var nilConsumer *TelemetryConsumer
+	safeCount := func(c *TelemetryConsumer) int {
+		if c == nil {
+			return 0
+		}
+		return c.PendingRecoveryCount()
+	}
+	if safeCount(nilConsumer) != 0 {
+		t.Fatalf("expected 0 for nil consumer")
+	}
+}
+
+func TestTelemetryConsumer_TerminatedMessagesMetric(t *testing.T) {
+	consumer := &TelemetryConsumer{
+		logger: silentLogger(),
+	}
+
+	// 1. Initial value is 0
+	if consumer.TerminatedMessages() != 0 {
+		t.Fatalf("expected initial TerminatedMessages to be 0, got %d", consumer.TerminatedMessages())
+	}
+
+	// 2. Successful termination via TermWithReason
+	msg1 := &mockMsgForTerm{}
+	err := consumer.termMessage(msg1, "poisoned payload")
+	if err != nil {
+		t.Fatalf("expected nil err, got %v", err)
+	}
+	if msg1.termWithReasonCalled != 1 || msg1.termCalled != 0 {
+		t.Fatalf("expected TermWithReason called, Term not called")
+	}
+	if msg1.reasonReceived != "poisoned payload" {
+		t.Fatalf("expected reason 'poisoned payload', got %q", msg1.reasonReceived)
+	}
+	if consumer.TerminatedMessages() != 1 {
+		t.Fatalf("expected TerminatedMessages=1, got %d", consumer.TerminatedMessages())
+	}
+
+	// 3. Fallback: TermWithReason fails, but Term succeeds -> counts as 1 termination
+	msg2 := &mockMsgForTerm{
+		termWithReasonErr: errors.New("server does not support TermWithReason"),
+	}
+	err = consumer.termMessage(msg2, "poisoned fallback")
+	if err != nil {
+		t.Fatalf("expected nil err on fallback success, got %v", err)
+	}
+	if msg2.termWithReasonCalled != 1 || msg2.termCalled != 1 {
+		t.Fatalf("expected both called on fallback")
+	}
+	if consumer.TerminatedMessages() != 2 {
+		t.Fatalf("expected TerminatedMessages=2, got %d", consumer.TerminatedMessages())
+	}
+
+	// 4. Failure: both TermWithReason and Term fail -> MUST NOT increment counter
+	msg3 := &mockMsgForTerm{
+		termWithReasonErr: errors.New("network error"),
+		termErr:           errors.New("connection closed"),
+	}
+	err = consumer.termMessage(msg3, "failed term")
+	if err == nil {
+		t.Fatalf("expected error when both fail, got nil")
+	}
+	if msg3.termWithReasonCalled != 1 || msg3.termCalled != 1 {
+		t.Fatalf("expected both called")
+	}
+	if consumer.TerminatedMessages() != 2 {
+		t.Fatalf("expected TerminatedMessages to remain 2 after failure, got %d", consumer.TerminatedMessages())
+	}
+
+	// 5. Nil message handling returns error and does not increment
+	err = consumer.termMessage(nil, "nil test")
+	if err == nil {
+		t.Fatalf("expected error for nil message")
+	}
+	if consumer.TerminatedMessages() != 2 {
+		t.Fatalf("expected TerminatedMessages to remain 2, got %d", consumer.TerminatedMessages())
+	}
+}
