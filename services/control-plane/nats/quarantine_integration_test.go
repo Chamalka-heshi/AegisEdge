@@ -88,6 +88,12 @@ func (m *mockFailingQuarantineStore) PruneQuarantinePayloads(ctx context.Context
 	return m.underlying.PruneQuarantinePayloads(ctx, cutoff, limit)
 }
 
+func (m *mockFailingQuarantineStore) CountActiveQuarantineRecords(ctx context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.underlying.CountActiveQuarantineRecords(ctx)
+}
+
 // 1. Test scenario: Malformed JSON is durably quarantined before source ACK/TERM
 func TestConsumer_Quarantine_MalformedJSON_DurableBeforeTerm(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
@@ -188,6 +194,10 @@ verified:
 	// Consumed should be 0 (poison message is not valid telemetry)
 	if consumer.Consumed() != 0 {
 		t.Errorf("expected 0 consumed, got %d", consumer.Consumed())
+	}
+	// TerminatedMessages must be 1 (successfully terminated poisoned message)
+	if consumer.TerminatedMessages() != 1 {
+		t.Errorf("expected 1 terminated message, got %d", consumer.TerminatedMessages())
 	}
 }
 
@@ -386,6 +396,10 @@ verified:
 	// Confirm quarantined count is 0 because persistence failed
 	if consumer.Quarantined() != 0 {
 		t.Errorf("expected 0 quarantined, got %d", consumer.Quarantined())
+	}
+	// Confirm terminated messages count is 0 because message was not terminated
+	if consumer.TerminatedMessages() != 0 {
+		t.Errorf("expected 0 terminated messages, got %d", consumer.TerminatedMessages())
 	}
 }
 
@@ -1552,6 +1566,10 @@ func (s *selectiveFailingStore) DiscardQuarantineRecord(ctx context.Context, id,
 
 func (s *selectiveFailingStore) PruneQuarantinePayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
 	return s.underlying.PruneQuarantinePayloads(ctx, cutoff, limit)
+}
+
+func (s *selectiveFailingStore) CountActiveQuarantineRecords(ctx context.Context) (int64, error) {
+	return s.underlying.CountActiveQuarantineRecords(ctx)
 }
 
 func TestConsumer_Recovery_SingleUnavailableItem_DoesNotBlockOthers(t *testing.T) {
