@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/metrics"
 	"github.com/Chamalka-heshi/AegisEdge/services/control-plane/storage"
 	"github.com/Chamalka-heshi/AegisEdge/shared/types"
 )
@@ -1028,5 +1029,321 @@ func TestQuarantineAPI_Errors_StorageErrorsSanitized(t *testing.T) {
 	json.Unmarshal(body, &errResp)
 	if strings.Contains(strings.ToLower(errResp.Message), "sqlite") || strings.Contains(errResp.Message, ".db") {
 		t.Fatalf("error message leaks internal storage details: %q", errResp.Message)
+	}
+}
+
+// ============================================================================
+// Administrative Quarantine Operation Metrics (Phase 1)
+// ============================================================================
+
+// 30. Administrative Quarantine Replay Metrics: outcomes correctly increment counters.
+func TestQuarantineAPI_Metrics_ReplayOutcomes(t *testing.T) {
+	srv, store, ts := setupQuarantineTestServer(t, true, testAdminToken)
+
+	// Seed records
+	validBatch := makeValidBatchPayload("node-metrics-replay", "batch-metrics-replay")
+	seq1 := uint64(1001)
+	recValid := seedQuarantineRecord(t, store, &storage.QuarantineRecord{
+		ID:               "qrn-metric-rep-valid",
+		DeduplicationKey: "dedup-metric-rep-valid",
+		SourceStream:     "TELEMETRY",
+		SourceSequence:   &seq1,
+		SourceSubject:    "telemetry.node-metrics-replay",
+		NodeID:           "node-metrics-replay",
+		BatchID:          "batch-metrics-replay",
+		Payload:          validBatch,
+		PayloadSizeBytes: len(validBatch),
+		Status:           storage.StatusQuarantined,
+	})
+
+	corruptBatch := []byte("not-valid-json-bytes")
+	seq2 := uint64(1002)
+	recCorrupt := seedQuarantineRecord(t, store, &storage.QuarantineRecord{
+		ID:               "qrn-metric-rep-corrupt",
+		DeduplicationKey: "dedup-metric-rep-corrupt",
+		SourceStream:     "TELEMETRY",
+		SourceSequence:   &seq2,
+		SourceSubject:    "telemetry.node-metrics-replay",
+		NodeID:           "node-metrics-replay",
+		BatchID:          "batch-metrics-rep-corrupt",
+		Payload:          corruptBatch,
+		PayloadSizeBytes: len(corruptBatch),
+		Status:           storage.StatusQuarantined,
+	})
+
+	seq3 := uint64(1003)
+	recAlreadyReplayed := seedQuarantineRecord(t, store, &storage.QuarantineRecord{
+		ID:               "qrn-metric-rep-conflict",
+		DeduplicationKey: "dedup-metric-rep-conflict",
+		SourceStream:     "TELEMETRY",
+		SourceSequence:   &seq3,
+		SourceSubject:    "telemetry.node-metrics-replay",
+		NodeID:           "node-metrics-replay",
+		BatchID:          "batch-metrics-rep-conflict",
+		Payload:          validBatch,
+		PayloadSizeBytes: len(validBatch),
+		Status:           storage.StatusReplayed,
+	})
+
+	// 1. Success outcome -> 200
+	resp, _ := doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/"+recValid.ID+"/replay", testAdminToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// 2. Conflict outcome -> 409 (replaying already replayed record)
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/"+recAlreadyReplayed.ID+"/replay", testAdminToken, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", resp.StatusCode)
+	}
+
+	// 3. Not Found outcome -> 404
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-nonexistent-replay/replay", testAdminToken, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+
+	// 4. Invalid outcome:
+	// a) Reason too long -> 400
+	longReason := strings.Repeat("A", storage.MaxStatusReasonLength+1)
+	body, _ := json.Marshal(map[string]string{"reason": longReason})
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/"+recCorrupt.ID+"/replay", testAdminToken, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+
+	// b) Corrupt payload -> 422
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/"+recCorrupt.ID+"/replay", testAdminToken, nil)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d", resp.StatusCode)
+	}
+
+	// Verify metrics so far
+	out := srv.Metrics().Registry().FormatPrometheus()
+	if !strings.Contains(out, `aegisedge_quarantine_replays_total{outcome="success"} 1`) {
+		t.Fatalf("expected replays success=1, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_replays_total{outcome="conflict"} 1`) {
+		t.Fatalf("expected replays conflict=1, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_replays_total{outcome="not_found"} 1`) {
+		t.Fatalf("expected replays not_found=1, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_replays_total{outcome="invalid"} 2`) {
+		t.Fatalf("expected replays invalid=2, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_replays_total{outcome="error"} 0`) {
+		t.Fatalf("expected replays error=0, got:\n%s", out)
+	}
+
+	// 5. Error outcome -> 500 (closing store)
+	srv.Close()
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-metric-rep-valid/replay", testAdminToken, nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	}
+
+	out = srv.Metrics().Registry().FormatPrometheus()
+	if !strings.Contains(out, `aegisedge_quarantine_replays_total{outcome="error"} 1`) {
+		t.Fatalf("expected replays error=1, got:\n%s", out)
+	}
+}
+
+// 31. Administrative Quarantine Discard Metrics: outcomes correctly increment counters.
+func TestQuarantineAPI_Metrics_DiscardOutcomes(t *testing.T) {
+	srv, store, ts := setupQuarantineTestServer(t, true, testAdminToken)
+
+	seq2001 := uint64(2001)
+	recValid := seedQuarantineRecord(t, store, &storage.QuarantineRecord{
+		ID:               "qrn-metric-disc-valid",
+		DeduplicationKey: "dedup-metric-disc-valid",
+		SourceStream:     "TELEMETRY",
+		SourceSequence:   &seq2001,
+		SourceSubject:    "telemetry.node-metrics-discard",
+		NodeID:           "node-metrics-discard",
+		BatchID:          "batch-metrics-discard",
+		Payload:          []byte("raw"),
+		PayloadSizeBytes: 3,
+		Status:           storage.StatusQuarantined,
+	})
+
+	seq2002 := uint64(2002)
+	recAlreadyDiscarded := seedQuarantineRecord(t, store, &storage.QuarantineRecord{
+		ID:               "qrn-metric-disc-conflict",
+		DeduplicationKey: "dedup-metric-disc-conflict",
+		SourceStream:     "TELEMETRY",
+		SourceSequence:   &seq2002,
+		SourceSubject:    "telemetry.node-metrics-discard",
+		NodeID:           "node-metrics-discard",
+		BatchID:          "batch-metrics-disc-conflict",
+		Payload:          []byte("raw"),
+		PayloadSizeBytes: 3,
+		Status:           storage.StatusDiscarded,
+	})
+
+	// 1. Success outcome -> 200
+	body, _ := json.Marshal(map[string]string{"reason": "administrator discard test"})
+	resp, _ := doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/"+recValid.ID+"/discard", testAdminToken, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// 2. Conflict outcome -> 409
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/"+recAlreadyDiscarded.ID+"/discard", testAdminToken, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", resp.StatusCode)
+	}
+
+	// 3. Not Found outcome -> 404
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-nonexistent-discard/discard", testAdminToken, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+
+	// 4. Invalid outcome:
+	// a) Malformed JSON
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-any/discard", testAdminToken, []byte("{invalid-json"))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+
+	// b) Reason exceeds max length
+	longReason := strings.Repeat("B", storage.MaxStatusReasonLength+1)
+	body, _ = json.Marshal(map[string]string{"reason": longReason})
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-any/discard", testAdminToken, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+
+	// Verify metrics so far
+	out := srv.Metrics().Registry().FormatPrometheus()
+	if !strings.Contains(out, `aegisedge_quarantine_discards_total{outcome="success"} 1`) {
+		t.Fatalf("expected discards success=1, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_discards_total{outcome="conflict"} 1`) {
+		t.Fatalf("expected discards conflict=1, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_discards_total{outcome="not_found"} 1`) {
+		t.Fatalf("expected discards not_found=1, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_discards_total{outcome="invalid"} 2`) {
+		t.Fatalf("expected discards invalid=2, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_quarantine_discards_total{outcome="error"} 0`) {
+		t.Fatalf("expected discards error=0, got:\n%s", out)
+	}
+
+	// 5. Error outcome -> 500 (closing store)
+	srv.Close()
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-metric-disc-valid/discard", testAdminToken, nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	}
+
+	out = srv.Metrics().Registry().FormatPrometheus()
+	if !strings.Contains(out, `aegisedge_quarantine_discards_total{outcome="error"} 1`) {
+		t.Fatalf("expected discards error=1, got:\n%s", out)
+	}
+}
+
+// 32. Quarantine operation metrics: Auth failures do NOT increment replay/discard counters.
+func TestQuarantineAPI_Metrics_AuthFailureDoesNotIncrementQuarantineCounters(t *testing.T) {
+	srv, _, ts := setupQuarantineTestServer(t, true, testAdminToken)
+
+	// 1. Request with missing credentials -> 401
+	resp, _ := doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-auth-test/replay", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+
+	// 2. Request with invalid bearer token -> 401
+	resp, _ = doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/qrn-auth-test/discard", "wrong-admin-token", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+
+	// 3. Request with valid Node HMAC credentials (rejected as non-admin) -> 403
+	req := signedRequest(t, http.MethodPost, ts.URL+"/api/v1/telemetry/quarantine/qrn-auth-test/replay", "node-test", nil)
+	hmacResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("HMAC request failed: %v", err)
+	}
+	defer hmacResp.Body.Close()
+	if hmacResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for Node HMAC, got %d", hmacResp.StatusCode)
+	}
+
+	out := srv.Metrics().Registry().FormatPrometheus()
+
+	// Verify all replay and discard counters are strictly 0
+	expectedZeroes := []string{
+		`aegisedge_quarantine_replays_total{outcome="success"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="not_found"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="conflict"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="invalid"} 0`,
+		`aegisedge_quarantine_replays_total{outcome="error"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="success"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="not_found"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="conflict"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="invalid"} 0`,
+		`aegisedge_quarantine_discards_total{outcome="error"} 0`,
+	}
+	for _, expected := range expectedZeroes {
+		if !strings.Contains(out, expected) {
+			t.Fatalf("expected %q, but got exposition:\n%s", expected, out)
+		}
+	}
+
+	// But auth_failures_total was incremented!
+	if !strings.Contains(out, `aegisedge_control_plane_auth_failures_total{reason="unauthorized"} 2`) {
+		t.Fatalf("expected auth_failures unauthorized=2, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aegisedge_control_plane_auth_failures_total{reason="forbidden"} 1`) {
+		t.Fatalf("expected auth_failures forbidden=1, got:\n%s", out)
+	}
+}
+
+// 33. Replay and discard counters operate independently.
+func TestQuarantineAPI_Metrics_CounterIndependence(t *testing.T) {
+	srv, store, ts := setupQuarantineTestServer(t, true, testAdminToken)
+
+	validBatch := makeValidBatchPayload("node-indep", "batch-indep")
+	seq3001 := uint64(3001)
+	rec := seedQuarantineRecord(t, store, &storage.QuarantineRecord{
+		ID:               "qrn-metric-indep",
+		DeduplicationKey: "dedup-metric-indep",
+		SourceStream:     "TELEMETRY",
+		SourceSequence:   &seq3001,
+		SourceSubject:    "telemetry.node-indep",
+		NodeID:           "node-indep",
+		BatchID:          "batch-indep",
+		Payload:          validBatch,
+		PayloadSizeBytes: len(validBatch),
+		Status:           storage.StatusQuarantined,
+	})
+
+	// Perform 1 successful replay
+	resp, _ := doAdminRequest(t, ts, http.MethodPost, "/api/v1/telemetry/quarantine/"+rec.ID+"/replay", testAdminToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	out := srv.Metrics().Registry().FormatPrometheus()
+
+	// Replay success is 1, all others 0
+	if !strings.Contains(out, `aegisedge_quarantine_replays_total{outcome="success"} 1`) {
+		t.Fatalf("expected replay success=1, got:\n%s", out)
+	}
+	for _, outcome := range []string{
+		metrics.QuarantineOutcomeSuccess,
+		metrics.QuarantineOutcomeNotFound,
+		metrics.QuarantineOutcomeConflict,
+		metrics.QuarantineOutcomeInvalid,
+		metrics.QuarantineOutcomeError,
+	} {
+		expDiscard := fmt.Sprintf(`aegisedge_quarantine_discards_total{outcome="%s"} 0`, outcome)
+		if !strings.Contains(out, expDiscard) {
+			t.Fatalf("expected %s, got:\n%s", expDiscard, out)
+		}
 	}
 }
