@@ -2545,3 +2545,149 @@ func TestQuarantine_AtomicReplay_PayloadBothIdentitiesMismatch(t *testing.T) {
 		t.Errorf("expected failure reason preserved, got %q", fresh.FailureReason)
 	}
 }
+
+// TestSQLiteStore_CountActiveQuarantineRecords verifies the lifecycle and query properties of CountActiveQuarantineRecords:
+// 1. Empty quarantine store returns 0.
+// 2. Active quarantined records are counted accurately.
+// 3. Replayed and discarded records are excluded.
+// 4. Transitions to terminal states immediately decrease the count.
+// 5. Query execution uses the covering index without loading payload BLOBs.
+// 6. Closed store returns ErrStoreClosed.
+func TestSQLiteStore_CountActiveQuarantineRecords(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Empty quarantine store reports 0
+	count, err := store.CountActiveQuarantineRecords(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveQuarantineRecords on empty store failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 active records, got %d", count)
+	}
+
+	// 2. Add 3 active quarantined records
+	r1, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		ID:               "qrn-count-1",
+		DeduplicationKey: "dedup-count-1",
+		NodeID:           "node-1",
+		BatchID:          "batch-1",
+		Payload:          []byte("large-payload-blob-1"),
+		FailureCategory:  CategoryDeserialization,
+		FailureReason:    "malformed payload 1",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 1 failed: %v", err)
+	}
+
+	r2, err := store.RecordQuarantine(ctx, &QuarantineRecord{
+		ID:               "qrn-count-2",
+		DeduplicationKey: "dedup-count-2",
+		NodeID:           "node-2",
+		BatchID:          "batch-2",
+		Payload:          []byte("large-payload-blob-2"),
+		FailureCategory:  CategoryDeserialization,
+		FailureReason:    "malformed payload 2",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 2 failed: %v", err)
+	}
+
+	_, err = store.RecordQuarantine(ctx, &QuarantineRecord{
+		ID:               "qrn-count-3",
+		DeduplicationKey: "dedup-count-3",
+		NodeID:           "node-3",
+		BatchID:          "batch-3",
+		Payload:          []byte("large-payload-blob-3"),
+		FailureCategory:  CategoryDeserialization,
+		FailureReason:    "malformed payload 3",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 3 failed: %v", err)
+	}
+
+	count, err = store.CountActiveQuarantineRecords(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveQuarantineRecords failed: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 active records, got %d", count)
+	}
+
+	// 3. Replay r1 -> becomes terminal StatusReplayed
+	_, err = store.UpdateQuarantineStatus(ctx, QuarantineStatusUpdate{
+		ID:        r1.ID,
+		NewStatus: StatusReplayed,
+		Reason:    "replayed in test",
+		UpdatedBy: "operator",
+	})
+	if err != nil {
+		t.Fatalf("UpdateQuarantineStatus to replayed failed: %v", err)
+	}
+
+	count, err = store.CountActiveQuarantineRecords(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveQuarantineRecords failed: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 active records after replay, got %d", count)
+	}
+
+	// 4. Discard r2 -> becomes terminal StatusDiscarded
+	_, err = store.DiscardQuarantineRecord(ctx, r2.ID, "operator", "discarded in test")
+	if err != nil {
+		t.Fatalf("DiscardQuarantineRecord failed: %v", err)
+	}
+
+	count, err = store.CountActiveQuarantineRecords(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveQuarantineRecords failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 active record after discard, got %d", count)
+	}
+
+	// 5. Verify query plan uses index idx_cp_quarantine_status_time without full table scan
+	rows, err := store.db.QueryContext(ctx, `EXPLAIN QUERY PLAN SELECT COUNT(*) FROM cp_telemetry_quarantine WHERE status = 'quarantined'`)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN failed: %v", err)
+	}
+	defer rows.Close()
+
+	var selectID, orderVal, fromVal int
+	var detail string
+	var planDetails []string
+	for rows.Next() {
+		if err := rows.Scan(&selectID, &orderVal, &fromVal, &detail); err != nil {
+			t.Fatalf("scan query plan row failed: %v", err)
+		}
+		planDetails = append(planDetails, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate query plan rows failed: %v", err)
+	}
+	fullPlan := strings.Join(planDetails, "; ")
+	if !strings.Contains(fullPlan, "idx_cp_quarantine_status") || !strings.Contains(fullPlan, "COVERING INDEX") {
+		t.Errorf("expected query plan to use a quarantine status covering index, got: %s", fullPlan)
+	}
+	if strings.Contains(fullPlan, "SCAN cp_telemetry_quarantine") && !strings.Contains(fullPlan, "USING INDEX") {
+		t.Errorf("query plan performed unindexed table scan: %s", fullPlan)
+	}
+
+	// 6. Test closed store error behavior
+	closedStore, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	if err := closedStore.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	_, err = closedStore.CountActiveQuarantineRecords(ctx)
+	if err == nil || !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("expected ErrStoreClosed on closed store, got: %v", err)
+	}
+}
