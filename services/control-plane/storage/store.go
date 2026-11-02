@@ -415,6 +415,10 @@ type QuarantineStore interface {
 	// older than the cutoff timestamp by setting payload = X'' (empty BLOB).
 	// Audit metadata and idempotency keys are strictly retained.
 	PruneQuarantinePayloads(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+
+	// CountActiveQuarantineRecords returns the total number of durable quarantine records
+	// currently in 'quarantined' status.
+	CountActiveQuarantineRecords(ctx context.Context) (int64, error)
 }
 
 // DeriveDeduplicationKey computes a deterministic, collision-resistant identity for quarantine deduplication.
