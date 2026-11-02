@@ -408,3 +408,128 @@ func TestMetrics_RegisteredNodesRehydration(t *testing.T) {
 		t.Fatalf("expected %q on rehydrated server, but got:\n%s", expectedMetric, mRec2.Body.String())
 	}
 }
+
+func TestMetrics_ActiveQuarantineRecordsGauge(t *testing.T) {
+	ctx := context.Background()
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, "quarantine_metrics.db")
+
+	store, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+
+	srv := NewServer(newDiscardLogger(), WithIdempotencyStore(store), WithQuarantineStore(store))
+	handler := srv.Routes()
+
+	// 1. Empty quarantine store reports 0
+	mReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	mRec := httptest.NewRecorder()
+	handler.ServeHTTP(mRec, mReq)
+	if !strings.Contains(mRec.Body.String(), "aegisedge_quarantine_active_records 0") {
+		t.Fatalf("expected 0 active quarantine records initially, got:\n%s", mRec.Body.String())
+	}
+
+	// 2. Add 2 active quarantined records
+	r1, err := store.RecordQuarantine(ctx, &storage.QuarantineRecord{
+		ID:               "qrn-gauge-1",
+		DeduplicationKey: "dedup-gauge-1",
+		NodeID:           "node-g1",
+		BatchID:          "batch-g1",
+		Payload:          []byte("payload-1"),
+		FailureCategory:  storage.CategoryDeserialization,
+		FailureReason:    "corrupted payload",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 1 failed: %v", err)
+	}
+
+	r2, err := store.RecordQuarantine(ctx, &storage.QuarantineRecord{
+		ID:               "qrn-gauge-2",
+		DeduplicationKey: "dedup-gauge-2",
+		NodeID:           "node-g2",
+		BatchID:          "batch-g2",
+		Payload:          []byte("payload-2"),
+		FailureCategory:  storage.CategorySchemaValidation,
+		FailureReason:    "schema mismatch",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 2 failed: %v", err)
+	}
+
+	mRec = httptest.NewRecorder()
+	handler.ServeHTTP(mRec, mReq)
+	if !strings.Contains(mRec.Body.String(), "aegisedge_quarantine_active_records 2") {
+		t.Fatalf("expected 2 active quarantine records, got:\n%s", mRec.Body.String())
+	}
+
+	// 3. Transition r1 to replayed -> gauge decreases to 1
+	_, err = store.UpdateQuarantineStatus(ctx, storage.QuarantineStatusUpdate{
+		ID:        r1.ID,
+		NewStatus: storage.StatusReplayed,
+		Reason:    "replayed",
+		UpdatedBy: "admin",
+	})
+	if err != nil {
+		t.Fatalf("UpdateQuarantineStatus to replayed failed: %v", err)
+	}
+
+	mRec = httptest.NewRecorder()
+	handler.ServeHTTP(mRec, mReq)
+	if !strings.Contains(mRec.Body.String(), "aegisedge_quarantine_active_records 1") {
+		t.Fatalf("expected 1 active quarantine record after replay, got:\n%s", mRec.Body.String())
+	}
+
+	// 4. Transition r2 to discarded -> gauge decreases to 0 (terminal records excluded)
+	_, err = store.DiscardQuarantineRecord(ctx, r2.ID, "admin", "discarded")
+	if err != nil {
+		t.Fatalf("DiscardQuarantineRecord failed: %v", err)
+	}
+
+	mRec = httptest.NewRecorder()
+	handler.ServeHTTP(mRec, mReq)
+	if !strings.Contains(mRec.Body.String(), "aegisedge_quarantine_active_records 0") {
+		t.Fatalf("expected 0 active quarantine records after discard, got:\n%s", mRec.Body.String())
+	}
+
+	// 5. Add a 3rd record, close server and verify restart persistence on new server instance
+	_, err = store.RecordQuarantine(ctx, &storage.QuarantineRecord{
+		ID:               "qrn-gauge-3",
+		DeduplicationKey: "dedup-gauge-3",
+		NodeID:           "node-g3",
+		BatchID:          "batch-g3",
+		Payload:          []byte("payload-3"),
+		FailureCategory:  storage.CategoryDeliveryExhausted,
+		FailureReason:    "exhausted",
+	})
+	if err != nil {
+		t.Fatalf("RecordQuarantine 3 failed: %v", err)
+	}
+
+	_ = srv.Close()
+
+	// Open second server on same database
+	storeRestart, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite restart failed: %v", err)
+	}
+	srvRestart := NewServer(newDiscardLogger(), WithIdempotencyStore(storeRestart), WithQuarantineStore(storeRestart))
+	handlerRestart := srvRestart.Routes()
+
+	mRec = httptest.NewRecorder()
+	handlerRestart.ServeHTTP(mRec, mReq)
+	if !strings.Contains(mRec.Body.String(), "aegisedge_quarantine_active_records 1") {
+		t.Fatalf("expected 1 active quarantine record after restart, got:\n%s", mRec.Body.String())
+	}
+
+	// 6. Explicitly close store and verify storage failure produces NaN, never a false successful 0
+	_ = srvRestart.Close() // closes storeRestart
+	mRec = httptest.NewRecorder()
+	handlerRestart.ServeHTTP(mRec, mReq)
+	if strings.Contains(mRec.Body.String(), "aegisedge_quarantine_active_records 0") {
+		t.Fatalf("storage error falsely presented as successful 0:\n%s", mRec.Body.String())
+	}
+	if !strings.Contains(mRec.Body.String(), "aegisedge_quarantine_active_records NaN") {
+		t.Fatalf("expected NaN on storage failure, got:\n%s", mRec.Body.String())
+	}
+}
