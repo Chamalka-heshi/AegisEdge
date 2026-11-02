@@ -389,6 +389,12 @@ func main() {
 		srvInstance.Metrics().SetNATSStalledUnacknowledgedSequencesSource(func() float64 {
 			return float64(consumer.StalledUnacknowledgedSequences())
 		})
+		srvInstance.Metrics().SetNATSPendingRecoverySource(func() float64 {
+			return float64(consumer.PendingRecoveryCount())
+		})
+		srvInstance.Metrics().SetNATSTerminatedMessagesSource(func() float64 {
+			return float64(consumer.TerminatedMessages())
+		})
 		if err := consumer.Start(); err != nil {
 			logger.Error("failed to start NATS consumer", slog.Any("error", err))
 			os.Exit(1)
