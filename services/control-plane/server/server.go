@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -450,8 +451,28 @@ func NewServer(logger *slog.Logger, opts ...ServerOption) *Server {
 		defer s.mu.RUnlock()
 		return float64(len(s.nodes))
 	})
+	s.metrics.SetQuarantineActiveRecordsSource(func() float64 {
+		return s.activeQuarantineCount()
+	})
 
 	return s
+}
+
+// activeQuarantineCount retrieves the current durable active quarantine records count.
+// Returns 0 if quarantine store is not configured, or math.NaN() if query fails.
+func (s *Server) activeQuarantineCount() float64 {
+	if s.quarantineStore == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	count, err := s.quarantineStore.CountActiveQuarantineRecords(ctx)
+	if err != nil {
+		s.logger.Warn("failed to count active quarantine records for metrics", slog.Any("error", err))
+		return math.NaN()
+	}
+	return float64(count)
 }
 
 // Metrics returns the operational metrics instance for the server.
