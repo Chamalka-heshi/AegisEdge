@@ -1,0 +1,69 @@
+# Prometheus Alerting Rules for AegisEdge Control Plane
+# Scope: Telemetry Quarantine Backlog, Storage Health, and NATS JetStream Recovery Observability
+# Reference: ADR-0008, docs/development/telemetry-quarantine.md
+
+groups:
+  - name: aegisedge-quarantine-and-nats
+    rules:
+      - alert: QuarantineActiveBacklogHigh
+        expr: aegisedge_quarantine_active_records > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated active telemetry quarantine backlog"
+          description: "Active durable quarantine backlog is {{ $value }} records (threshold > 100) for more than 5m. Inspect quarantined payloads via GET /api/v1/telemetry/quarantine."
+
+      - alert: QuarantineActiveBacklogCritical
+        expr: aegisedge_quarantine_active_records > 500
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critically high active telemetry quarantine backlog"
+          description: "Active durable quarantine backlog has reached {{ $value }} records (threshold > 500) for more than 5m. High volume of invalid or corrupted edge telemetry requires immediate operator triage."
+
+      - alert: QuarantineActiveCountStorageFailure
+        expr: aegisedge_quarantine_active_records != aegisedge_quarantine_active_records
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Quarantine active records query failing (NaN emitted)"
+          description: "The control plane quarantine count query has returned NaN for more than 2m. SQLite storage query timed out (>2s) or encountered database errors."
+
+      - alert: QuarantineActiveMetricMissing
+        expr: absent(aegisedge_quarantine_active_records)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Active quarantine records metric is absent"
+          description: "The metric aegisedge_quarantine_active_records is absent from scrape targets for more than 5m. Verify control plane process health and Prometheus scrape configuration."
+
+      - alert: NATSPendingRecoveryAccumulationWarning
+        expr: aegisedge_nats_pending_recovery_items > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NATS consumer has persistent pending recovery items"
+          description: "NATS JetStream consumer has {{ $value }} exhausted messages in process-local memory awaiting quarantine persistence for more than 5m."
+
+      - alert: NATSPendingRecoveryAccumulationCritical
+        expr: aegisedge_nats_pending_recovery_items > 20
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NATS consumer pending recovery accumulation is critically high"
+          description: "NATS consumer in-memory recovery queue has {{ $value }} items (threshold > 20) for more than 5m. Quarantine persistence may be failing or severely throttled."
+
+      - alert: NATSHighMessageTerminationRate
+        expr: increase(aegisedge_nats_terminated_messages_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate of permanent NATS message terminations"
+          description: "NATS consumer terminated {{ $value | printf \"%.0f\" }} poisoned messages over 5m (rate > 10 per 5m). Investigate edge producer telemetry validity and quarantine error reasons."
