@@ -613,3 +613,148 @@ curl -s http://127.0.0.1:8080/metrics | findstr /i "quarantine nats"
 # # TYPE aegisedge_quarantine_pruned_payloads_total counter
 # aegisedge_quarantine_pruned_payloads_total 14
 ```
+
+---
+
+## 10. Operational Prometheus Alerting & Troubleshooting Runbook (Stage 6.31B.11A)
+
+AegisEdge control-plane deployment includes pre-configured Prometheus alerting rules in [`infra/prometheus/alert_rules.yml`](../../infra/prometheus/alert_rules.yml) to detect backlog growth, storage degradation, and message termination spikes.
+
+### 10.1 Alert Rules Summary
+
+| Alert Name | Severity | Condition (PromQL) | Duration (`for`) | Scope |
+| :--- | :---: | :--- | :---: | :--- |
+| **`QuarantineActiveBacklogHigh`** | `warning` | `aegisedge_quarantine_active_records > 100` | `5m` | Durable SQLite State |
+| **`QuarantineActiveBacklogCritical`** | `critical` | `aegisedge_quarantine_active_records > 500` | `5m` | Durable SQLite State |
+| **`QuarantineActiveCountStorageFailure`** | `critical` | `aegisedge_quarantine_active_records != aegisedge_quarantine_active_records` | `2m` | SQLite Probe Health (NaN) |
+| **`QuarantineActiveMetricMissing`** | `critical` | `absent(aegisedge_quarantine_active_records)` | `5m` | Scrape Availability |
+| **`NATSPendingRecoveryAccumulationWarning`** | `warning` | `aegisedge_nats_pending_recovery_items > 0` | `5m` | Process-Local In-Memory |
+| **`NATSPendingRecoveryAccumulationCritical`** | `critical` | `aegisedge_nats_pending_recovery_items > 20` | `5m` | Process-Local In-Memory |
+| **`NATSHighMessageTerminationRate`** | `warning` | `increase(aegisedge_nats_terminated_messages_total[5m]) > 10` | `2m` | Process-Local Counter |
+
+> [!NOTE]
+> **Threshold Tuning**: Backlog thresholds (100 warning, 500 critical) and pending recovery limits (0 warning, 20 critical) are initial operational baselines. Operators should tune these values in `alert_rules.yml` to reflect specific edge fleet size, reporting frequencies, and normal administrative review cadences.
+
+---
+
+### 10.2 Metric Scopes and Architectural Invariants
+
+Understanding the data lifetime and storage tier of each metric is mandatory before interpreting alert firing:
+
+1. **Durable SQLite State (`aegisedge_quarantine_active_records`)**:
+   - Represents the physical count of records with `status = 'quarantined'` stored in SQLite `cp_telemetry_quarantine`.
+   - **Persistent across restarts**: Stopping or restarting the control-plane daemon does **not** reset this gauge.
+   - Evaluated at scrape time via covering index scan with a 2-second timeout.
+2. **Process-Local In-Memory Queue (`aegisedge_nats_pending_recovery_items`)**:
+   - Measures items currently held in the consumer's `c.pendingExhausted` map awaiting asynchronous insertion into SQLite quarantine.
+   - **Non-durable**: Resets to 0 upon control-plane restart. On restart, unpersisted messages are re-acquired from JetStream unacknowledged streams and advisory sequences.
+3. **Process-Local Termination Counter (`aegisedge_nats_terminated_messages_total`)**:
+   - Monotonically tracks successful `TermWithReason` and `Term` calls issued to NATS JetStream by the active process.
+   - **Non-durable**: Resets to 0 on restart. Preinitialized to 0 on startup so `increase()` has an uninterrupted baseline from $t=0$.
+
+---
+
+### 10.3 Alert Investigation & Remediation Procedures
+
+#### 10.3.1 `QuarantineActiveBacklogHigh` & `QuarantineActiveBacklogCritical`
+
+- **Meaning**: The number of durable records awaiting operator triage in `quarantined` state has exceeded 100 (warning) or 500 (critical) for over 5 minutes.
+- **First Inspection Step**: Query the control-plane quarantine API to review failure categories and recent quarantine entries:
+  ```powershell
+  # List recent quarantined batches
+  curl -s -H "Authorization: Bearer <ADMIN_TOKEN>" "http://127.0.0.1:8080/api/v1/telemetry/quarantine?limit=20&status=quarantined" | jq .
+  ```
+- **Diagnostic Signals**:
+  - Check failure category distribution: `deserialization_error`, `schema_validation_error`, `delivery_exhausted`.
+  - Inspect structured server logs: `slog.String("failure_category", ...)` and `slog.String("reason", ...)`.
+- **Safe Remediation**:
+  - Inspect specific record details:
+    ```powershell
+    curl -s -H "Authorization: Bearer <ADMIN_TOKEN>" "http://127.0.0.1:8080/api/v1/telemetry/quarantine/<record_id>" | jq .
+    ```
+  - For schema fixes or restored upstream services, replay eligible records:
+    ```powershell
+    curl -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" "http://127.0.0.1:8080/api/v1/telemetry/quarantine/<record_id>/replay"
+    ```
+  - For unrecoverable or malicious test payloads, discard the record:
+    ```powershell
+    curl -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" "http://127.0.0.1:8080/api/v1/telemetry/quarantine/<record_id>/discard"
+    ```
+- **Prohibited Actions**:
+  - **Do NOT** manually execute `DELETE FROM cp_telemetry_quarantine` or `UPDATE cp_telemetry_quarantine SET status = 'discarded'` directly via SQLite CLI. Bypassing the API skips audit trails and administrative authorization invariants.
+
+---
+
+#### 10.3.2 `QuarantineActiveCountStorageFailure`
+
+- **Meaning**: The active quarantine gauge is emitting `NaN` (detected in PromQL via `metric != metric`). The control plane cannot count active records due to SQLite timeouts (>2s) or database errors.
+- **First Inspection Step**: Check control plane application logs for storage warnings:
+  ```powershell
+  # Search for active quarantine query errors
+  grep "failed to count active quarantine records for metrics" /var/log/aegisedge/control-plane.log
+  ```
+- **Diagnostic Signals**:
+  - Check database lock contention or disk I/O wait times.
+  - Check whether a heavy database maintenance job (e.g. bulk VACUUM or unindexed queries) is holding exclusive SQLite locks.
+  - Verify filesystem health and free disk space where `control-plane.db` is stored.
+- **Safe Remediation**:
+  - Verify server readiness via `GET /readyz`.
+  - If locked, identify long-running SQLite transactions or external tools accessing the database file.
+- **Prohibited Actions**:
+  - **Do NOT** kill `-9` the control-plane process while SQLite WAL checkpoints are in progress, which risks database recovery delays.
+
+---
+
+#### 10.3.3 `QuarantineActiveMetricMissing`
+
+- **Meaning**: `absent(aegisedge_quarantine_active_records)` evaluates to 1 for over 5 minutes. The metric is completely missing from Prometheus scrape targets.
+- **First Inspection Step**: Verify that the control plane process is running and reachable:
+  ```powershell
+  curl -i http://127.0.0.1:8080/healthz
+  curl -s http://127.0.0.1:8080/metrics | grep aegisedge_quarantine_active_records
+  ```
+- **Diagnostic Signals**:
+  - Process exit / crash events in systemd, Kubernetes, or Docker logs.
+  - Prometheus target status: check Prometheus UI `Targets` page for `aegisedge-control-plane` scrape errors (e.g. `connection refused`, `context deadline exceeded`).
+- **Safe Remediation**:
+  - Restart the control-plane daemon if stopped.
+  - Verify firewall and network routing between Prometheus scraper and port 8080.
+
+---
+
+#### 10.3.4 `NATSPendingRecoveryAccumulationWarning` & `NATSPendingRecoveryAccumulationCritical`
+
+- **Meaning**: Messages that exceeded `MaxDeliver` are queued in the consumer's in-memory `pendingExhausted` map awaiting quarantine persistence for >5m (>0 warning, >20 critical).
+- **First Inspection Step**: Check NATS consumer logs for recovery write failures:
+  ```powershell
+  grep "quarantine write failed during background recovery retry" /var/log/aegisedge/control-plane.log
+  ```
+- **Diagnostic Signals**:
+  - Check `c.pendingExhausted` retry attempt counts in log attributes (`attempts`, `lastAttempt`).
+  - Check for database contention on `RecordQuarantine`.
+  - Inspect advisory stream metrics: `aegisedge_nats_advisory_fetch_errors_total` and `aegisedge_nats_advisory_evictions_total`.
+- **Safe Remediation**:
+  - Ensure the database is writable. As soon as SQLite write capacity is restored, the background recovery worker automatically drains `pendingExhausted`.
+- **Prohibited Actions**:
+  - **Do NOT** restart the control-plane process prematurely if avoidable. While messages remain in JetStream, in-memory retry tracking is lost on restart and must be re-discovered via advisory streams.
+
+---
+
+#### 10.3.5 `NATSHighMessageTerminationRate`
+
+- **Meaning**: `increase(aegisedge_nats_terminated_messages_total[5m]) > 10` for over 2 minutes. The control plane is actively terminating poisoned messages in JetStream at an elevated rate.
+- **First Inspection Step**: Inspect the latest quarantined records and termination logs:
+  ```powershell
+  curl -s -H "Authorization: Bearer <ADMIN_TOKEN>" "http://127.0.0.1:8080/api/v1/telemetry/quarantine?limit=10" | jq .
+  ```
+- **Diagnostic Signals**:
+  - Common termination reasons:
+    - `malformed_json`: Ingested payload cannot be parsed.
+    - `invalid_envelope`: Missing `node_id`, `batch_id`, or metadata fields.
+    - `subject_character_violation`: Node ID contains illegal NATS subject characters.
+  - Identify whether a specific edge node or agent version is broadcasting malformed batches.
+- **Safe Remediation**:
+  - If a malfunctioning edge agent firmware/build is producing invalid payloads, isolate the specific edge node or roll back its agent version.
+  - Note: Messages counted by this metric have **already been durably persisted** to quarantine storage before termination; no telemetry data is silently lost.
+- **Prohibited Actions**:
+  - **Do NOT** purge or delete the NATS JetStream stream. Termination cleanly halts redelivery for poisoned messages without impacting healthy concurrent telemetry streams.
