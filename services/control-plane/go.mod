@@ -6,6 +6,7 @@ require (
 	github.com/Chamalka-heshi/AegisEdge/shared/ml v0.0.0
 	github.com/Chamalka-heshi/AegisEdge/shared/types v0.0.0
 	github.com/nats-io/nats.go v1.39.1
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.58.0
 )
 
