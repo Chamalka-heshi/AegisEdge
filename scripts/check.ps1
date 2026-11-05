@@ -24,6 +24,24 @@ Write-Host "`n==> Running go vet across workspace modules..." -ForegroundColor C
 go vet ./shared/types/... ./shared/ml/... ./edge/agent/... ./services/control-plane/...
 Write-Host "go vet passed." -ForegroundColor Green
 
+Write-Host "`n==> Checking Prometheus configuration and alert rules..." -ForegroundColor Cyan
+if (Get-Command promtool -ErrorAction SilentlyContinue) {
+    promtool check rules infra/prometheus/alert_rules.yml
+    if ($LASTEXITCODE -ne 0) {
+        throw "promtool check rules failed with exit code $LASTEXITCODE"
+    }
+
+    promtool check config infra/prometheus/prometheus.yml
+    if ($LASTEXITCODE -ne 0) {
+        throw "promtool check config failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host "promtool verification passed." -ForegroundColor Green
+}
+else {
+    Write-Host "promtool CLI not found on PATH; Prometheus CLI validation skipped. YAML structural validation remains covered by Go tests." -ForegroundColor Yellow
+}
+
 Write-Host "`n==> Running go test across all modules..." -ForegroundColor Cyan
 go test -v ./shared/types/... ./shared/ml/... ./edge/agent/... ./services/control-plane/...
 Write-Host "All tests passed successfully!" -ForegroundColor Green
