@@ -1,5 +1,11 @@
 # Prometheus Server Configuration for AegisEdge
 # Reference: docs/development/telemetry-quarantine.md
+#
+# Deployment & Topology Guidance:
+# - '127.0.0.1:8080' is appropriate when Prometheus executes directly on the host alongside the control plane.
+# - If Prometheus runs inside a Docker container, '127.0.0.1' points to the container's isolated network.
+#   In that setup, use 'host.docker.internal:8080' (Docker Desktop) or a service DNS name on a shared Docker network.
+# - Note: The repository currently does not establish a combined Prometheus + control-plane Docker Compose deployment.
 
 global:
   scrape_interval: 15s
