@@ -1,6 +1,6 @@
 module github.com/Chamalka-heshi/AegisEdge/edge/agent
 
-go 1.25.0
+go 1.25
 
 require (
 	github.com/Chamalka-heshi/AegisEdge/shared/ml v0.0.0
