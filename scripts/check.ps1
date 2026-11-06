@@ -36,10 +36,51 @@ if (Get-Command promtool -ErrorAction SilentlyContinue) {
         throw "promtool check config failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "promtool verification passed." -ForegroundColor Green
+    promtool test rules infra/prometheus/alert_rules_test.yml
+    if ($LASTEXITCODE -ne 0) {
+        throw "promtool test rules failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host "promtool verification and rule tests passed." -ForegroundColor Green
 }
 else {
-    Write-Host "promtool CLI not found on PATH; Prometheus CLI validation skipped. YAML structural validation remains covered by Go tests." -ForegroundColor Yellow
+    $dockerRunning = $false
+    if (Get-Command docker -ErrorAction SilentlyContinue) {
+        try {
+            $tempErr = Join-Path $env:TEMP "aegisedge_docker_check_err.log"
+            $tempOut = Join-Path $env:TEMP "aegisedge_docker_check_out.log"
+            $proc = Start-Process -FilePath "docker" -ArgumentList "info" -NoNewWindow -Wait -PassThru -RedirectStandardError $tempErr -RedirectStandardOutput $tempOut
+            if ($proc.ExitCode -eq 0) {
+                $dockerRunning = $true
+            }
+            Remove-Item $tempErr, $tempOut -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+            $dockerRunning = $false
+        }
+    }
+    if ($dockerRunning) {
+        Write-Host "Executing promtool via Docker (prom/prometheus:v3.2.1)..." -ForegroundColor Cyan
+        & docker run --rm --entrypoint promtool -v "${PWD}/infra/prometheus:/etc/prometheus" prom/prometheus:v3.2.1 check rules /etc/prometheus/alert_rules.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker promtool check rules failed with exit code $LASTEXITCODE"
+        }
+
+        & docker run --rm --entrypoint promtool -v "${PWD}/infra/prometheus:/etc/prometheus" prom/prometheus:v3.2.1 check config /etc/prometheus/prometheus.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker promtool check config failed with exit code $LASTEXITCODE"
+        }
+
+        & docker run --rm --entrypoint promtool -v "${PWD}/infra/prometheus:/etc/prometheus" prom/prometheus:v3.2.1 test rules /etc/prometheus/alert_rules_test.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker promtool test rules failed with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "Dockerized promtool verification and rule tests passed." -ForegroundColor Green
+    }
+    else {
+        Write-Host "promtool CLI not found on PATH and Docker daemon is unavailable; Prometheus CLI validation skipped. YAML structural validation remains covered by Go tests." -ForegroundColor Yellow
+    }
 }
 
 Write-Host "`n==> Running go test across all modules..." -ForegroundColor Cyan
