@@ -1,4 +1,4 @@
-# AegisEdge Stage 6.31B.12: Local Development Prometheus Monitoring Environment
+# AegisEdge Stage 6.31B.13: Local Development Prometheus & Grafana Monitoring Environment
 # Reference: ADR-0008, docs/development/telemetry-quarantine.md
 
 services:
@@ -21,6 +21,27 @@ services:
       - ./alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus_data:/prometheus
 
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: aegisedge-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_DISABLE_LOGIN_FORM=false
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+
 volumes:
   prometheus_data:
     name: aegisedge_prometheus_data
+  grafana_data:
+    name: aegisedge_grafana_data
