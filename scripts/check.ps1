@@ -83,6 +83,30 @@ else {
     }
 }
 
+Write-Host "`n==> Validating Grafana dashboard and provisioning syntax..." -ForegroundColor Cyan
+$dashboardPath = "infra/prometheus/grafana/dashboards/telemetry_and_recovery_operations.json"
+if (Test-Path $dashboardPath) {
+    try {
+        $dashJson = Get-Content $dashboardPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($dashJson.title -notlike "*Telemetry*Recovery*") {
+            throw "Unexpected dashboard title: $($dashJson.title)"
+        }
+        if ($dashJson.uid -ne "aegisedge-telemetry-recovery") {
+            throw "Unexpected dashboard UID: $($dashJson.uid)"
+        }
+        if ($dashJson.panels.Count -lt 10) {
+            throw "Dashboard has fewer than 10 panels: $($dashJson.panels.Count)"
+        }
+        Write-Host "Grafana dashboard JSON syntax, title, UID, and $($dashJson.panels.Count) panels validated." -ForegroundColor Green
+    }
+    catch {
+        throw "Grafana dashboard validation failed: $_"
+    }
+}
+else {
+    throw "Dashboard JSON not found at $dashboardPath"
+}
+
 Write-Host "`n==> Running go test across all modules..." -ForegroundColor Cyan
 go test -v ./shared/types/... ./shared/ml/... ./edge/agent/... ./services/control-plane/...
 Write-Host "All tests passed successfully!" -ForegroundColor Green
