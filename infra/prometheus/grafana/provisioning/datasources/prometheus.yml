@@ -1,0 +1,16 @@
+# AegisEdge Grafana Prometheus Datasource Provisioning
+# Reference: ADR-0008, docs/development/telemetry-quarantine.md
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    version: 1
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
