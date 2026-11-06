@@ -1081,3 +1081,153 @@ If Prometheus reports the `aegisedge-control-plane` target as `DOWN`:
 - When `promtool` and Docker are absent, automated CI runs `check.ps1` and `go test ./services/control-plane/...`.
 - `TestAlertRules_PromtoolCheck` cleanly logs `t.Skip` without failing the test suite.
 - `check.ps1` displays a yellow warning notifying operators that CLI checks were skipped, while maintaining 100% test coverage over YAML syntax, PromQL expressions, and behavioral test suite structure via typed Go tests.
+
+
+---
+
+## 13. Grafana Observability Dashboard (Stage 6.31B.13)
+
+### 13.1 Overview & Architecture
+
+AegisEdge provides a production-grade Grafana dashboard designed for edge telemetry and NATS recovery operations:
+- **Dashboard Name**: `AegisEdge — Telemetry & Recovery Operations`
+- **Dashboard UID**: `aegisedge-telemetry-recovery`
+- **Location**: [`infra/prometheus/grafana/dashboards/telemetry_and_recovery_operations.json`](../../infra/prometheus/grafana/dashboards/telemetry_and_recovery_operations.json)
+- **Deployment**: Integrated into [`infra/prometheus/docker-compose.yml`](../../infra/prometheus/docker-compose.yml) using pinned Grafana image `grafana/grafana:11.5.2`.
+- **Provisioning**: 100% automated via declarative file mounts. No manual browser setup required.
+
+```mermaid
+graph LR
+    subgraph Host Network
+        CP["Control Plane<br/>:8080/metrics"]
+    end
+
+    subgraph Docker Compose Bridge Network
+        Prom["Prometheus<br/>:9090"]
+        Graf["Grafana<br/>:3000"]
+        DS["Provisioned Datasource<br/>(http://prometheus:9090)"]
+        Dash["Provisioned Dashboard<br/>(AegisEdge)"]
+
+        Prom -->|"scrapes host.docker.internal:8080"| CP
+        Graf --> DS
+        DS --> Prom
+        Graf --> Dash
+    end
+
+    HostUser["Operator Browser<br/>(http://localhost:3000)"] -->|"127.0.0.1:3000"| Graf
+```
+
+---
+
+### 13.2 Dashboard Structure & Panel Inventory
+
+The dashboard is structured into four functional operational sections:
+
+#### Section A: Monitoring Health
+- **Panel 2 (Stat)**: `Control Plane Scrape Target (up)`
+  - *Query*: `up{job="aegisedge-control-plane"}`
+  - *Purpose*: Immediate visual indicator of control plane availability (`UP` in green, `DOWN` in red, `NO DATA` in gray).
+- **Panel 3 (Stat)**: `Telemetry Ingestion Rate`
+  - *Query*: `sum(rate(aegisedge_control_plane_ingested_batches_total[5m]))`
+  - *Purpose*: Aggregate throughput of incoming edge telemetry batches (`reqps`).
+- **Panel 4 (Stat)**: `Storage Probe Failures`
+  - *Query*: `aegisedge_control_plane_storage_probe_failures_total`
+  - *Purpose*: Monitors `/readyz` probe health to detect SQLite lock contention or disk saturation.
+
+#### Section B: Quarantine Operations
+- **Panel 6 (Gauge)**: `Active Quarantine Records`
+  - *Query*: `aegisedge_quarantine_active_records`
+  - *Thresholds*: Normal $\le 100$ (Green), Warning $> 100$ (Yellow), Critical $> 500$ (Red). Aligns with alert rules `QuarantineActiveBacklogHigh` and `QuarantineActiveBacklogCritical`.
+- **Panel 7 (Timeseries)**: `Active Quarantine Trend (Backlog Progression)`
+  - *Query*: `aegisedge_quarantine_active_records`
+  - *Threshold Lines*: Visual horizontal markers at 100 (Warning) and 500 (Critical). Tracks accumulation rate over time.
+- **Panel 8 (Stat)**: `Quarantine Storage Health (NaN Check)`
+  - *Query*: `(aegisedge_quarantine_active_records != aegisedge_quarantine_active_records) or (0 * aegisedge_quarantine_active_records)`
+  - *Purpose*: Explicitly surfaces IEEE 754 NaN values emitted when SQLite count queries fail or exceed the 2-second timeout (`HEALTHY (0 NaN)` in green, `FAILURE (NaN DETECTED)` in red, `NO DATA` in gray).
+- **Panel 9 (Timeseries)**: `Quarantine Discard vs Replay Resolution Rate`
+  - *Queries*: `sum by (outcome) (rate(aegisedge_quarantine_replays_total[5m]))` and `sum by (outcome) (rate(aegisedge_quarantine_discards_total[5m]))`
+  - *Purpose*: Operator throughput monitoring showing successful vs conflicting replays and discards.
+
+#### Section C: NATS Recovery Operations
+- **Panel 11 (Gauge)**: `NATS Pending Recovery Queue`
+  - *Query*: `aegisedge_nats_pending_recovery_items`
+  - *Thresholds*: Normal $= 0$ (Green), Warning $> 0$ (Yellow), Critical $> 20$ (Red). Aligns with alert rules `NATSPendingRecoveryAccumulationWarning` and `NATSPendingRecoveryAccumulationCritical`.
+- **Panel 12 (Timeseries)**: `NATS Pending Recovery Backlog Trend`
+  - *Query*: `aegisedge_nats_pending_recovery_items`
+  - *Threshold Line*: Marker at 20 (Critical). Identifies recovery worker stalls or database write throttling.
+- **Panel 13 (Stat)**: `Terminated Poison Messages (Total)`
+  - *Query*: `aegisedge_nats_terminated_messages_total`
+  - *Purpose*: Monotonically increasing counter of permanently unprocessable messages cleanly terminated via JetStream Term.
+- **Panel 14 (Timeseries)**: `NATS Message Termination Rate (5m Increase)`
+  - *Query*: `increase(aegisedge_nats_terminated_messages_total[5m])`
+  - *Threshold Line*: Marker at 10 (Warning). Aligns with alert rule `NATSHighMessageTerminationRate`.
+
+#### Section D: Operational Alerts Status
+- **Panel 16 (Table)**: `Active AegisEdge Quarantine & NATS Alerts`
+  - *Query*: `ALERTS{alertname=~"Quarantine.*|NATS.*"}`
+  - *Purpose*: Displays active Prometheus alerts with state (`pending` or `firing`) and severity level, linking directly to triage runbooks.
+
+---
+
+### 13.3 Declarative Provisioning Configuration
+
+1. **Prometheus Datasource Provisioning**:
+   - File: [`infra/prometheus/grafana/provisioning/datasources/prometheus.yml`](../../infra/prometheus/grafana/provisioning/datasources/prometheus.yml)
+   - Targets the Prometheus container via internal Docker DNS: `http://prometheus:9090`.
+   - Set as default datasource with HTTP POST query method and 15s scrape alignment.
+2. **Dashboard Provider Provisioning**:
+   - File: [`infra/prometheus/grafana/provisioning/dashboards/dashboards.yml`](../../infra/prometheus/grafana/provisioning/dashboards/dashboards.yml)
+   - Automatically loads dashboards from `/var/lib/grafana/dashboards`.
+3. **Dashboard Definition**:
+   - File: [`infra/prometheus/grafana/dashboards/telemetry_and_recovery_operations.json`](../../infra/prometheus/grafana/dashboards/telemetry_and_recovery_operations.json)
+   - Mounted read-only into `/var/lib/grafana/dashboards`.
+
+---
+
+### 13.4 Deployment & Local Access
+
+#### 1. Starting the Monitoring Stack
+```powershell
+docker compose -f infra/prometheus/docker-compose.yml up -d
+```
+
+#### 2. Accessing the Dashboard
+- **URL**: `http://localhost:3000` or `http://127.0.0.1:3000`
+- **Authentication**: Anonymous viewer access is enabled by default (`GF_AUTH_ANONYMOUS_ENABLED=true`).
+- **Dashboard Location**: Navigate to **Dashboards** > **AegisEdge** > **AegisEdge — Telemetry & Recovery Operations** (or direct URL `http://localhost:3000/d/aegisedge-telemetry-recovery`).
+
+#### 3. Stopping the Stack
+```powershell
+docker compose -f infra/prometheus/docker-compose.yml down
+```
+
+#### 4. Preserving vs Resetting Data
+- **Preserve Data**: Container state and dashboards survive restarts via named Docker volumes `aegisedge_prometheus_data` and `aegisedge_grafana_data`.
+- **Reset State**: To wipe TSDB history and Grafana preferences:
+  ```powershell
+  docker compose -f infra/prometheus/docker-compose.yml down -v
+  ```
+
+---
+
+### 13.5 Troubleshooting Guide
+
+1. **Disconnected Prometheus Datasource (`HTTP Error Bad Gateway` or `Connection Refused`)**:
+   - Ensure both `prometheus` and `grafana` services are running in the same compose network (`docker compose ps`).
+   - Verify that Grafana targets `http://prometheus:9090` (container internal name), not `localhost:9090`.
+2. **Scrape Target `DOWN` in Panel 2**:
+   - Ensure the AegisEdge control-plane server is running on the host (`go run ./services/control-plane -host=0.0.0.0 -port=8080`).
+   - Confirm firewall rules allow inbound traffic to host port 8080.
+3. **`NO DATA` on Panels**:
+   - Normal on initial startup before edge nodes register or before any quarantine records occur.
+   - For `up` panel: verify scrape job name is `aegisedge-control-plane`.
+
+---
+
+### 13.6 Validation Tiers & Tool Requirements
+
+| Tier | Component | Dependencies | Execution Mechanism | Scope & Guarantees |
+|:---|:---|:---|:---|:---|
+| **Tier 1** | **Go Schema & Metric Validation** | Go compiler only | `go test ./services/control-plane/metrics/...` | Validates JSON syntax, UID uniqueness, panel IDs, and asserts that all panel queries reference valid Go metric constants. |
+| **Tier 2** | **PowerShell Script Validation** | PowerShell | `.\scripts\check.ps1` | Validates JSON parsing and required title/UID/panels in automated scripts. |
+| **Tier 3** | **Live Docker Integration** | Docker daemon running | `docker compose up -d` | Verifies live container health and UI rendering. When Docker is offline, Tier 3 is explicitly marked as **SKIPPED** while Tiers 1 and 2 provide 100% test coverage. |
