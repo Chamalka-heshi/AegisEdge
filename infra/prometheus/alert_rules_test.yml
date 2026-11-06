@@ -1,0 +1,203 @@
+# Prometheus Alert Rule Behavioral Unit Tests for AegisEdge
+# Reference: ADR-0008, docs/development/telemetry-quarantine.md
+# Run via: promtool test rules infra/prometheus/alert_rules_test.yml
+
+rule_files:
+  - alert_rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Test Suite 1: Active Quarantine Backlog High and Critical Thresholds
+  - interval: 1m
+    input_series:
+      - series: 'aegisedge_quarantine_active_records'
+        values: '0 50 150 150 150 150 150 150 600 600 600 600 600 600 200 50'
+    alert_rule_test:
+      # At 2m, value is 150 (> 100), QuarantineActiveBacklogHigh enters pending state.
+      - eval_time: 2m
+        alertname: QuarantineActiveBacklogHigh
+      # At 6m (4m pending), warning has not fired yet (for: 5m).
+      - eval_time: 6m
+        alertname: QuarantineActiveBacklogHigh
+      # At 7m (5m pending), QuarantineActiveBacklogHigh fires with severity: warning.
+      - eval_time: 7m
+        alertname: QuarantineActiveBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Elevated active telemetry quarantine backlog"
+              description: "Active durable quarantine backlog is 150 records (threshold > 100) for more than 5m. Inspect quarantined payloads via GET /api/v1/telemetry/quarantine."
+      # At 7m, QuarantineActiveBacklogCritical is not firing (150 <= 500).
+      - eval_time: 7m
+        alertname: QuarantineActiveBacklogCritical
+      # At 8m, value jumps to 600 (> 500). Critical enters pending state.
+      - eval_time: 8m
+        alertname: QuarantineActiveBacklogCritical
+      # At 12m (4m pending), critical has not fired yet.
+      - eval_time: 12m
+        alertname: QuarantineActiveBacklogCritical
+      # At 13m (5m pending), QuarantineActiveBacklogCritical fires with severity: critical.
+      - eval_time: 13m
+        alertname: QuarantineActiveBacklogCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Critically high active telemetry quarantine backlog"
+              description: "Active durable quarantine backlog has reached 600 records (threshold > 500) for more than 5m. High volume of invalid or corrupted edge telemetry requires immediate operator triage."
+      # At 14m, value drops to 200 (<= 500). Critical resolves immediately.
+      - eval_time: 14m
+        alertname: QuarantineActiveBacklogCritical
+      # At 14m, QuarantineActiveBacklogHigh continues firing (200 > 100).
+      - eval_time: 14m
+        alertname: QuarantineActiveBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Elevated active telemetry quarantine backlog"
+              description: "Active durable quarantine backlog is 200 records (threshold > 100) for more than 5m. Inspect quarantined payloads via GET /api/v1/telemetry/quarantine."
+      # At 15m, value drops to 50 (<= 100). Warning resolves immediately.
+      - eval_time: 15m
+        alertname: QuarantineActiveBacklogHigh
+
+  # Test Suite 2: Storage Failure Detection (NaN Emitted by Count Query)
+  - interval: 1m
+    input_series:
+      - series: 'aegisedge_quarantine_active_records'
+        values: '0 0 NaN NaN NaN NaN 0'
+    alert_rule_test:
+      # At 1m, value is 0 (normal, not firing).
+      - eval_time: 1m
+        alertname: QuarantineActiveCountStorageFailure
+      # At 2m, value is NaN, condition becomes true, pending.
+      - eval_time: 2m
+        alertname: QuarantineActiveCountStorageFailure
+      # At 3m (1m pending), not yet firing (for: 2m).
+      - eval_time: 3m
+        alertname: QuarantineActiveCountStorageFailure
+      # At 4m (2m pending), QuarantineActiveCountStorageFailure fires.
+      - eval_time: 4m
+        alertname: QuarantineActiveCountStorageFailure
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Quarantine active records query failing (NaN emitted)"
+              description: "The control plane quarantine count query has returned NaN for more than 2m. SQLite storage query timed out (>2s) or encountered database errors."
+      # At 6m, value returns to 0 (normal), alert resolves.
+      - eval_time: 6m
+        alertname: QuarantineActiveCountStorageFailure
+
+  # Test Suite 3: Missing Metric Detection (absent)
+  - interval: 1m
+    input_series:
+      - series: 'aegisedge_quarantine_active_records'
+        values: '10 10 _ _ _ _ _ _ 10'
+    alert_rule_test:
+      # At 1m, metric is present (not firing).
+      - eval_time: 1m
+        alertname: QuarantineActiveMetricMissing
+      # At 2m, metric becomes absent, enters pending.
+      - eval_time: 2m
+        alertname: QuarantineActiveMetricMissing
+      # At 6m (4m absent), not yet firing (for: 5m).
+      - eval_time: 6m
+        alertname: QuarantineActiveMetricMissing
+      # At 7m (5m absent), QuarantineActiveMetricMissing fires.
+      - eval_time: 7m
+        alertname: QuarantineActiveMetricMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Active quarantine records metric is absent"
+              description: "The metric aegisedge_quarantine_active_records is absent from scrape targets for more than 5m. Verify control plane process health and Prometheus scrape configuration."
+      # At 8m, metric returns, alert resolves.
+      - eval_time: 8m
+        alertname: QuarantineActiveMetricMissing
+
+  # Test Suite 4: NATS Pending Recovery Queue Accumulation (Warning & Critical)
+  - interval: 1m
+    input_series:
+      - series: 'aegisedge_nats_pending_recovery_items'
+        values: '0 5 5 5 5 5 5 30 30 30 30 30 30 10 0'
+    alert_rule_test:
+      # At 1m, value is 5 (> 0), warning enters pending state.
+      - eval_time: 1m
+        alertname: NATSPendingRecoveryAccumulationWarning
+      # At 5m (4m pending), warning has not fired yet.
+      - eval_time: 5m
+        alertname: NATSPendingRecoveryAccumulationWarning
+      # At 6m (5m pending), NATSPendingRecoveryAccumulationWarning fires.
+      - eval_time: 6m
+        alertname: NATSPendingRecoveryAccumulationWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "NATS consumer has persistent pending recovery items"
+              description: "NATS JetStream consumer has 5 exhausted messages in process-local memory awaiting quarantine persistence for more than 5m."
+      # At 6m, Critical is not firing (5 <= 20).
+      - eval_time: 6m
+        alertname: NATSPendingRecoveryAccumulationCritical
+      # At 7m, value jumps to 30 (> 20), critical enters pending state.
+      - eval_time: 7m
+        alertname: NATSPendingRecoveryAccumulationCritical
+      # At 11m (4m pending), critical has not fired yet.
+      - eval_time: 11m
+        alertname: NATSPendingRecoveryAccumulationCritical
+      # At 12m (5m pending), NATSPendingRecoveryAccumulationCritical fires.
+      - eval_time: 12m
+        alertname: NATSPendingRecoveryAccumulationCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "NATS consumer pending recovery accumulation is critically high"
+              description: "NATS consumer in-memory recovery queue has 30 items (threshold > 20) for more than 5m. Quarantine persistence may be failing or severely throttled."
+      # At 13m, value drops to 10 (<= 20). Critical resolves immediately.
+      - eval_time: 13m
+        alertname: NATSPendingRecoveryAccumulationCritical
+      # At 13m, Warning continues firing (10 > 0).
+      - eval_time: 13m
+        alertname: NATSPendingRecoveryAccumulationWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "NATS consumer has persistent pending recovery items"
+              description: "NATS JetStream consumer has 10 exhausted messages in process-local memory awaiting quarantine persistence for more than 5m."
+      # At 14m, value drops to 0. Warning resolves.
+      - eval_time: 14m
+        alertname: NATSPendingRecoveryAccumulationWarning
+
+  # Test Suite 5: NATS Terminated Messages High Rate (increase expression)
+  - interval: 1m
+    input_series:
+      - series: 'aegisedge_nats_terminated_messages_total'
+        values: '0 0 0 0 0 0 3 6 10 15 20 25 25 25 25 25 25 25'
+    alert_rule_test:
+      # At 5m, counter is 0, rate is 0.
+      - eval_time: 5m
+        alertname: NATSHighMessageTerminationRate
+      # At 9m, increase over [4m..9m] is 15 (> 10), alert enters pending state.
+      - eval_time: 9m
+        alertname: NATSHighMessageTerminationRate
+      # At 10m (1m pending), alert has not fired yet (for: 2m).
+      - eval_time: 10m
+        alertname: NATSHighMessageTerminationRate
+      # At 11m (2m pending), increase over [6m..11m] is 22 (> 10). NATSHighMessageTerminationRate fires.
+      - eval_time: 11m
+        alertname: NATSHighMessageTerminationRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "High rate of permanent NATS message terminations"
+              description: "NATS consumer terminated 22 poisoned messages over 5m (rate > 10 per 5m). Investigate edge producer telemetry validity and quarantine error reasons."
+      # At 16m, counter has been steady at 25 for 5m. increase over [11m..16m] is 0 (<= 10). Alert resolves.
+      - eval_time: 16m
+        alertname: NATSHighMessageTerminationRate

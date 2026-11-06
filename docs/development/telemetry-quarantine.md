@@ -909,3 +909,175 @@ go test ./services/control-plane/storage/... -run '^$' -bench 'BenchmarkCountAct
 
 - **Hardware Dependency**: Absolute timings will vary depending on disk I/O performance (NVMe vs SATA/HDD), CPU single-thread clock speed, and virtualization layers.
 - **Benchmarking Guidelines**: Benchmark numbers must never be used as brittle unit-test assertions (`t.Fatalf` on execution time); they serve as empirical operational capacity bounds for cluster sizing and alerting threshold calibration.
+
+
+---
+
+## 12. End-to-End Prometheus Monitoring & Alert Validation (Stage 6.31B.12)
+
+### 12.1 Overview & Architecture
+
+AegisEdge provides a complete, tiered observability stack for edge quarantine and NATS recovery operations:
+1. **Instrumented Control Plane**: Exposes Prometheus-formatted operational metrics at `GET /metrics` on port `8080`.
+2. **Prometheus Configuration**: Configured for both host-native (`infra/prometheus/prometheus.yml`) and containerized (`infra/prometheus/prometheus.docker.yml`, `infra/prometheus/docker-compose.yml`) deployments.
+3. **Alerting Rules**: 7 dedicated alerting rules (`infra/prometheus/alert_rules.yml`) governing backlog growth, storage failures (NaN), missing metrics, NATS queue accumulation, and high message termination rates.
+4. **Behavioral Unit Testing**: Prometheus rule test suite (`infra/prometheus/alert_rules_test.yml`) executed via `promtool test rules`.
+5. **Typed Structural Validation**: Automated Go test suite (`services/control-plane/metrics/alert_rules_test.go`) validating schemas without external dependencies.
+
+---
+
+### 12.2 Deployment Models: Host-Native vs Containerized
+
+#### 1. Host-Native Prometheus Execution
+When running Prometheus as a native binary directly on the developer or production host:
+- **Config File**: [`infra/prometheus/prometheus.yml`](../../infra/prometheus/prometheus.yml)
+- **Scrape Target**: `127.0.0.1:8080` (reaches the control plane running on the same host).
+- **Run Command**:
+  ```powershell
+  prometheus --config.file=infra/prometheus/prometheus.yml --storage.tsdb.path=data/prometheus
+  ```
+
+#### 2. Containerized Prometheus Execution (Docker Compose)
+When running Prometheus inside a container (Docker Desktop on Windows/macOS or Docker on Linux):
+- **Compose File**: [`infra/prometheus/docker-compose.yml`](../../infra/prometheus/docker-compose.yml)
+- **Config File**: [`infra/prometheus/prometheus.docker.yml`](../../infra/prometheus/prometheus.docker.yml)
+- **Scrape Target**: `host.docker.internal:8080`
+- **Network Topology**:
+  - Inside a Docker container, `127.0.0.1` refers to the container's isolated loopback namespace.
+  - To reach the host control-plane server, Docker Desktop resolves `host.docker.internal`.
+  - On Linux hosts, `docker-compose.yml` configures `extra_hosts: ["host.docker.internal:host-gateway"]` to route to the host bridge.
+- **Port Mapping**: The Prometheus UI is bound to host port `127.0.0.1:9090` (`http://localhost:9090`).
+- **Data Persistence**: Backed by a dedicated Docker volume `aegisedge_prometheus_data`.
+- **Run Commands**:
+  ```powershell
+  docker compose -f infra/prometheus/docker-compose.yml up -d
+  docker compose -f infra/prometheus/docker-compose.yml down
+  ```
+
+---
+
+### 12.3 Validation Tiers & Tool Availability
+
+Validation is organized into three distinct tiers to ensure developer workflows remain productive regardless of local environment tooling:
+
+| Tier | Component | Dependencies | Execution Mechanism | Scope & Guarantees |
+|:---|:---|:---|:---|:---|
+| **Tier 1** | **Go Schema Tests** | Go compiler only | `go test ./services/control-plane/metrics/...` | Parses YAML files via `gopkg.in/yaml.v3`, validates PromQL expressions, checks alert names, durations, severities, and verifies behavioral test coverage for all 7 alerts. |
+| **Tier 2** | **Promtool CLI Validation** | `promtool` or Docker | `promtool check ...` and `promtool test rules ...` | Performs official Prometheus syntactic and behavioral unit testing. If tools are missing, explicitly reports **SKIPPED** (never false PASS). |
+| **Tier 3** | **Live Scrape Verification** | Control Plane + Prometheus | PowerShell script / curl | Verifies live HTTP 200 response on `GET /metrics`, validates target status `UP` in Prometheus, and queries time-series. |
+
+---
+
+### 12.4 Alert-Rule Behavioral Testing (`alert_rules_test.yml`)
+
+The rule test file [`infra/prometheus/alert_rules_test.yml`](../../infra/prometheus/alert_rules_test.yml) executes discrete simulation scenarios using `promtool test rules`:
+
+1. **`QuarantineActiveBacklogHigh` (Warning)**:
+   - Evaluates active backlog `> 100`.
+   - Simulates backlog rising to 150. Asserts pending state at $t=2\text{m}$, un-fired at $t=6\text{m}$, firing with severity `warning` at $t=7\text{m}$ (`for: 5m`), and resolving when backlog drops to 50.
+2. **`QuarantineActiveBacklogCritical` (Critical)**:
+   - Evaluates active backlog `> 500`.
+   - Demonstrates independent threshold evaluation: at backlog 150, Warning fires while Critical remains inactive. At backlog 600, Critical fires after 5m. When backlog returns to 200, Critical resolves immediately while Warning remains firing.
+3. **`QuarantineActiveCountStorageFailure` (Critical)**:
+   - Evaluates IEEE 754 NaN detection idiom: `aegisedge_quarantine_active_records != aegisedge_quarantine_active_records`.
+   - Simulates SQLite query timeouts emitting `NaN`. Asserts pending at $t=2\text{m}$, firing after $2\text{m}$ (`for: 2m`), and resolving when valid numeric telemetry resumes.
+4. **`QuarantineActiveMetricMissing` (Critical)**:
+   - Evaluates `absent(aegisedge_quarantine_active_records)`.
+   - Simulates scrape failure/metric absence using missing samples (`_`). Fires after 5 minutes of total absence and resolves upon metric reappearance.
+5. **`NATSPendingRecoveryAccumulationWarning` (Warning)**:
+   - Evaluates in-memory recovery items `> 0`.
+   - Simulates item accumulation (value 5). Fires after 5 minutes and resolves when consumer flushes queue to 0.
+6. **`NATSPendingRecoveryAccumulationCritical` (Critical)**:
+   - Evaluates in-memory recovery items `> 20`.
+   - Simulates queue backlog spiking to 30. Fires after 5 minutes and resolves independently when backlog decreases below 20.
+7. **`NATSHighMessageTerminationRate` (Warning)**:
+   - Evaluates `increase(aegisedge_nats_terminated_messages_total[5m]) > 10`.
+   - Simulates rapid poison message terminations (counter delta 22 over 5 minutes). Fires after 2 minutes of sustained high rate (`for: 2m`) and resolves when termination rate flattens.
+
+---
+
+### 12.5 Live Service Verification Procedure
+
+To manually verify the end-to-end monitoring pipeline in PowerShell:
+
+#### Step 1: Start the Control Plane Server
+```powershell
+# In terminal 1 (starts control plane with default port 8080 and local DB)
+go run ./services/control-plane -port=8080 -db-path=data/control-plane.db
+```
+
+#### Step 2: Confirm Endpoint Responds & Exposes AegisEdge Metrics
+```powershell
+# In terminal 2
+$resp = Invoke-WebRequest -Uri "http://127.0.0.1:8080/metrics" -UseBasicParsing
+Write-Host "Status Code: $($resp.StatusCode)"
+
+# Verify representative quarantine and NATS metrics
+$resp.Content -split "`n" | Select-String -Pattern "aegisedge_quarantine_active_records|aegisedge_nats_pending_recovery_items|aegisedge_nats_terminated_messages_total"
+```
+*Expected Output:*
+```text
+Status Code: 200
+# TYPE aegisedge_quarantine_active_records gauge
+aegisedge_quarantine_active_records 0
+# TYPE aegisedge_nats_pending_recovery_items gauge
+aegisedge_nats_pending_recovery_items 0
+# TYPE aegisedge_nats_terminated_messages_total counter
+aegisedge_nats_terminated_messages_total 0
+```
+
+#### Step 3: Launch Prometheus (Docker Compose)
+```powershell
+docker compose -f infra/prometheus/docker-compose.yml up -d
+```
+
+#### Step 4: Confirm Scrape Target is UP
+Query the Prometheus API endpoint:
+```powershell
+$targets = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/targets"
+$targets.data.activeTargets | Select-Object discoveredLabels, health, lastScrape
+```
+*Expected Output:* `health: "up"` for job `"aegisedge-control-plane"`.
+
+#### Step 5: Query Representative Metrics Through Prometheus
+```powershell
+$result = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/query?query=aegisedge_quarantine_active_records"
+$result.data.result
+```
+
+#### Step 6: Inspect Active Alerts
+```powershell
+# Query Prometheus alerts API
+$alerts = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/alerts"
+$alerts.data.alerts
+```
+Alternatively, open `http://localhost:9090/alerts` in a browser to inspect the state (`Inactive`, `Pending`, or `Firing`) of all 7 AegisEdge alert rules.
+
+---
+
+### 12.6 Troubleshooting DOWN Scrape Targets
+
+If Prometheus reports the `aegisedge-control-plane` target as `DOWN`:
+
+1. **Host Binding vs Loopback**:
+   - When running Prometheus in Docker, the control plane must be accessible from outside `127.0.0.1`.
+   - On Windows, ensure the control plane is listening on all interfaces if necessary:
+     ```powershell
+     go run ./services/control-plane -host=0.0.0.0 -port=8080
+     ```
+2. **Docker Host Gateway**:
+   - Verify that `host.docker.internal` resolves from inside the container:
+     ```powershell
+     docker exec -it aegisedge-prometheus wget -q -O - http://host.docker.internal:8080/metrics
+     ```
+3. **Firewall & Port Conflicts**:
+   - Check if Windows Defender Firewall blocks inbound connections on port `8080`.
+   - Ensure another process is not holding port `8080` (`Get-NetTCPConnection -LocalPort 8080`).
+
+---
+
+### 12.7 Graceful Degradation & Skipped Validations
+
+- When `promtool` and Docker are absent, automated CI runs `check.ps1` and `go test ./services/control-plane/...`.
+- `TestAlertRules_PromtoolCheck` cleanly logs `t.Skip` without failing the test suite.
+- `check.ps1` displays a yellow warning notifying operators that CLI checks were skipped, while maintaining 100% test coverage over YAML syntax, PromQL expressions, and behavioral test suite structure via typed Go tests.
