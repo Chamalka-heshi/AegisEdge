@@ -48,6 +48,27 @@ type PrometheusConfigFile struct {
 	} `yaml:"scrape_configs"`
 }
 
+// PrometheusRuleTestFile represents the schema of alert_rules_test.yml for promtool.
+type PrometheusRuleTestFile struct {
+	RuleFiles          []string `yaml:"rule_files"`
+	EvaluationInterval string   `yaml:"evaluation_interval"`
+	Tests              []struct {
+		Interval    string `yaml:"interval"`
+		InputSeries []struct {
+			Series string `yaml:"series"`
+			Values string `yaml:"values"`
+		} `yaml:"input_series"`
+		AlertRuleTest []struct {
+			EvalTime  string `yaml:"eval_time"`
+			Alertname string `yaml:"alertname"`
+			ExpAlerts []struct {
+				ExpLabels      map[string]string `yaml:"exp_labels"`
+				ExpAnnotations map[string]string `yaml:"exp_annotations"`
+			} `yaml:"exp_alerts"`
+		} `yaml:"alert_rule_test"`
+	} `yaml:"tests"`
+}
+
 // TestAlertRules_YAMLUnmarshalAndSchema performs YAML parsing and typed structural validation
 // for alert_rules.yml, asserting all alert definitions and exact PromQL expressions.
 func TestAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
@@ -261,8 +282,168 @@ func TestAlertRules_NaNDetectionLogic(t *testing.T) {
 	}
 }
 
-// TestAlertRules_PromtoolCheck runs 'promtool check rules' and 'promtool check config'
-// if the promtool binary is available on PATH. If missing, it explicitly marks the test skipped.
+// TestAlertRulesTestFile_YAMLUnmarshalAndSchema performs typed schema validation for alert_rules_test.yml,
+// verifying that all 7 alerts have behavioral test scenarios covering firing and resolution.
+func TestAlertRulesTestFile_YAMLUnmarshalAndSchema(t *testing.T) {
+	testPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alert_rules_test.yml")
+	data, err := os.ReadFile(testPath)
+	if err != nil {
+		t.Fatalf("failed to read alert rules test file at %s: %v", testPath, err)
+	}
+
+	var tf PrometheusRuleTestFile
+	if err := yaml.Unmarshal(data, &tf); err != nil {
+		t.Fatalf("YAML unmarshal failed for %s: %v", testPath, err)
+	}
+
+	foundRuleFile := false
+	for _, rf := range tf.RuleFiles {
+		if rf == "alert_rules.yml" {
+			foundRuleFile = true
+			break
+		}
+	}
+	if !foundRuleFile {
+		t.Errorf("expected 'alert_rules.yml' in rule_files of %s, got %v", testPath, tf.RuleFiles)
+	}
+
+	evalDur, err := time.ParseDuration(tf.EvaluationInterval)
+	if err != nil || evalDur <= 0 {
+		t.Errorf("invalid evaluation_interval %q in %s: %v", tf.EvaluationInterval, testPath, err)
+	}
+
+	expectedAlerts := map[string]bool{
+		"QuarantineActiveBacklogHigh":             false,
+		"QuarantineActiveBacklogCritical":         false,
+		"QuarantineActiveCountStorageFailure":     false,
+		"QuarantineActiveMetricMissing":           false,
+		"NATSPendingRecoveryAccumulationWarning":  false,
+		"NATSPendingRecoveryAccumulationCritical": false,
+		"NATSHighMessageTerminationRate":          false,
+	}
+
+	if len(tf.Tests) == 0 {
+		t.Fatalf("expected non-empty test suites in %s", testPath)
+	}
+
+	for i, testCase := range tf.Tests {
+		intervalDur, err := time.ParseDuration(testCase.Interval)
+		if err != nil || intervalDur <= 0 {
+			t.Errorf("test[%d] has invalid interval %q: %v", i, testCase.Interval, err)
+		}
+		if len(testCase.InputSeries) == 0 {
+			t.Errorf("test[%d] has no input_series", i)
+		}
+		for sIdx, is := range testCase.InputSeries {
+			if strings.TrimSpace(is.Series) == "" {
+				t.Errorf("test[%d].input_series[%d] has empty series name", i, sIdx)
+			}
+			if strings.TrimSpace(is.Values) == "" {
+				t.Errorf("test[%d].input_series[%d] has empty values", i, sIdx)
+			}
+		}
+		for aIdx, art := range testCase.AlertRuleTest {
+			if strings.TrimSpace(art.EvalTime) == "" {
+				t.Errorf("test[%d].alert_rule_test[%d] has empty eval_time", i, aIdx)
+			} else {
+				if _, err := time.ParseDuration(art.EvalTime); err != nil {
+					t.Errorf("test[%d].alert_rule_test[%d] has invalid eval_time %q: %v", i, aIdx, art.EvalTime, err)
+				}
+			}
+			if strings.TrimSpace(art.Alertname) == "" {
+				t.Errorf("test[%d].alert_rule_test[%d] has empty alertname", i, aIdx)
+			} else {
+				if _, ok := expectedAlerts[art.Alertname]; ok {
+					expectedAlerts[art.Alertname] = true
+				} else {
+					t.Errorf("test[%d].alert_rule_test[%d] tests unexpected alertname %q", i, aIdx, art.Alertname)
+				}
+			}
+			for expIdx, exp := range art.ExpAlerts {
+				sev := exp.ExpLabels["severity"]
+				if sev != "warning" && sev != "critical" {
+					t.Errorf("test[%d].alert_rule_test[%d].exp_alerts[%d] has invalid severity %q", i, aIdx, expIdx, sev)
+				}
+				if strings.TrimSpace(exp.ExpAnnotations["summary"]) == "" {
+					t.Errorf("test[%d].alert_rule_test[%d].exp_alerts[%d] has empty summary", i, aIdx, expIdx)
+				}
+				if strings.TrimSpace(exp.ExpAnnotations["description"]) == "" {
+					t.Errorf("test[%d].alert_rule_test[%d].exp_alerts[%d] has empty description", i, aIdx, expIdx)
+				}
+			}
+		}
+	}
+
+	for alertName, tested := range expectedAlerts {
+		if !tested {
+			t.Errorf("expected alert %q is not covered by any behavioral test scenario in %s", alertName, testPath)
+		}
+	}
+}
+
+// TestPrometheusDockerConfig_YAMLUnmarshalAndSchema performs typed schema validation for prometheus.docker.yml.
+func TestPrometheusDockerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
+	configPath := filepath.Join("..", "..", "..", "infra", "prometheus", "prometheus.docker.yml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("failed to read prometheus docker config file at %s: %v", configPath, err)
+	}
+
+	var cfg PrometheusConfigFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("YAML unmarshal failed for %s: %v", configPath, err)
+	}
+
+	scrapeDur, err := time.ParseDuration(cfg.Global.ScrapeInterval)
+	if err != nil || scrapeDur <= 0 {
+		t.Errorf("invalid scrape_interval %q: %v", cfg.Global.ScrapeInterval, err)
+	}
+
+	evalDur, err := time.ParseDuration(cfg.Global.EvaluationInterval)
+	if err != nil || evalDur <= 0 {
+		t.Errorf("invalid evaluation_interval %q: %v", cfg.Global.EvaluationInterval, err)
+	}
+
+	foundRuleFile := false
+	for _, rf := range cfg.RuleFiles {
+		if rf == "alert_rules.yml" {
+			foundRuleFile = true
+			break
+		}
+	}
+	if !foundRuleFile {
+		t.Errorf("expected 'alert_rules.yml' in rule_files, got %v", cfg.RuleFiles)
+	}
+
+	foundJob := false
+	for _, sc := range cfg.ScrapeConfigs {
+		if sc.JobName == "aegisedge-control-plane" {
+			foundJob = true
+			if sc.MetricsPath != "/metrics" {
+				t.Errorf("expected metrics_path '/metrics', got %q", sc.MetricsPath)
+			}
+			foundTarget := false
+			for _, stc := range sc.StaticConfigs {
+				for _, tgt := range stc.Targets {
+					if tgt == "host.docker.internal:8080" {
+						foundTarget = true
+						break
+					}
+				}
+			}
+			if !foundTarget {
+				t.Errorf("expected target 'host.docker.internal:8080' in scrape config")
+			}
+		}
+	}
+	if !foundJob {
+		t.Errorf("expected scrape job 'aegisedge-control-plane' in scrape_configs")
+	}
+}
+
+// TestAlertRules_PromtoolCheck runs 'promtool check rules', 'promtool check config',
+// and 'promtool test rules' if the promtool binary is available on PATH.
+// If missing, it explicitly marks the test skipped.
 func TestAlertRules_PromtoolCheck(t *testing.T) {
 	promtoolPath, err := exec.LookPath("promtool")
 	if err != nil {
@@ -285,4 +466,20 @@ func TestAlertRules_PromtoolCheck(t *testing.T) {
 		t.Fatalf("promtool check config failed: %v\nOutput: %s", err, string(outCfg))
 	}
 	t.Logf("promtool check config succeeded:\n%s", string(outCfg))
+
+	dockerCfgPath := filepath.Join("..", "..", "..", "infra", "prometheus", "prometheus.docker.yml")
+	cmdDockerCfg := exec.Command(promtoolPath, "check", "config", dockerCfgPath)
+	outDockerCfg, err := cmdDockerCfg.CombinedOutput()
+	if err != nil {
+		t.Fatalf("promtool check config (docker) failed: %v\nOutput: %s", err, string(outDockerCfg))
+	}
+	t.Logf("promtool check config (docker) succeeded:\n%s", string(outDockerCfg))
+
+	testRulesPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alert_rules_test.yml")
+	cmdTestRules := exec.Command(promtoolPath, "test", "rules", testRulesPath)
+	outTestRules, err := cmdTestRules.CombinedOutput()
+	if err != nil {
+		t.Fatalf("promtool test rules failed: %v\nOutput: %s", err, string(outTestRules))
+	}
+	t.Logf("promtool test rules succeeded:\n%s", string(outTestRules))
 }

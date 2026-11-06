@@ -1,0 +1,26 @@
+# AegisEdge Stage 6.31B.12: Local Development Prometheus Monitoring Environment
+# Reference: ADR-0008, docs/development/telemetry-quarantine.md
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: aegisedge-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.docker.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+
+volumes:
+  prometheus_data:
+    name: aegisedge_prometheus_data
