@@ -95,12 +95,12 @@ tests:
   - interval: 1m
     input_series:
       - series: 'aegisedge_quarantine_active_records'
-        values: '10 10 _ _ _ _ _ _ 10'
+        values: '10 10 stale _ _ _ _ _ 10'
     alert_rule_test:
       # At 1m, metric is present (not firing).
       - eval_time: 1m
         alertname: QuarantineActiveMetricMissing
-      # At 2m, metric becomes absent, enters pending.
+      # At 2m, metric becomes stale, enters pending.
       - eval_time: 2m
         alertname: QuarantineActiveMetricMissing
       # At 6m (4m absent), not yet firing (for: 5m).
@@ -189,7 +189,7 @@ tests:
       # At 10m (1m pending), alert has not fired yet (for: 2m).
       - eval_time: 10m
         alertname: NATSHighMessageTerminationRate
-      # At 11m (2m pending), increase over [6m..11m] is 22 (> 10). NATSHighMessageTerminationRate fires.
+      # At 11m (2m pending), increase over [6m..11m] evaluates to 24 (> 10) with Prometheus extrapolation. NATSHighMessageTerminationRate fires.
       - eval_time: 11m
         alertname: NATSHighMessageTerminationRate
         exp_alerts:
@@ -197,7 +197,7 @@ tests:
               severity: warning
             exp_annotations:
               summary: "High rate of permanent NATS message terminations"
-              description: "NATS consumer terminated 22 poisoned messages over 5m (rate > 10 per 5m). Investigate edge producer telemetry validity and quarantine error reasons."
+              description: "NATS consumer terminated 24 poisoned messages over 5m (rate > 10 per 5m). Investigate edge producer telemetry validity and quarantine error reasons."
       # At 16m, counter has been steady at 25 for 5m. increase over [11m..16m] is 0 (<= 10). Alert resolves.
       - eval_time: 16m
         alertname: NATSHighMessageTerminationRate
