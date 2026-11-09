@@ -41,7 +41,14 @@ if (Get-Command promtool -ErrorAction SilentlyContinue) {
         throw "promtool test rules failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "promtool verification and rule tests passed." -ForegroundColor Green
+    if (Get-Command amtool -ErrorAction SilentlyContinue) {
+        amtool check-config infra/prometheus/alertmanager.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "amtool check-config failed with exit code $LASTEXITCODE"
+        }
+    }
+
+    Write-Host "promtool and amtool verification passed." -ForegroundColor Green
 }
 else {
     $dockerRunning = $false
@@ -71,12 +78,32 @@ else {
             throw "docker promtool check config failed with exit code $LASTEXITCODE"
         }
 
+        & docker run --rm --entrypoint promtool -v "${PWD}/infra/prometheus:/etc/prometheus" prom/prometheus:v3.2.1 check config /etc/prometheus/prometheus.docker.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker promtool check config (docker) failed with exit code $LASTEXITCODE"
+        }
+
+        & docker run --rm --entrypoint promtool -v "${PWD}/infra/prometheus:/etc/prometheus" prom/prometheus:v3.2.1 check config /etc/prometheus/prometheus.test.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker promtool check config (test) failed with exit code $LASTEXITCODE"
+        }
+
+        & docker run --rm --entrypoint promtool -v "${PWD}/infra/prometheus:/etc/prometheus" prom/prometheus:v3.2.1 check rules /etc/prometheus/alert_rules_lifecycle_test.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker promtool check rules (lifecycle test) failed with exit code $LASTEXITCODE"
+        }
+
         & docker run --rm --entrypoint promtool -v "${PWD}/infra/prometheus:/etc/prometheus" prom/prometheus:v3.2.1 test rules /etc/prometheus/alert_rules_test.yml
         if ($LASTEXITCODE -ne 0) {
             throw "docker promtool test rules failed with exit code $LASTEXITCODE"
         }
 
-        Write-Host "Dockerized promtool verification and rule tests passed." -ForegroundColor Green
+        & docker run --rm -v "${PWD}/infra/prometheus:/etc/alertmanager" --entrypoint amtool prom/alertmanager:v0.28.1 check-config /etc/alertmanager/alertmanager.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker amtool check-config failed with exit code $LASTEXITCODE"
+        }
+
+        Write-Host "Dockerized promtool and amtool verification passed." -ForegroundColor Green
     }
     else {
         Write-Host "promtool CLI not found on PATH and Docker daemon is unavailable; Prometheus CLI validation skipped. YAML structural validation remains covered by Go tests." -ForegroundColor Yellow
