@@ -1396,3 +1396,193 @@ The Panel 8 expression `(x != x) or (0 * x)` was evaluated across three distinct
    - All 7 production alert rules in `alert_rules.yml` are 100% syntactically and semantically validated by both promtool and Go schema tests.
 2. **Host-to-Container Loopback Forwarding**:
    - On Windows WSL2, binding the control plane to `127.0.0.1:8080` allows `host.docker.internal:8080` to reach the control plane transparently via the WSL2 localhost forwarding proxy while keeping development mode security invariants intact.
+
+---
+
+## 15. Alertmanager Integration & End-to-End Alert Delivery (Stage 6.31B.15)
+
+### 15.1 Architecture & Notification Pipeline Topology
+
+In Stage 6.31B.15, Alertmanager (`prom/alertmanager:v0.28.1`) was integrated into the AegisEdge Docker Compose deployment to complete the alerting pipeline. Prometheus forwards firing and resolved alerts to Alertmanager via its `/api/v2/alerts` interface, which groups, deduplicates, and routes them to local webhook receivers.
+
+```mermaid
+graph TD
+    subgraph Docker Network: prometheus_default
+        Prom["Prometheus v3.2.1<br/>127.0.0.1:9090"]
+        AM["Alertmanager v0.28.1<br/>127.0.0.1:9093<br/>(aegisedge-alertmanager)"]
+        Recv["Webhook Receiver (Temporary)<br/>127.0.0.1:9095<br/>(webhook-receiver)"]
+
+        Prom -->|"evaluates rules (15s / 2s test)"| Prom
+        Prom -->|"POST /api/v2/alerts (firing/resolved)"| AM
+        AM -->|"route: warning<br/>POST /alerts/warning"| Recv
+        AM -->|"route: critical<br/>POST /alerts/critical"| Recv
+        AM -->|"fallback: default<br/>POST /alerts/default"| Recv
+        Prom -->|"scrapes test metric"| Recv
+    end
+
+    subgraph Host Network (Windows 11)
+        Test["Integration Test Runner<br/>.\\scripts\\test-alertmanager-lifecycle.ps1"]
+        Test -->|"GET /-/ready"| Prom
+        Test -->|"GET /-/ready"| AM
+        Test -->|"POST /api/trigger?val=1,2,0"| Recv
+        Test -->|"GET /api/events"| Recv
+    end
+```
+
+### 15.2 Alertmanager Configuration & Severity-Based Routing
+
+The Alertmanager configuration [`infra/prometheus/alertmanager.yml`](../../infra/prometheus/alertmanager.yml) establishes deterministic, severity-based notification routing:
+
+1. **Global Configuration**:
+   - `resolve_timeout: 5m`: Automatically marks stale alerts resolved after 5 minutes if Prometheus stops renewing them.
+2. **Root Route & Grouping Invariants**:
+   - `receiver: "default-receiver"`: Catch-all fallback receiver.
+   - `group_by: ['alertname', 'severity', 'job']`: Batches alerts sharing the same alert name, severity, and originating job into unified notification payloads.
+   - `group_wait: 10s`: Initial buffer delay before dispatching the first notification in a group, allowing related alerts in a cluster to group together.
+   - `group_interval: 30s`: Minimum interval before sending an updated notification for an active alert group.
+   - `repeat_interval: 4h`: Default interval for repeating identical firing alert notifications.
+3. **Sub-Routes**:
+   - `severity = "critical"` $\to$ `critical-receiver` with `repeat_interval: 1h`.
+   - `severity = "warning"` $\to$ `warning-receiver` with `repeat_interval: 4h`.
+4. **Receivers**:
+   - All three receivers (`default-receiver`, `warning-receiver`, `critical-receiver`) configure HTTP webhook targets with `send_resolved: true` to ensure operators receive both alert activations and clearance notifications.
+
+### 15.3 Deployment and Shutdown Commands
+
+#### 1. Starting the Complete Monitoring & Alerting Stack
+```powershell
+docker compose -f infra/prometheus/docker-compose.yml up -d
+```
+Verified services:
+- `aegisedge-prometheus` (`prom/prometheus:v3.2.1`): `127.0.0.1:9090`
+- `aegisedge-alertmanager` (`prom/alertmanager:v0.28.1`): `127.0.0.1:9093`
+- `aegisedge-grafana` (`grafana/grafana:11.5.2`): `127.0.0.1:3000`
+
+#### 2. Validating Stack Health
+```powershell
+# Prometheus Health & Alertmanager Discovery
+Invoke-RestMethod -Uri "http://127.0.0.1:9090/-/ready"
+(Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/alertmanagers").data.activeAlertmanagers
+
+# Alertmanager Health
+Invoke-RestMethod -Uri "http://127.0.0.1:9093/-/ready"
+```
+
+#### 3. Stopping the Stack
+```powershell
+docker compose -f infra/prometheus/docker-compose.yml down
+```
+
+### 15.4 Dedicated Integration Test Configuration & Compose Override (F-01 / F-02 Resolution)
+
+To ensure zero test-related rules, test scrape targets, or temporary volumes pollute production monitoring:
+
+1. **Strict Configuration Isolation**:
+   - **Production Configurations** ([`infra/prometheus/prometheus.docker.yml`](../../infra/prometheus/prometheus.docker.yml) and [`infra/prometheus/prometheus.yml`](../../infra/prometheus/prometheus.yml)) define ONLY the 7 production alert definitions from `alert_rules.yml` and the production scrape target `aegisedge-control-plane`.
+   - **Production Compose** ([`infra/prometheus/docker-compose.yml`](../../infra/prometheus/docker-compose.yml)) mounts only `prometheus.docker.yml`, `alert_rules.yml`, and `alertmanager.yml`.
+   - **Dedicated Test Configuration** ([`infra/prometheus/prometheus.test.yml`](../../infra/prometheus/prometheus.test.yml)) runs with accelerated 2s scrape/evaluation intervals, loads both `alert_rules.yml` and `alert_rules_lifecycle_test.yml`, and configures the `aegisedge-lifecycle-test` scrape job targeting `webhook-receiver:9095`.
+   - **Dedicated Test Compose Override** ([`infra/prometheus/docker-compose.test.yml`](../../infra/prometheus/docker-compose.test.yml)) mounts `prometheus.test.yml` as `/etc/prometheus/prometheus.yml` and `alert_rules_lifecycle_test.yml` into the Prometheus container during test execution.
+
+2. **Test Lifecycle Architecture**:
+   During integration runs, the test harness starts the stack using:
+   ```powershell
+   docker compose -f infra/prometheus/docker-compose.yml -f infra/prometheus/docker-compose.test.yml up -d
+   ```
+   Upon test completion or unexpected failure, a `try ... finally` block automatically cleans up temporary containers and executes:
+   ```powershell
+   docker compose -f infra/prometheus/docker-compose.yml up -d
+   ```
+   This immediately restores the production configuration with zero test mounts or rules.
+
+---
+
+### 15.5 End-to-End Alert Delivery & Resilience Verification
+
+The verification script [`scripts/test-alertmanager-lifecycle.ps1`](../../scripts/test-alertmanager-lifecycle.ps1) executes comprehensive end-to-end integration testing across 12 distinct automated phases:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-alertmanager-lifecycle.ps1
+```
+
+Verified Lifecycle Steps & Scenarios:
+1. **Compilation**: Compiles `bin/webhook-receiver` as a standalone, dependency-free Linux amd64 binary (`CGO_ENABLED=0`).
+2. **Container Launch**: Deploys a temporary `webhook-receiver` container on network `prometheus_default` with `--entrypoint /webhook-receiver`.
+3. **Readiness & Discovery**:
+   - Prometheus and Alertmanager verify healthy via `/-/ready`.
+   - Prometheus actively discovers Alertmanager at `http://alertmanager:9093/api/v2/alerts` (`GET /api/v1/alertmanagers`).
+   - Synthetic test scrape target `aegisedge-lifecycle-test` is verified `UP`.
+4. **Scenario A — Warning Alert Lifecycle (Firing $\to$ Resolved + Strict Event Selection)**:
+   - `POST /api/trigger?val=1&run_id=$MainRunId` triggers synthetic warning metric tagged with unique scenario `test_run_id`.
+   - Rule `AegisEdgeE2ELifecycleWarning` transitions: `inactive` $\to$ `pending` $\to$ `firing`.
+   - Alertmanager routes alert to `/alerts/warning` (`warning-receiver`).
+   - Webhook delivery asserted with matching `test_run_id`, summary, description, and valid `startsAt`. The firing fingerprint is captured.
+   - `POST /api/trigger?val=0&run_id=$MainRunId` clears metric and triggers resolution.
+   - Event selection matches the exact firing fingerprint, validates route (`warning`), receiver (`warning-receiver`), status (`resolved`), alert labels, annotations, and asserts `endsAt > startsAt`.
+5. **Scenario B — Critical Alert Routing & Resolution**:
+   - `POST /api/trigger?val=2&run_id=$MainRunId` triggers critical metric.
+   - Rule `AegisEdgeE2ELifecycleCritical` fires.
+   - Alertmanager routes alert to `/alerts/critical` (`critical-receiver`), matching severity.
+   - Resolution is triggered and verified with fingerprint correlation and valid timestamps.
+6. **Scenario C — Default Fallback Routing for Unmatched Severity**:
+   - `POST /api/trigger?val=3&run_id=$MainRunId` triggers informational test metric (`severity: info`).
+   - Rule `AegisEdgeE2ELifecycleDefaultFallback` fires.
+   - Alertmanager routes alert to `/alerts/default` (`default-receiver`), proving fallback behavior.
+   - Resolution verified with fingerprint matching and valid timestamps.
+7. **Scenario D — Strict Alert Grouping & Grouped Resolution Verification**:
+   - `POST /api/trigger?val=1&instances=2&run_id=$MainRunId` emits multi-instance metrics across `node-a` and `node-b`.
+   - Firing webhook asserts exactly 2 alert instances batched under `groupLabels` `['alertname', 'severity', 'job']`.
+   - Firing fingerprints for `node-a` and `node-b` are captured.
+   - `POST /api/trigger?val=0&instances=2&run_id=$MainRunId` clears both instances.
+   - Grouped resolution webhook asserts exactly 2 alert instances, matching labels, distinct `node-a` and `node-b`, and verifies that each resolved alert's fingerprint strictly matches the firing fingerprint for its respective node label with `endsAt > startsAt`.
+8. **Scenario E — Alertmanager Restart Resilience & Post-Restart Delivery**:
+   - `docker restart aegisedge-alertmanager` restarts Alertmanager.
+   - Stack re-verifies health within 15 seconds without state corruption or connection drops.
+   - Prometheus rediscovery of active Alertmanager is verified.
+   - A distinct post-restart execution run ID (`$RestartRunId`) is generated.
+   - `POST /api/trigger?val=1&run_id=$RestartRunId` triggers post-restart warning.
+   - Post-restart firing notification is verified asserting `test_run_id=$RestartRunId`, capturing the post-restart fingerprint.
+   - Resolution is triggered with `$RestartRunId` and asserted with matching post-restart fingerprint and valid timestamps (`endsAt > startsAt`).
+9. **Teardown & Production Restoration**:
+   - Temporary `webhook-receiver` container is safely stopped and removed (verified absent via `docker ps -a`).
+   - Base Compose stack (`docker-compose.yml`) is recreated.
+   - Protected `try/finally` ensures all cleanup steps are executed even if a previous step encounters an issue.
+   - Teardown errors are accumulated without terminating `Write-Error` calls under `$ErrorActionPreference = "Stop"`.
+   - Verification confirms production Prometheus active rules contain only `aegisedge-quarantine-and-nats` (7 production rules, 0 test rules) and active scrape targets contain only `aegisedge-control-plane` (0 test targets).
+
+---
+
+### 15.6 Webhook Receiver Hardening & Runtime Safety
+
+The test webhook receiver (`services/control-plane/cmd/webhook-receiver`) enforces production-grade HTTP safety invariants:
+
+1. **Explicit Server Timeouts**:
+   Configured with bounded HTTP timeouts to mitigate Slowloris and resource exhaustion attacks:
+   - `ReadHeaderTimeout: 5s`
+   - `ReadTimeout: 10s`
+   - `WriteTimeout: 10s`
+   - `IdleTimeout: 60s`
+2. **Payload Size Limits & HTTP 413 Handling**:
+   - All webhook ingestion endpoints wrap `r.Body` with `http.MaxBytesReader(w, r.Body, 1048576)` (1 MiB maximum).
+   - If an oversized request payload is received, the server halts reading and immediately responds with HTTP `413 Request Entity Too Large` (`http.StatusRequestEntityTooLarge`).
+3. **Safe Malformed Body Handling (Log Injection & Flooding Defense)**:
+   - When a malformed or invalid JSON payload is received, the receiver logs only the parsing error and the total payload length (`body_bytes=%d`).
+   - The malformed request body content is never printed to server logs, preventing log injection, credential leakage, and log disk flooding.
+4. **Bounded In-Memory Storage**:
+   - Webhook events are stored in an in-memory ring buffer strictly capped at `maxRecordedEvents = 1000`.
+   - When the event limit is reached, older events are pruned first-in-first-out, preventing unbounded memory growth.
+5. **Parameter Validation (`instances` and `run_id`)**:
+   - Query parameter `instances` in `/api/trigger` is strictly validated to integers between 1 and 10 (`maxInstancesLimit = 10`). Non-numeric, zero, negative, or values exceeding 10 are rejected with HTTP `400 Bad Request`.
+   - Query parameter `run_id` dynamically populates metric label `test_run_id` across single- and multi-instance metrics for complete scenario isolation.
+
+---
+
+### 15.7 Security & Configuration Validation
+
+1. **Localhost Isolation**: Port `9093` is bound strictly to `127.0.0.1`. The web UI and REST API are never exposed to external or untrusted interfaces.
+2. **Zero Credentials**: No dummy tokens or cloud notification credentials are hardcoded.
+3. **Automated Verification Pipeline**:
+   - `amtool check-config infra/prometheus/alertmanager.yml`: Validates syntax, routing tree, and receivers via `scripts/check.ps1`.
+   - `promtool check config`: Validates production `prometheus.yml`, `prometheus.docker.yml`, and isolated `prometheus.test.yml`.
+   - `promtool check rules`: Validates `alert_rules.yml` (7 rules) and `alert_rules_lifecycle_test.yml` (3 rules).
+   - Go typed schema tests in `alert_rules_test.go` and `dashboard_test.go`: Assert unmarshal schemas, port bindings, and pinned image tags.
+   - Production isolation tests in `TestPrometheusConfig` and `TestPrometheusDockerConfig`: Assert test rule files and test scrape jobs are strictly absent from production configurations.
