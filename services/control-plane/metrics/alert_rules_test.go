@@ -38,7 +38,14 @@ type PrometheusConfigFile struct {
 		ScrapeInterval     string `yaml:"scrape_interval"`
 		EvaluationInterval string `yaml:"evaluation_interval"`
 	} `yaml:"global"`
-	RuleFiles     []string `yaml:"rule_files"`
+	RuleFiles []string `yaml:"rule_files"`
+	Alerting  struct {
+		Alertmanagers []struct {
+			StaticConfigs []struct {
+				Targets []string `yaml:"targets"`
+			} `yaml:"static_configs"`
+		} `yaml:"alertmanagers"`
+	} `yaml:"alerting"`
 	ScrapeConfigs []struct {
 		JobName       string `yaml:"job_name"`
 		MetricsPath   string `yaml:"metrics_path"`
@@ -46,6 +53,32 @@ type PrometheusConfigFile struct {
 			Targets []string `yaml:"targets"`
 		} `yaml:"static_configs"`
 	} `yaml:"scrape_configs"`
+}
+
+// AlertmanagerConfigFile represents the schema of alertmanager.yml.
+type AlertmanagerConfigFile struct {
+	Global struct {
+		ResolveTimeout string `yaml:"resolve_timeout"`
+	} `yaml:"global"`
+	Route struct {
+		Receiver       string   `yaml:"receiver"`
+		GroupBy        []string `yaml:"group_by"`
+		GroupWait      string   `yaml:"group_wait"`
+		GroupInterval  string   `yaml:"group_interval"`
+		RepeatInterval string   `yaml:"repeat_interval"`
+		Routes         []struct {
+			Receiver       string   `yaml:"receiver"`
+			Matchers       []string `yaml:"matchers"`
+			RepeatInterval string   `yaml:"repeat_interval"`
+		} `yaml:"routes"`
+	} `yaml:"route"`
+	Receivers []struct {
+		Name           string `yaml:"name"`
+		WebhookConfigs []struct {
+			URL          string `yaml:"url"`
+			SendResolved bool   `yaml:"send_resolved"`
+		} `yaml:"webhook_configs"`
+	} `yaml:"receivers"`
 }
 
 // PrometheusRuleTestFile represents the schema of alert_rules_test.yml for promtool.
@@ -247,6 +280,33 @@ func TestPrometheusConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 	if !foundJob {
 		t.Errorf("expected scrape job 'aegisedge-control-plane' in scrape_configs")
 	}
+
+	foundAlertmanager := false
+	for _, am := range cfg.Alerting.Alertmanagers {
+		for _, sc := range am.StaticConfigs {
+			for _, tgt := range sc.Targets {
+				if tgt == "127.0.0.1:9093" {
+					foundAlertmanager = true
+					break
+				}
+			}
+		}
+	}
+	if !foundAlertmanager {
+		t.Errorf("expected alertmanager target '127.0.0.1:9093' in prometheus.yml alerting configuration")
+	}
+
+	// Verify strict isolation: production prometheus.yml must not contain test rules or test scrape jobs
+	for _, rf := range cfg.RuleFiles {
+		if rf != "alert_rules.yml" {
+			t.Errorf("production prometheus.yml must not contain test rule file %q", rf)
+		}
+	}
+	for _, sc := range cfg.ScrapeConfigs {
+		if sc.JobName != "aegisedge-control-plane" {
+			t.Errorf("production prometheus.yml must not contain test scrape job %q", sc.JobName)
+		}
+	}
 }
 
 // TestAlertRules_CounterPreinitialization verifies that the terminated messages counter
@@ -438,6 +498,147 @@ func TestPrometheusDockerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 	}
 	if !foundJob {
 		t.Errorf("expected scrape job 'aegisedge-control-plane' in scrape_configs")
+	}
+
+	foundAlertmanager := false
+	for _, am := range cfg.Alerting.Alertmanagers {
+		for _, sc := range am.StaticConfigs {
+			for _, tgt := range sc.Targets {
+				if tgt == "alertmanager:9093" {
+					foundAlertmanager = true
+					break
+				}
+			}
+		}
+	}
+	if !foundAlertmanager {
+		t.Errorf("expected alertmanager target 'alertmanager:9093' in prometheus.docker.yml alerting configuration")
+	}
+
+	// Verify strict isolation: production prometheus.docker.yml must not contain test rules or test scrape jobs
+	for _, rf := range cfg.RuleFiles {
+		if rf != "alert_rules.yml" {
+			t.Errorf("production prometheus.docker.yml must not contain test rule file %q", rf)
+		}
+	}
+	for _, sc := range cfg.ScrapeConfigs {
+		if sc.JobName != "aegisedge-control-plane" {
+			t.Errorf("production prometheus.docker.yml must not contain test scrape job %q", sc.JobName)
+		}
+	}
+}
+
+// TestPrometheusTestConfig_YAMLUnmarshalAndSchema performs typed schema validation for prometheus.test.yml,
+// verifying that test rules and lifecycle scrape targets are isolated to the test configuration.
+func TestPrometheusTestConfig_YAMLUnmarshalAndSchema(t *testing.T) {
+	configPath := filepath.Join("..", "..", "..", "infra", "prometheus", "prometheus.test.yml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("failed to read prometheus test config file at %s: %v", configPath, err)
+	}
+
+	var cfg PrometheusConfigFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("YAML unmarshal failed for %s: %v", configPath, err)
+	}
+
+	foundProdRules := false
+	foundTestRules := false
+	for _, rf := range cfg.RuleFiles {
+		if rf == "alert_rules.yml" {
+			foundProdRules = true
+		}
+		if rf == "alert_rules_lifecycle_test.yml" {
+			foundTestRules = true
+		}
+	}
+	if !foundProdRules {
+		t.Errorf("expected 'alert_rules.yml' in test rule_files")
+	}
+	if !foundTestRules {
+		t.Errorf("expected 'alert_rules_lifecycle_test.yml' in test rule_files")
+	}
+
+	foundTestScrapeJob := false
+	for _, sc := range cfg.ScrapeConfigs {
+		if sc.JobName == "aegisedge-lifecycle-test" {
+			foundTestScrapeJob = true
+			if sc.MetricsPath != "/test-metrics" {
+				t.Errorf("expected metrics_path '/test-metrics', got %q", sc.MetricsPath)
+			}
+		}
+	}
+	if !foundTestScrapeJob {
+		t.Errorf("expected scrape job 'aegisedge-lifecycle-test' in test scrape_configs")
+	}
+
+	foundAlertmanager := false
+	for _, am := range cfg.Alerting.Alertmanagers {
+		for _, sc := range am.StaticConfigs {
+			for _, tgt := range sc.Targets {
+				if tgt == "alertmanager:9093" {
+					foundAlertmanager = true
+					break
+				}
+			}
+		}
+	}
+	if !foundAlertmanager {
+		t.Errorf("expected alertmanager target 'alertmanager:9093' in prometheus.test.yml alerting configuration")
+	}
+}
+
+// TestAlertmanagerConfig_YAMLUnmarshalAndSchema performs typed schema validation for alertmanager.yml.
+func TestAlertmanagerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
+	configPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alertmanager.yml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("failed to read alertmanager config file at %s: %v", configPath, err)
+	}
+
+	var cfg AlertmanagerConfigFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("YAML unmarshal failed for %s: %v", configPath, err)
+	}
+
+	resolveTimeout, err := time.ParseDuration(cfg.Global.ResolveTimeout)
+	if err != nil || resolveTimeout <= 0 {
+		t.Errorf("invalid resolve_timeout %q: %v", cfg.Global.ResolveTimeout, err)
+	}
+
+	if cfg.Route.Receiver != "default-receiver" {
+		t.Errorf("expected root receiver 'default-receiver', got %q", cfg.Route.Receiver)
+	}
+
+	expectedReceivers := map[string]bool{
+		"default-receiver":  false,
+		"critical-receiver": false,
+		"warning-receiver":  false,
+	}
+
+	for _, r := range cfg.Receivers {
+		if _, ok := expectedReceivers[r.Name]; ok {
+			expectedReceivers[r.Name] = true
+		} else {
+			t.Errorf("unexpected receiver %q in alertmanager.yml", r.Name)
+		}
+		if len(r.WebhookConfigs) == 0 {
+			t.Errorf("receiver %q has no webhook_configs", r.Name)
+		}
+		for _, wh := range r.WebhookConfigs {
+			if wh.URL == "" {
+				t.Errorf("receiver %q has empty webhook URL", r.Name)
+			}
+			if !wh.SendResolved {
+				t.Errorf("receiver %q expected send_resolved: true", r.Name)
+			}
+		}
+	}
+
+	for rName, found := range expectedReceivers {
+		if !found {
+			t.Errorf("expected receiver %q not found in alertmanager.yml", rName)
+		}
 	}
 }
 

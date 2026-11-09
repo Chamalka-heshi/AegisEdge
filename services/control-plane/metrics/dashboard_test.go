@@ -284,6 +284,16 @@ func TestGrafanaDockerCompose_Configuration(t *testing.T) {
 		t.Errorf("expected pinned Prometheus image 'prom/prometheus:v3.2.1', got %q", promService.Image)
 	}
 
+	// Verify production compose does not mount test rule files
+	for _, v := range promService.Volumes {
+		if strings.Contains(v, "alert_rules_lifecycle_test.yml") {
+			t.Errorf("production docker-compose.yml must not mount test rule file: %s", v)
+		}
+		if strings.Contains(v, "prometheus.test.yml") {
+			t.Errorf("production docker-compose.yml must not mount test configuration file: %s", v)
+		}
+	}
+
 	// Verify Grafana service
 	grafanaService, hasGrafana := compose.Services["grafana"]
 	if !hasGrafana {
@@ -305,12 +315,35 @@ func TestGrafanaDockerCompose_Configuration(t *testing.T) {
 		t.Errorf("expected Grafana port binding '127.0.0.1:3000:3000', got %v", grafanaService.Ports)
 	}
 
+	// Verify Alertmanager service
+	amService, hasAM := compose.Services["alertmanager"]
+	if !hasAM {
+		t.Fatalf("expected 'alertmanager' service in docker-compose.yml")
+	}
+	if amService.Image != "prom/alertmanager:v0.28.1" {
+		t.Errorf("expected pinned Alertmanager image 'prom/alertmanager:v0.28.1', got %q", amService.Image)
+	}
+
+	hasAMBoundPort := false
+	for _, p := range amService.Ports {
+		if p == "127.0.0.1:9093:9093" {
+			hasAMBoundPort = true
+			break
+		}
+	}
+	if !hasAMBoundPort {
+		t.Errorf("expected Alertmanager port binding '127.0.0.1:9093:9093', got %v", amService.Ports)
+	}
+
 	// Verify volume definitions
 	if _, ok := compose.Volumes["prometheus_data"]; !ok {
 		t.Errorf("expected volume 'prometheus_data' in compose volumes")
 	}
 	if _, ok := compose.Volumes["grafana_data"]; !ok {
 		t.Errorf("expected volume 'grafana_data' in compose volumes")
+	}
+	if _, ok := compose.Volumes["alertmanager_data"]; !ok {
+		t.Errorf("expected volume 'alertmanager_data' in compose volumes")
 	}
 
 	// Verify mounted host directories exist
