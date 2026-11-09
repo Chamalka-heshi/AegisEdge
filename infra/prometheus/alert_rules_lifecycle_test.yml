@@ -1,0 +1,37 @@
+# Prometheus Alert Rules for End-to-End Lifecycle Validation
+# Scope: Isolated test alert rules for verifying Prometheus -> Alertmanager -> Webhook lifecycle.
+# In normal production operation, aegisedge_lifecycle_test_metric is not present, so these rules remain inactive.
+
+groups:
+  - name: aegisedge-lifecycle-test
+    interval: 2s
+    rules:
+      - alert: AegisEdgeE2ELifecycleWarning
+        expr: aegisedge_lifecycle_test_metric == 1
+        for: 4s
+        labels:
+          severity: warning
+          tier: integration-test
+        annotations:
+          summary: "E2E lifecycle test warning alert"
+          description: "Integration test alert for Prometheus -> Alertmanager -> webhook delivery"
+
+      - alert: AegisEdgeE2ELifecycleCritical
+        expr: aegisedge_lifecycle_test_metric == 2
+        for: 4s
+        labels:
+          severity: critical
+          tier: integration-test
+        annotations:
+          summary: "E2E lifecycle test critical alert"
+          description: "Integration test alert for Prometheus -> Alertmanager -> webhook delivery"
+
+      - alert: AegisEdgeE2ELifecycleDefaultFallback
+        expr: aegisedge_lifecycle_test_metric == 3
+        for: 4s
+        labels:
+          severity: info
+          tier: integration-test
+        annotations:
+          summary: "E2E lifecycle test unmatched severity fallback alert"
+          description: "Integration test alert verifying fallback to default-receiver"

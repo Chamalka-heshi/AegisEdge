@@ -1,0 +1,11 @@
+# Docker Compose Override for AegisEdge Alertmanager Lifecycle Testing
+# Reference: docs/development/telemetry-quarantine.md
+# Mounts the isolated test configuration and test alert rules into Prometheus.
+
+services:
+  prometheus:
+    volumes:
+      - ./prometheus.test.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - ./alert_rules_lifecycle_test.yml:/etc/prometheus/alert_rules_lifecycle_test.yml:ro
+      - prometheus_data:/prometheus
