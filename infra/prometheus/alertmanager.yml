@@ -1,0 +1,40 @@
+# Alertmanager Configuration for AegisEdge Observability
+# Reference: ADR-0008, docs/development/telemetry-quarantine.md
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: "default-receiver"
+  group_by: ["alertname", "severity", "job"]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 4h
+  routes:
+    - receiver: "critical-receiver"
+      matchers:
+        - severity = "critical"
+      repeat_interval: 1h
+
+    - receiver: "warning-receiver"
+      matchers:
+        - severity = "warning"
+      repeat_interval: 4h
+
+receivers:
+  - name: "default-receiver"
+    webhook_configs:
+      - url: "http://webhook-receiver:9095/alerts/default"
+        send_resolved: true
+
+  - name: "critical-receiver"
+    webhook_configs:
+      - url: "http://webhook-receiver:9095/alerts/critical"
+        send_resolved: true
+
+  - name: "warning-receiver"
+    webhook_configs:
+      - url: "http://webhook-receiver:9095/alerts/warning"
+        send_resolved: true
+
+inhibit_rules: []

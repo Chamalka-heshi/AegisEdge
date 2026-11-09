@@ -2,10 +2,28 @@
 # Reference: ADR-0008, docs/development/telemetry-quarantine.md
 
 services:
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    container_name: aegisedge-alertmanager
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--cluster.listen-address="
+    ports:
+      - "127.0.0.1:9093:9093"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+
   prometheus:
     image: prom/prometheus:v3.2.1
     container_name: aegisedge-prometheus
     restart: unless-stopped
+    depends_on:
+      - alertmanager
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -45,3 +63,5 @@ volumes:
     name: aegisedge_prometheus_data
   grafana_data:
     name: aegisedge_grafana_data
+  alertmanager_data:
+    name: aegisedge_alertmanager_data

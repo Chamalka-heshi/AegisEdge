@@ -14,6 +14,11 @@ global:
 rule_files:
   - "alert_rules.yml"
 
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:9093"]
+
 scrape_configs:
   - job_name: "aegisedge-control-plane"
     metrics_path: "/metrics"
