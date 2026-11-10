@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -249,4 +252,76 @@ func TestWebhookReceiver_ServerTimeouts(t *testing.T) {
 	if srv.IdleTimeout != 60*time.Second {
 		t.Errorf("expected IdleTimeout 60s, got %v", srv.IdleTimeout)
 	}
+}
+
+// TestWebhookReceiver_ReadHeaderTimeout_Behavior verifies that the HTTP server actively enforces
+// ReadHeaderTimeout by closing connections from clients that stall during header transmission.
+//
+// Testing Limitation Documentation:
+// The production ReadHeaderTimeout is 5 seconds (with 10s Read/Write timeouts). Testing literal
+// 5-10 second sleeps in rapid unit tests is impractical because it introduces unacceptable test
+// latency and OS-level timing flakiness. Therefore, functional timeout enforcement is tested
+// here using NewServerWithTimeouts with an accelerated duration (100ms) on an ephemeral TCP listener,
+// while the production values are asserted in TestWebhookReceiver_ServerTimeouts and validated
+// in the end-to-end integration test suite (scripts/test-alertmanager-lifecycle.ps1).
+func TestWebhookReceiver_ReadHeaderTimeout_Behavior(t *testing.T) {
+	state := NewServerState()
+	handler := NewHandler(state)
+
+	acceleratedTimeouts := ServerTimeouts{
+		ReadHeaderTimeout: 100 * time.Millisecond,
+		ReadTimeout:       200 * time.Millisecond,
+		WriteTimeout:      200 * time.Millisecond,
+		IdleTimeout:       1 * time.Second,
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind ephemeral listener: %v", err)
+	}
+	defer listener.Close()
+
+	srv := NewServerWithTimeouts(0, handler, acceleratedTimeouts)
+	go func() {
+		_ = srv.Serve(listener)
+	}()
+	defer srv.Close()
+
+	conn, err := net.DialTimeout("tcp", listener.Addr().String(), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to dial server: %v", err)
+	}
+	defer conn.Close()
+
+	// Send an incomplete HTTP request header without the terminating "\r\n\r\n"
+	_, err = conn.Write([]byte("POST /alerts/warning HTTP/1.1\r\nHost: 127.0.0.1\r\n"))
+	if err != nil {
+		t.Fatalf("failed to write partial header: %v", err)
+	}
+
+	// Wait beyond the 100ms ReadHeaderTimeout
+	time.Sleep(200 * time.Millisecond)
+
+	// Attempt to read from the connection; the server should have severed the connection
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 128)
+	n, readErr := conn.Read(buf)
+	if readErr == nil {
+		t.Fatalf("expected connection to be closed by server, but read %d bytes: %s", n, string(buf[:n]))
+	}
+
+	var netErr net.Error
+	if errors.As(readErr, &netErr) && netErr.Timeout() {
+		t.Fatalf("client read timed out waiting for server to close connection: server did not enforce ReadHeaderTimeout")
+	}
+
+	// EOF, connection reset, or closed network connection indicates server severed the connection
+	if errors.Is(readErr, io.EOF) ||
+		strings.Contains(readErr.Error(), "forcibly closed") ||
+		strings.Contains(readErr.Error(), "connection reset") ||
+		strings.Contains(readErr.Error(), "use of closed network connection") {
+		return
+	}
+
+	t.Fatalf("unexpected read error: %v", readErr)
 }
