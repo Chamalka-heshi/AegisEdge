@@ -1506,7 +1506,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-alertmana
 
 Verified Lifecycle Steps & Scenarios:
 1. **Compilation**: Compiles `bin/webhook-receiver` as a standalone, dependency-free Linux amd64 binary (`CGO_ENABLED=0`).
-2. **Container Launch**: Deploys a temporary `webhook-receiver` container on network `prometheus_default` with `--entrypoint /webhook-receiver`.
+2. **Container Launch**: Deploys a uniquely named temporary receiver container (`aegisedge-recv-<uuid>`) with `--network-alias webhook-receiver` on network `prometheus_default`. Pre-existing containers from unrelated processes are never removed or touched.
 3. **Readiness & Discovery**:
    - Prometheus and Alertmanager verify healthy via `/-/ready`.
    - Prometheus actively discovers Alertmanager at `http://alertmanager:9093/api/v2/alerts` (`GET /api/v1/alertmanagers`).
@@ -1542,12 +1542,21 @@ Verified Lifecycle Steps & Scenarios:
    - `POST /api/trigger?val=1&run_id=$RestartRunId` triggers post-restart warning.
    - Post-restart firing notification is verified asserting `test_run_id=$RestartRunId`, capturing the post-restart fingerprint.
    - Resolution is triggered with `$RestartRunId` and asserted with matching post-restart fingerprint and valid timestamps (`endsAt > startsAt`).
-9. **Teardown & Production Restoration**:
-   - Temporary `webhook-receiver` container is safely stopped and removed (verified absent via `docker ps -a`).
+9. **Teardown & Comprehensive Production Restoration**:
+   - Temporary receiver container owned by this execution is stopped and removed (verified absent via `docker ps -a`).
    - Base Compose stack (`docker-compose.yml`) is recreated.
    - Protected `try/finally` ensures all cleanup steps are executed even if a previous step encounters an issue.
    - Teardown errors are accumulated without terminating `Write-Error` calls under `$ErrorActionPreference = "Stop"`.
-   - Verification confirms production Prometheus active rules contain only `aegisedge-quarantine-and-nats` (7 production rules, 0 test rules) and active scrape targets contain only `aegisedge-control-plane` (0 test targets).
+   - Strict production restoration assertions require:
+     - Prometheus readiness returns HTTP 200 (`/-/ready`).
+     - Production alert rules are loaded (7 rules in `aegisedge-quarantine-and-nats`).
+     - Lifecycle test rule group is absent (`aegisedge-lifecycle-test`).
+     - Lifecycle test scrape target is absent (`aegisedge-lifecycle-test`).
+     - Production Control Plane scrape target (`aegisedge-control-plane`) exists and is verified healthy (`health=up`).
+     - Production Alertmanager endpoint is discovered (`:9093`).
+     - Temporary receiver container is verified absent.
+   - If the production Control Plane scrape target is missing or unhealthy, cleanup fails with a non-zero exit code.
+   - Built-in failure-injection testing (`scripts/test-cleanup-failure-injection.ps1`) verifies isolated error reporting and stack restoration across simulated failure modes (`fail-test`, `fail-receiver-cleanup`, `fail-compose-restore`, and `fail-target-verify`).
 
 ---
 
@@ -1555,12 +1564,13 @@ Verified Lifecycle Steps & Scenarios:
 
 The test webhook receiver (`services/control-plane/cmd/webhook-receiver`) enforces production-grade HTTP safety invariants:
 
-1. **Explicit Server Timeouts**:
+1. **Explicit Server Timeouts & Testing Methodology**:
    Configured with bounded HTTP timeouts to mitigate Slowloris and resource exhaustion attacks:
    - `ReadHeaderTimeout: 5s`
    - `ReadTimeout: 10s`
    - `WriteTimeout: 10s`
    - `IdleTimeout: 60s`
+   *Testing Limitation & Validation Strategy*: Literal multi-second sleeps (5s-10s) in fast unit test suites are avoided to eliminate artificial CI delays and scheduler-induced flakiness. Active connection severance upon header stall is functionally verified in `TestWebhookReceiver_ReadHeaderTimeout_Behavior` using `NewServerWithTimeouts` with accelerated durations (100ms) on an ephemeral TCP listener, while production values are asserted via struct configuration tests and validated in end-to-end integration runs.
 2. **Payload Size Limits & HTTP 413 Handling**:
    - All webhook ingestion endpoints wrap `r.Body` with `http.MaxBytesReader(w, r.Body, 1048576)` (1 MiB maximum).
    - If an oversized request payload is received, the server halts reading and immediately responds with HTTP `413 Request Entity Too Large` (`http.StatusRequestEntityTooLarge`).
