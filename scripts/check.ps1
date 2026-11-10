@@ -36,6 +36,21 @@ if (Get-Command promtool -ErrorAction SilentlyContinue) {
         throw "promtool check config failed with exit code $LASTEXITCODE"
     }
 
+    promtool check config infra/prometheus/prometheus.docker.yml
+    if ($LASTEXITCODE -ne 0) {
+        throw "promtool check config (docker) failed with exit code $LASTEXITCODE"
+    }
+
+    promtool check config infra/prometheus/prometheus.test.yml
+    if ($LASTEXITCODE -ne 0) {
+        throw "promtool check config (test) failed with exit code $LASTEXITCODE"
+    }
+
+    promtool check rules infra/prometheus/alert_rules_lifecycle_test.yml
+    if ($LASTEXITCODE -ne 0) {
+        throw "promtool check rules (lifecycle test) failed with exit code $LASTEXITCODE"
+    }
+
     promtool test rules infra/prometheus/alert_rules_test.yml
     if ($LASTEXITCODE -ne 0) {
         throw "promtool test rules failed with exit code $LASTEXITCODE"
