@@ -250,16 +250,37 @@ func NewHandler(state *ServerState) http.Handler {
 	return mux
 }
 
-// NewServer creates an http.Server configured with production-grade timeouts.
-func NewServer(port int, handler http.Handler) *http.Server {
+// ServerTimeouts holds HTTP server timeout parameters.
+type ServerTimeouts struct {
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+}
+
+// DefaultServerTimeouts defines the production-grade timeout configuration for the receiver.
+var DefaultServerTimeouts = ServerTimeouts{
+	ReadHeaderTimeout: 5 * time.Second,
+	ReadTimeout:       10 * time.Second,
+	WriteTimeout:      10 * time.Second,
+	IdleTimeout:       60 * time.Second,
+}
+
+// NewServerWithTimeouts constructs an http.Server with custom timeout parameters.
+func NewServerWithTimeouts(port int, handler http.Handler, timeouts ServerTimeouts) *http.Server {
 	return &http.Server{
 		Addr:              fmt.Sprintf("0.0.0.0:%d", port),
 		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: timeouts.ReadHeaderTimeout,
+		ReadTimeout:       timeouts.ReadTimeout,
+		WriteTimeout:      timeouts.WriteTimeout,
+		IdleTimeout:       timeouts.IdleTimeout,
 	}
+}
+
+// NewServer creates an http.Server configured with production-grade timeouts.
+func NewServer(port int, handler http.Handler) *http.Server {
+	return NewServerWithTimeouts(port, handler, DefaultServerTimeouts)
 }
 
 func main() {
