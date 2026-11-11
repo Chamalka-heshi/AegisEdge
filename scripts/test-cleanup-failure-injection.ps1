@@ -60,7 +60,8 @@ function Verify-ProductionStateDirectly {
                 return $false
             }
             $cp = $targets.data.activeTargets | Where-Object { $_.scrapePool -eq "aegisedge-control-plane" }
-            if ($cp -ne $null -and $cp.health -eq "up") {
+            $am = $targets.data.activeTargets | Where-Object { $_.scrapePool -eq "aegisedge-alertmanager" }
+            if ($cp -ne $null -and $cp.health -eq "up" -and $am -ne $null -and $am.health -eq "up") {
                 $cpHealthy = $true
                 break
             }

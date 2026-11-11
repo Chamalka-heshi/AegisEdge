@@ -7,7 +7,7 @@ groups:
     interval: 2s
     rules:
       - alert: AegisEdgeE2ELifecycleWarning
-        expr: aegisedge_lifecycle_test_metric == 1
+        expr: (aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning"} == 1) or (aegisedge_lifecycle_test_metric == 1)
         for: 4s
         labels:
           severity: warning
@@ -17,7 +17,7 @@ groups:
           description: "Integration test alert for Prometheus -> Alertmanager -> webhook delivery"
 
       - alert: AegisEdgeE2ELifecycleCritical
-        expr: aegisedge_lifecycle_test_metric == 2
+        expr: (aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical"} == 1) or (aegisedge_lifecycle_test_metric == 2)
         for: 4s
         labels:
           severity: critical
@@ -35,3 +35,13 @@ groups:
         annotations:
           summary: "E2E lifecycle test unmatched severity fallback alert"
           description: "Integration test alert verifying fallback to default-receiver"
+
+      - alert: AegisEdgeE2EUnrelatedWarning
+        expr: aegisedge_lifecycle_test_metric{alert_family="unrelated",alert_type="warning"} == 1
+        for: 4s
+        labels:
+          severity: warning
+          tier: integration-test
+        annotations:
+          summary: "E2E lifecycle test unrelated warning alert"
+          description: "Integration test alert verifying non-inhibition of unrelated warnings"
