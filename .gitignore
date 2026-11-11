@@ -33,6 +33,7 @@ infra/nats/bin/
 .env
 .env.*
 !.env.example
+infra/prometheus/.test_secret/
 
 # Python virtual environments (for future ML milestones)
 .venv/

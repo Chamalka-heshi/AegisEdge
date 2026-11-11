@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ const (
 	maxRequestBodyBytes = 1 << 20 // 1 MiB bounded payload
 	maxStoredEvents     = 1000    // Ring-buffer cap to avoid unbounded accumulation
 	maxInstancesLimit   = 10      // Safety limit on multi-instance synthetic generation
+	minAuthTokenLength  = 16      // Minimum required characters for valid Bearer token
 )
 
 // WebhookAlert represents an alert in the Alertmanager webhook payload.
@@ -56,29 +58,62 @@ type RecordedEvent struct {
 }
 
 type ServerState struct {
-	mu          sync.RWMutex
-	metricValue int64
-	instances   int
-	runID       string
-	events      []RecordedEvent
-	nextEventID int
+	mu             sync.RWMutex
+	metricValue    int64
+	instances      int
+	runID          string
+	inhibitionMode bool
+	inhibitionVal  int64
+	events         []RecordedEvent
+	nextEventID    int
 }
 
 func NewServerState() *ServerState {
 	return &ServerState{
-		metricValue: 0,
-		instances:   1,
-		runID:       "",
-		events:      make([]RecordedEvent, 0),
-		nextEventID: 1,
+		metricValue:    0,
+		instances:      1,
+		runID:          "",
+		inhibitionMode: false,
+		inhibitionVal:  0,
+		events:         make([]RecordedEvent, 0),
+		nextEventID:    1,
 	}
 }
 
-// NewHandler constructs and returns the HTTP handler mux for the webhook receiver and mock exporter.
+// requireAuth returns an http.HandlerFunc wrapper enforcing Bearer token authentication
+// when authToken is non-empty. If authToken is empty, all requests pass through.
+func requireAuth(authToken string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if authToken != "" {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing authorization header"})
+				return
+			}
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") || parts[1] != authToken {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid bearer token"})
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// NewHandler constructs and returns the HTTP handler mux for the webhook receiver and mock exporter without authentication.
 func NewHandler(state *ServerState) http.Handler {
+	return NewHandlerWithAuth(state, "")
+}
+
+// NewHandlerWithAuth constructs the HTTP handler mux enforcing Bearer token authentication on protected endpoints.
+func NewHandlerWithAuth(state *ServerState, authToken string) http.Handler {
 	mux := http.NewServeMux()
 
-	// Health check
+	// Health check (unauthenticated GET)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -89,13 +124,15 @@ func NewHandler(state *ServerState) http.Handler {
 		_, _ = w.Write([]byte("OK\n"))
 	})
 
-	// Prometheus metrics exposition for the synthetic test metric
+	// Prometheus metrics exposition for synthetic test metrics (unauthenticated GET for scraper)
 	mux.HandleFunc("/test-metrics", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		state.mu.RLock()
+		inhibitMode := state.inhibitionMode
+		inhibitVal := state.inhibitionVal
 		val := state.metricValue
 		inst := state.instances
 		runID := state.runID
@@ -105,6 +142,19 @@ func NewHandler(state *ServerState) http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintf(w, "# HELP aegisedge_lifecycle_test_metric Synthetic metric for E2E alert lifecycle validation\n")
 		_, _ = fmt.Fprintf(w, "# TYPE aegisedge_lifecycle_test_metric gauge\n")
+
+		if inhibitMode {
+			if runID != "" {
+				_, _ = fmt.Fprintf(w, "aegisedge_lifecycle_test_metric{alert_family=\"lifecycle\",alert_type=\"warning\",tier=\"integration-test\",test_run_id=%q} %d\n", runID, inhibitVal)
+				_, _ = fmt.Fprintf(w, "aegisedge_lifecycle_test_metric{alert_family=\"lifecycle\",alert_type=\"critical\",tier=\"integration-test\",test_run_id=%q} %d\n", runID, inhibitVal)
+				_, _ = fmt.Fprintf(w, "aegisedge_lifecycle_test_metric{alert_family=\"unrelated\",alert_type=\"warning\",tier=\"integration-test\",test_run_id=%q} %d\n", runID, inhibitVal)
+			} else {
+				_, _ = fmt.Fprintf(w, "aegisedge_lifecycle_test_metric{alert_family=\"lifecycle\",alert_type=\"warning\",tier=\"integration-test\"} %d\n", inhibitVal)
+				_, _ = fmt.Fprintf(w, "aegisedge_lifecycle_test_metric{alert_family=\"lifecycle\",alert_type=\"critical\",tier=\"integration-test\"} %d\n", inhibitVal)
+				_, _ = fmt.Fprintf(w, "aegisedge_lifecycle_test_metric{alert_family=\"unrelated\",alert_type=\"warning\",tier=\"integration-test\"} %d\n", inhibitVal)
+			}
+			return
+		}
 
 		if inst > 1 {
 			for i := 1; i <= inst; i++ {
@@ -123,8 +173,8 @@ func NewHandler(state *ServerState) http.Handler {
 		}
 	})
 
-	// Control API: update test metric value
-	mux.HandleFunc("/api/trigger", func(w http.ResponseWriter, r *http.Request) {
+	// Control API: update test metric value (protected by Bearer auth)
+	mux.HandleFunc("/api/trigger", requireAuth(authToken, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -149,6 +199,7 @@ func NewHandler(state *ServerState) http.Handler {
 		runID := strings.TrimSpace(r.URL.Query().Get("run_id"))
 
 		state.mu.Lock()
+		state.inhibitionMode = false
 		state.metricValue = val
 		state.instances = inst
 		if runID != "" {
@@ -164,11 +215,43 @@ func NewHandler(state *ServerState) http.Handler {
 			"instances":   inst,
 			"runId":       currentRunID,
 		})
-	})
+	}))
 
-	// Webhook handler factory with bounded read, validation, and event cap
+	// Control API: update simultaneous inhibition test metrics (protected by Bearer auth)
+	mux.HandleFunc("/api/trigger/inhibition", requireAuth(authToken, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		valStr := r.URL.Query().Get("val")
+		val, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid val: %v", err), http.StatusBadRequest)
+			return
+		}
+		runID := strings.TrimSpace(r.URL.Query().Get("run_id"))
+
+		state.mu.Lock()
+		state.inhibitionMode = true
+		state.inhibitionVal = val
+		if runID != "" {
+			state.runID = runID
+		}
+		currentRunID := state.runID
+		state.mu.Unlock()
+
+		log.Printf("[TRIGGER-INHIBITION] simultaneous metrics updated to %d (run_id=%q)", val, currentRunID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"inhibitionMode": true,
+			"metricValue":    val,
+			"runId":          currentRunID,
+		})
+	}))
+
+	// Webhook handler factory with bounded read, validation, event cap, and Bearer auth
 	handleWebhook := func(route string) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
+		return requireAuth(authToken, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -187,7 +270,7 @@ func NewHandler(state *ServerState) http.Handler {
 			}
 			var msg WebhookMessage
 			if err := json.Unmarshal(body, &msg); err != nil {
-				// Log diagnostic information only (error and body length) without logging the body contents
+				// Log diagnostic information only (error and body length) without logging body contents
 				log.Printf("[WEBHOOK-ERR] json unmarshal failed: %v, body_bytes=%d", err, len(body))
 				http.Error(w, "Invalid JSON", http.StatusBadRequest)
 				return
@@ -218,15 +301,15 @@ func NewHandler(state *ServerState) http.Handler {
 				route, msg.Status, len(msg.Alerts), msg.Receiver)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"received"}`))
-		}
+		})
 	}
 
 	mux.HandleFunc("/alerts/default", handleWebhook("default"))
 	mux.HandleFunc("/alerts/warning", handleWebhook("warning"))
 	mux.HandleFunc("/alerts/critical", handleWebhook("critical"))
 
-	// API to inspect and query received events
-	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+	// API to inspect and query received events (protected by Bearer auth)
+	mux.HandleFunc("/api/events", requireAuth(authToken, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			state.mu.RLock()
@@ -245,9 +328,29 @@ func NewHandler(state *ServerState) http.Handler {
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
+	}))
 
 	return mux
+}
+
+// loadAuthToken reads the Bearer token from the specified file path or WEBHOOK_AUTH_TOKEN_FILE env var.
+// Returns an error if the path is provided but unreadable, or if the token is shorter than 16 characters.
+func loadAuthToken(tokenFilePath string) (string, error) {
+	if tokenFilePath == "" {
+		tokenFilePath = os.Getenv("WEBHOOK_AUTH_TOKEN_FILE")
+	}
+	if tokenFilePath == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(tokenFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read auth token file at %s: %w", tokenFilePath, err)
+	}
+	token := strings.TrimSpace(string(data))
+	if len(token) < minAuthTokenLength {
+		return "", fmt.Errorf("auth token from %s is too short (minimum %d characters required, got %d)", tokenFilePath, minAuthTokenLength, len(token))
+	}
+	return token, nil
 }
 
 // ServerTimeouts holds HTTP server timeout parameters.
@@ -285,13 +388,23 @@ func NewServer(port int, handler http.Handler) *http.Server {
 
 func main() {
 	port := flag.Int("port", 9095, "HTTP listen port")
+	authTokenFile := flag.String("auth-token-file", "", "Path to file containing Bearer authentication token")
 	flag.Parse()
 
+	authToken, err := loadAuthToken(*authTokenFile)
+	if err != nil {
+		log.Fatalf("Fatal auth token configuration error: %v", err)
+	}
+
 	state := NewServerState()
-	handler := NewHandler(state)
+	handler := NewHandlerWithAuth(state, authToken)
 	server := NewServer(*port, handler)
 
-	log.Printf("Starting AegisEdge Webhook Receiver on %s", server.Addr)
+	if authToken != "" {
+		log.Printf("Starting AegisEdge Webhook Receiver on %s with Bearer auth enabled (token_length=%d)", server.Addr, len(authToken))
+	} else {
+		log.Printf("Starting AegisEdge Webhook Receiver on %s (unauthenticated mode)", server.Addr)
+	}
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Server exited with error: %v", err)
 	}

@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -324,4 +326,216 @@ func TestWebhookReceiver_ReadHeaderTimeout_Behavior(t *testing.T) {
 	}
 
 	t.Fatalf("unexpected read error: %v", readErr)
+}
+
+func TestWebhookReceiver_BearerAuth_WebhookEndpoint(t *testing.T) {
+	authToken := "super-secure-test-token-43-chars-long-1234"
+	state := NewServerState()
+	handler := NewHandlerWithAuth(state, authToken)
+
+	validPayload := `{
+		"version": "4",
+		"groupKey": "test",
+		"status": "firing",
+		"receiver": "warning-receiver",
+		"alerts": [{"status": "firing", "labels": {"alertname": "Test"}}]
+	}`
+
+	// 1. Missing Authorization header -> 401
+	reqMissing := httptest.NewRequest(http.MethodPost, "/alerts/warning", bytes.NewBufferString(validPayload))
+	wMissing := httptest.NewRecorder()
+	handler.ServeHTTP(wMissing, reqMissing)
+	if wMissing.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for missing auth header, got %d", wMissing.Code)
+	}
+
+	// 2. Invalid Bearer token -> 401
+	reqInvalid := httptest.NewRequest(http.MethodPost, "/alerts/warning", bytes.NewBufferString(validPayload))
+	reqInvalid.Header.Set("Authorization", "Bearer invalid-token-123")
+	wInvalid := httptest.NewRecorder()
+	handler.ServeHTTP(wInvalid, reqInvalid)
+	if wInvalid.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for invalid token, got %d", wInvalid.Code)
+	}
+
+	// 3. Valid Bearer token -> 200 OK
+	reqValid := httptest.NewRequest(http.MethodPost, "/alerts/warning", bytes.NewBufferString(validPayload))
+	reqValid.Header.Set("Authorization", "Bearer "+authToken)
+	wValid := httptest.NewRecorder()
+	handler.ServeHTTP(wValid, reqValid)
+	if wValid.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for valid token, got %d: %s", wValid.Code, wValid.Body.String())
+	}
+}
+
+func TestWebhookReceiver_BearerAuth_ControlEndpoints(t *testing.T) {
+	authToken := "test-secret-token-abcdef1234567890"
+	state := NewServerState()
+	handler := NewHandlerWithAuth(state, authToken)
+
+	// /api/trigger without auth -> 401
+	reqTrigNoAuth := httptest.NewRequest(http.MethodPost, "/api/trigger?val=1", nil)
+	wTrigNoAuth := httptest.NewRecorder()
+	handler.ServeHTTP(wTrigNoAuth, reqTrigNoAuth)
+	if wTrigNoAuth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /api/trigger without auth, got %d", wTrigNoAuth.Code)
+	}
+
+	// /api/trigger with auth -> 200
+	reqTrigAuth := httptest.NewRequest(http.MethodPost, "/api/trigger?val=1", nil)
+	reqTrigAuth.Header.Set("Authorization", "Bearer "+authToken)
+	wTrigAuth := httptest.NewRecorder()
+	handler.ServeHTTP(wTrigAuth, reqTrigAuth)
+	if wTrigAuth.Code != http.StatusOK {
+		t.Errorf("expected 200 for /api/trigger with auth, got %d", wTrigAuth.Code)
+	}
+
+	// /api/trigger/inhibition without auth -> 401
+	reqInhibitNoAuth := httptest.NewRequest(http.MethodPost, "/api/trigger/inhibition?val=1", nil)
+	wInhibitNoAuth := httptest.NewRecorder()
+	handler.ServeHTTP(wInhibitNoAuth, reqInhibitNoAuth)
+	if wInhibitNoAuth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /api/trigger/inhibition without auth, got %d", wInhibitNoAuth.Code)
+	}
+
+	// /api/trigger/inhibition with auth -> 200
+	reqInhibitAuth := httptest.NewRequest(http.MethodPost, "/api/trigger/inhibition?val=1", nil)
+	reqInhibitAuth.Header.Set("Authorization", "Bearer "+authToken)
+	wInhibitAuth := httptest.NewRecorder()
+	handler.ServeHTTP(wInhibitAuth, reqInhibitAuth)
+	if wInhibitAuth.Code != http.StatusOK {
+		t.Errorf("expected 200 for /api/trigger/inhibition with auth, got %d", wInhibitAuth.Code)
+	}
+
+	// /api/events without auth -> 401
+	reqEvNoAuth := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	wEvNoAuth := httptest.NewRecorder()
+	handler.ServeHTTP(wEvNoAuth, reqEvNoAuth)
+	if wEvNoAuth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /api/events without auth, got %d", wEvNoAuth.Code)
+	}
+
+	// /api/events with auth -> 200
+	reqEvAuth := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	reqEvAuth.Header.Set("Authorization", "Bearer "+authToken)
+	wEvAuth := httptest.NewRecorder()
+	handler.ServeHTTP(wEvAuth, reqEvAuth)
+	if wEvAuth.Code != http.StatusOK {
+		t.Errorf("expected 200 for /api/events with auth, got %d", wEvAuth.Code)
+	}
+}
+
+func TestWebhookReceiver_Unauthenticated_Endpoints(t *testing.T) {
+	authToken := "test-secret-token-abcdef1234567890"
+	state := NewServerState()
+	handler := NewHandlerWithAuth(state, authToken)
+
+	// /health must remain accessible without auth for container healthchecks
+	reqHealth := httptest.NewRequest(http.MethodGet, "/health", nil)
+	wHealth := httptest.NewRecorder()
+	handler.ServeHTTP(wHealth, reqHealth)
+	if wHealth.Code != http.StatusOK {
+		t.Errorf("expected 200 for /health without auth, got %d", wHealth.Code)
+	}
+
+	// /test-metrics must remain accessible via unauthenticated GET for Prometheus scraper
+	reqMetrics := httptest.NewRequest(http.MethodGet, "/test-metrics", nil)
+	wMetrics := httptest.NewRecorder()
+	handler.ServeHTTP(wMetrics, reqMetrics)
+	if wMetrics.Code != http.StatusOK {
+		t.Errorf("expected 200 for /test-metrics without auth, got %d", wMetrics.Code)
+	}
+}
+
+func TestWebhookReceiver_SimultaneousInhibitionTrigger(t *testing.T) {
+	state := NewServerState()
+	handler := NewHandler(state)
+
+	// Trigger simultaneous metrics with run_id
+	req := httptest.NewRequest(http.MethodPost, "/api/trigger/inhibition?val=1&run_id=simul-run-123", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from trigger/inhibition, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Scrape metrics
+	reqMetrics := httptest.NewRequest(http.MethodGet, "/test-metrics", nil)
+	wMetrics := httptest.NewRecorder()
+	handler.ServeHTTP(wMetrics, reqMetrics)
+	if wMetrics.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from test-metrics, got %d", wMetrics.Code)
+	}
+
+	body := wMetrics.Body.String()
+	expWarning := `aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning",tier="integration-test",test_run_id="simul-run-123"} 1`
+	expCritical := `aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical",tier="integration-test",test_run_id="simul-run-123"} 1`
+	expUnrelated := `aegisedge_lifecycle_test_metric{alert_family="unrelated",alert_type="warning",tier="integration-test",test_run_id="simul-run-123"} 1`
+
+	if !strings.Contains(body, expWarning) {
+		t.Errorf("missing expected warning metric: %s\nin:\n%s", expWarning, body)
+	}
+	if !strings.Contains(body, expCritical) {
+		t.Errorf("missing expected critical metric: %s\nin:\n%s", expCritical, body)
+	}
+	if !strings.Contains(body, expUnrelated) {
+		t.Errorf("missing expected unrelated warning metric: %s\nin:\n%s", expUnrelated, body)
+	}
+
+	// Clear metrics
+	reqClear := httptest.NewRequest(http.MethodPost, "/api/trigger/inhibition?val=0&run_id=simul-run-123", nil)
+	wClear := httptest.NewRecorder()
+	handler.ServeHTTP(wClear, reqClear)
+	if wClear.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from clear, got %d", wClear.Code)
+	}
+
+	reqMetricsClear := httptest.NewRequest(http.MethodGet, "/test-metrics", nil)
+	wMetricsClear := httptest.NewRecorder()
+	handler.ServeHTTP(wMetricsClear, reqMetricsClear)
+	bodyClear := wMetricsClear.Body.String()
+	if strings.Contains(bodyClear, `"} 1`) {
+		t.Errorf("expected all metrics to be 0 after clearance, got:\n%s", bodyClear)
+	}
+}
+
+func TestWebhookReceiver_LoadAuthToken(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Valid token file (43 chars Base64 ASCII)
+	validToken := "dGhpcy1pcy1hLXNlY3VyZS00My1jaGFyLXRlc3QtdG9rZW4"
+	validFile := filepath.Join(tmpDir, "valid_token")
+	if err := os.WriteFile(validFile, []byte(validToken+"\n"), 0600); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	tok, err := loadAuthToken(validFile)
+	if err != nil {
+		t.Fatalf("unexpected error loading valid token: %v", err)
+	}
+	if tok != validToken {
+		t.Errorf("expected %q, got %q", validToken, tok)
+	}
+
+	// 2. Token file too short (< 16 chars)
+	shortFile := filepath.Join(tmpDir, "short_token")
+	if err := os.WriteFile(shortFile, []byte("short"), 0600); err != nil {
+		t.Fatalf("failed to write short token file: %v", err)
+	}
+	_, errShort := loadAuthToken(shortFile)
+	if errShort == nil {
+		t.Errorf("expected error for token shorter than 16 chars, got nil")
+	}
+
+	// 3. Missing file
+	_, errMissing := loadAuthToken(filepath.Join(tmpDir, "non_existent"))
+	if errMissing == nil {
+		t.Errorf("expected error for non-existent file, got nil")
+	}
+
+	// 4. Empty path
+	tokEmpty, errEmpty := loadAuthToken("")
+	if errEmpty != nil || tokEmpty != "" {
+		t.Errorf("expected empty token and nil error for empty path, got tok=%q, err=%v", tokEmpty, errEmpty)
+	}
 }
