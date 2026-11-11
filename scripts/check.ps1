@@ -61,6 +61,11 @@ if (Get-Command promtool -ErrorAction SilentlyContinue) {
         if ($LASTEXITCODE -ne 0) {
             throw "amtool check-config failed with exit code $LASTEXITCODE"
         }
+
+        amtool check-config infra/prometheus/alertmanager.test.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "amtool check-config (test) failed with exit code $LASTEXITCODE"
+        }
     }
 
     Write-Host "promtool and amtool verification passed." -ForegroundColor Green
@@ -118,6 +123,11 @@ else {
             throw "docker amtool check-config failed with exit code $LASTEXITCODE"
         }
 
+        & docker run --rm -v "${PWD}/infra/prometheus:/etc/alertmanager" --entrypoint amtool prom/alertmanager:v0.28.1 check-config /etc/alertmanager/alertmanager.test.yml
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker amtool check-config (test) failed with exit code $LASTEXITCODE"
+        }
+
         Write-Host "Dockerized promtool and amtool verification passed." -ForegroundColor Green
     }
     else {
@@ -136,10 +146,10 @@ if (Test-Path $dashboardPath) {
         if ($dashJson.uid -ne "aegisedge-telemetry-recovery") {
             throw "Unexpected dashboard UID: $($dashJson.uid)"
         }
-        if ($dashJson.panels.Count -lt 10) {
-            throw "Dashboard has fewer than 10 panels: $($dashJson.panels.Count)"
+        if ($dashJson.panels.Count -ne 20) {
+            throw "Dashboard does not have exactly 20 panels: $($dashJson.panels.Count)"
         }
-        Write-Host "Grafana dashboard JSON syntax, title, UID, and $($dashJson.panels.Count) panels validated." -ForegroundColor Green
+        Write-Host "Grafana dashboard JSON syntax, title, UID, and exactly $($dashJson.panels.Count) panels validated." -ForegroundColor Green
     }
     catch {
         throw "Grafana dashboard validation failed: $_"
