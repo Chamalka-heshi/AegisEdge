@@ -115,8 +115,8 @@ func TestGrafanaDashboard_JSONSchemaAndMetrics(t *testing.T) {
 	if dash.SchemaVersion < 38 {
 		t.Errorf("expected schemaVersion >= 38, got %d", dash.SchemaVersion)
 	}
-	if len(dash.Panels) < 10 {
-		t.Fatalf("expected at least 10 panels, got %d", len(dash.Panels))
+	if len(dash.Panels) != 20 {
+		t.Fatalf("expected exactly 20 panels, got %d", len(dash.Panels))
 	}
 
 	seenPanelIDs := make(map[int]string)
@@ -124,15 +124,18 @@ func TestGrafanaDashboard_JSONSchemaAndMetrics(t *testing.T) {
 
 	// Set of legitimate, registered metrics in AegisEdge or Prometheus synthetics
 	allowedMetrics := map[string]bool{
-		MetricQuarantineActiveRecords:     true,
-		MetricNATSPendingRecoveryItems:    true,
-		MetricNATSTerminatedMessagesTotal: true,
-		MetricIngestedBatchesTotal:        true,
-		MetricStorageProbeFailuresTotal:   true,
-		MetricQuarantineReplaysTotal:      true,
-		MetricQuarantineDiscardsTotal:     true,
-		"up":                              true,
-		"ALERTS":                          true,
+		MetricQuarantineActiveRecords:             true,
+		MetricNATSPendingRecoveryItems:            true,
+		MetricNATSTerminatedMessagesTotal:         true,
+		MetricIngestedBatchesTotal:                true,
+		MetricStorageProbeFailuresTotal:           true,
+		MetricQuarantineReplaysTotal:              true,
+		MetricQuarantineDiscardsTotal:             true,
+		"up":                                      true,
+		"ALERTS":                                  true,
+		"prometheus_notifications_errors_total":   true,
+		"alertmanager_notifications_total":        true,
+		"alertmanager_notifications_failed_total": true,
 	}
 
 	metricRegex := regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)`)
@@ -178,7 +181,10 @@ func TestGrafanaDashboard_JSONSchemaAndMetrics(t *testing.T) {
 				if promQLKeywords[tok] {
 					continue
 				}
-				if strings.HasPrefix(tok, "aegisedge_") || tok == "up" || tok == "ALERTS" {
+				if strings.HasPrefix(tok, "aegisedge_") ||
+					strings.HasPrefix(tok, "alertmanager_") ||
+					strings.HasPrefix(tok, "prometheus_") ||
+					tok == "up" || tok == "ALERTS" {
 					if !allowedMetrics[tok] {
 						t.Errorf("panel %q references unknown metric %q in expr: %s", p.Title, tok, expr)
 					}
