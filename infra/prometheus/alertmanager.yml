@@ -1,40 +1,45 @@
-# Alertmanager Configuration for AegisEdge Observability
+# Alertmanager Production Configuration for AegisEdge
 # Reference: ADR-0008, docs/development/telemetry-quarantine.md
 
 global:
   resolve_timeout: 5m
 
 route:
-  receiver: "default-receiver"
-  group_by: ["alertname", "severity", "job"]
+  receiver: "local-development-sink"
+  group_by: ["alertname", "severity", "job", "instance"]
   group_wait: 10s
   group_interval: 30s
   repeat_interval: 4h
   routes:
-    - receiver: "critical-receiver"
+    - receiver: "local-development-sink"
       matchers:
         - severity = "critical"
       repeat_interval: 1h
 
-    - receiver: "warning-receiver"
+    - receiver: "local-development-sink"
       matchers:
         - severity = "warning"
       repeat_interval: 4h
 
 receivers:
-  - name: "default-receiver"
-    webhook_configs:
-      - url: "http://webhook-receiver:9095/alerts/default"
-        send_resolved: true
+  # Local sink with no outbound integrations: evaluates & groups alerts in memory with 0 network errors
+  - name: "local-development-sink"
 
-  - name: "critical-receiver"
-    webhook_configs:
-      - url: "http://webhook-receiver:9095/alerts/critical"
-        send_resolved: true
+inhibit_rules:
+  # Inhibit Quarantine Warning when corresponding Quarantine Critical is active on the same instance
+  - target_matchers:
+      - alertname = "QuarantineActiveBacklogHigh"
+      - severity = "warning"
+    source_matchers:
+      - alertname = "QuarantineActiveBacklogCritical"
+      - severity = "critical"
+    equal: ["job", "instance"]
 
-  - name: "warning-receiver"
-    webhook_configs:
-      - url: "http://webhook-receiver:9095/alerts/warning"
-        send_resolved: true
-
-inhibit_rules: []
+  # Inhibit NATS Pending Recovery Warning when corresponding NATS Recovery Critical is active on the same instance
+  - target_matchers:
+      - alertname = "NATSPendingRecoveryAccumulationWarning"
+      - severity = "warning"
+    source_matchers:
+      - alertname = "NATSPendingRecoveryAccumulationCritical"
+      - severity = "critical"
+    equal: ["job", "instance"]

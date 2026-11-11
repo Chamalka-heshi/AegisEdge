@@ -1,0 +1,73 @@
+# Alertmanager Dedicated Integration Test Configuration
+# Loaded strictly via docker-compose.test.yml during automated test runs
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: "default-receiver"
+  # test_run_id included in group_by to prevent cross-run alert batching
+  group_by: ["alertname", "severity", "job", "tier", "test_run_id"]
+  group_wait: 2s
+  group_interval: 5s
+  repeat_interval: 1h
+  routes:
+    - receiver: "critical-receiver"
+      matchers:
+        - severity = "critical"
+      repeat_interval: 1h
+
+    - receiver: "warning-receiver"
+      matchers:
+        - severity = "warning"
+      repeat_interval: 1h
+
+receivers:
+  - name: "default-receiver"
+    webhook_configs:
+      - url: "http://webhook-receiver:9095/alerts/default"
+        send_resolved: true
+        http_config:
+          bearer_token_file: "/etc/alertmanager/secrets/test_token"
+
+  - name: "critical-receiver"
+    webhook_configs:
+      - url: "http://webhook-receiver:9095/alerts/critical"
+        send_resolved: true
+        http_config:
+          bearer_token_file: "/etc/alertmanager/secrets/test_token"
+
+  - name: "warning-receiver"
+    webhook_configs:
+      - url: "http://webhook-receiver:9095/alerts/warning"
+        send_resolved: true
+        http_config:
+          bearer_token_file: "/etc/alertmanager/secrets/test_token"
+
+inhibit_rules:
+  # Real domain rules preserved during test execution
+  - target_matchers:
+      - alertname = "QuarantineActiveBacklogHigh"
+      - severity = "warning"
+    source_matchers:
+      - alertname = "QuarantineActiveBacklogCritical"
+      - severity = "critical"
+    equal: ["job", "instance"]
+
+  - target_matchers:
+      - alertname = "NATSPendingRecoveryAccumulationWarning"
+      - severity = "warning"
+    source_matchers:
+      - alertname = "NATSPendingRecoveryAccumulationCritical"
+      - severity = "critical"
+    equal: ["job", "instance"]
+
+  # Synthetic Lifecycle Test Inhibit Rule:
+  # Suppresses AegisEdgeE2ELifecycleWarning when AegisEdgeE2ELifecycleCritical fires for the same test run
+  - target_matchers:
+      - alertname = "AegisEdgeE2ELifecycleWarning"
+      - severity = "warning"
+    source_matchers:
+      - alertname = "AegisEdgeE2ELifecycleCritical"
+      - severity = "critical"
+    equal: ["job", "tier", "test_run_id"]

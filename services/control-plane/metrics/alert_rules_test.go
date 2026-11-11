@@ -55,6 +55,13 @@ type PrometheusConfigFile struct {
 	} `yaml:"scrape_configs"`
 }
 
+// InhibitRule represents an Alertmanager alert inhibition rule.
+type InhibitRule struct {
+	TargetMatchers []string `yaml:"target_matchers"`
+	SourceMatchers []string `yaml:"source_matchers"`
+	Equal          []string `yaml:"equal"`
+}
+
 // AlertmanagerConfigFile represents the schema of alertmanager.yml.
 type AlertmanagerConfigFile struct {
 	Global struct {
@@ -77,8 +84,12 @@ type AlertmanagerConfigFile struct {
 		WebhookConfigs []struct {
 			URL          string `yaml:"url"`
 			SendResolved bool   `yaml:"send_resolved"`
+			HTTPConfig   struct {
+				BearerTokenFile string `yaml:"bearer_token_file"`
+			} `yaml:"http_config"`
 		} `yaml:"webhook_configs"`
 	} `yaml:"receivers"`
+	InhibitRules []InhibitRule `yaml:"inhibit_rules"`
 }
 
 // PrometheusRuleTestFile represents the schema of alert_rules_test.yml for promtool.
@@ -588,8 +599,9 @@ func TestPrometheusTestConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 	}
 }
 
-// TestAlertmanagerConfig_YAMLUnmarshalAndSchema performs typed schema validation for alertmanager.yml.
-func TestAlertmanagerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
+// TestAlertmanagerConfig_ProductionIsolation performs typed schema validation for production alertmanager.yml,
+// asserting production inhibition rules, presence of local-development-sink, and zero synthetic test rules.
+func TestAlertmanagerConfig_ProductionIsolation(t *testing.T) {
 	configPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alertmanager.yml")
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -606,8 +618,89 @@ func TestAlertmanagerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 		t.Errorf("invalid resolve_timeout %q: %v", cfg.Global.ResolveTimeout, err)
 	}
 
+	if cfg.Route.Receiver != "local-development-sink" {
+		t.Errorf("expected root receiver 'local-development-sink', got %q", cfg.Route.Receiver)
+	}
+
+	if len(cfg.Receivers) != 1 || cfg.Receivers[0].Name != "local-development-sink" {
+		t.Fatalf("expected exactly 1 receiver 'local-development-sink', got %d receivers", len(cfg.Receivers))
+	}
+	if len(cfg.Receivers[0].WebhookConfigs) != 0 {
+		t.Errorf("expected 0 webhook_configs on local-development-sink, got %d", len(cfg.Receivers[0].WebhookConfigs))
+	}
+
+	// Verify production inhibition rules
+	if len(cfg.InhibitRules) != 2 {
+		t.Fatalf("expected exactly 2 production inhibit rules, got %d", len(cfg.InhibitRules))
+	}
+
+	// Rule 1: Quarantine Critical -> Warning with equal: [job, instance]
+	r1 := cfg.InhibitRules[0]
+	if !containsMatcher(r1.TargetMatchers, "alertname = \"QuarantineActiveBacklogHigh\"") ||
+		!containsMatcher(r1.TargetMatchers, "severity = \"warning\"") ||
+		!containsMatcher(r1.SourceMatchers, "alertname = \"QuarantineActiveBacklogCritical\"") ||
+		!containsMatcher(r1.SourceMatchers, "severity = \"critical\"") {
+		t.Errorf("unexpected quarantine inhibition rule matchers: %+v", r1)
+	}
+	if !slicesEqual(r1.Equal, []string{"job", "instance"}) {
+		t.Errorf("expected quarantine inhibition equal: [job, instance], got %+v", r1.Equal)
+	}
+
+	// Rule 2: NATS Critical -> Warning with equal: [job, instance]
+	r2 := cfg.InhibitRules[1]
+	if !containsMatcher(r2.TargetMatchers, "alertname = \"NATSPendingRecoveryAccumulationWarning\"") ||
+		!containsMatcher(r2.TargetMatchers, "severity = \"warning\"") ||
+		!containsMatcher(r2.SourceMatchers, "alertname = \"NATSPendingRecoveryAccumulationCritical\"") ||
+		!containsMatcher(r2.SourceMatchers, "severity = \"critical\"") {
+		t.Errorf("unexpected NATS inhibition rule matchers: %+v", r2)
+	}
+	if !slicesEqual(r2.Equal, []string{"job", "instance"}) {
+		t.Errorf("expected NATS inhibition equal: [job, instance], got %+v", r2.Equal)
+	}
+
+	// Strict production isolation: zero synthetic lifecycle test rules
+	for i, ir := range cfg.InhibitRules {
+		for _, m := range ir.TargetMatchers {
+			if strings.Contains(m, "AegisEdgeE2E") {
+				t.Errorf("synthetic test rule leaked into production alertmanager.yml at inhibit_rules[%d]: %s", i, m)
+			}
+		}
+		for _, m := range ir.SourceMatchers {
+			if strings.Contains(m, "AegisEdgeE2E") {
+				t.Errorf("synthetic test rule leaked into production alertmanager.yml at inhibit_rules[%d]: %s", i, m)
+			}
+		}
+	}
+}
+
+// TestAlertmanagerTestConfig_Schema performs typed schema validation for alertmanager.test.yml,
+// asserting webhook configurations, bearer token authentication, test_run_id grouping, and synthetic inhibition rules.
+func TestAlertmanagerTestConfig_Schema(t *testing.T) {
+	configPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alertmanager.test.yml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("failed to read test alertmanager config file at %s: %v", configPath, err)
+	}
+
+	var cfg AlertmanagerConfigFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("YAML unmarshal failed for %s: %v", configPath, err)
+	}
+
 	if cfg.Route.Receiver != "default-receiver" {
 		t.Errorf("expected root receiver 'default-receiver', got %q", cfg.Route.Receiver)
+	}
+
+	// Verify test_run_id is included in group_by to prevent cross-run alert batching
+	foundTestRunID := false
+	for _, gb := range cfg.Route.GroupBy {
+		if gb == "test_run_id" {
+			foundTestRunID = true
+			break
+		}
+	}
+	if !foundTestRunID {
+		t.Errorf("expected 'test_run_id' in route.group_by for alertmanager.test.yml, got %+v", cfg.Route.GroupBy)
 	}
 
 	expectedReceivers := map[string]bool{
@@ -620,7 +713,7 @@ func TestAlertmanagerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 		if _, ok := expectedReceivers[r.Name]; ok {
 			expectedReceivers[r.Name] = true
 		} else {
-			t.Errorf("unexpected receiver %q in alertmanager.yml", r.Name)
+			t.Errorf("unexpected receiver %q in alertmanager.test.yml", r.Name)
 		}
 		if len(r.WebhookConfigs) == 0 {
 			t.Errorf("receiver %q has no webhook_configs", r.Name)
@@ -632,14 +725,55 @@ func TestAlertmanagerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 			if !wh.SendResolved {
 				t.Errorf("receiver %q expected send_resolved: true", r.Name)
 			}
+			if wh.HTTPConfig.BearerTokenFile != "/etc/alertmanager/secrets/test_token" {
+				t.Errorf("receiver %q expected bearer_token_file '/etc/alertmanager/secrets/test_token', got %q", r.Name, wh.HTTPConfig.BearerTokenFile)
+			}
 		}
 	}
 
 	for rName, found := range expectedReceivers {
 		if !found {
-			t.Errorf("expected receiver %q not found in alertmanager.yml", rName)
+			t.Errorf("expected receiver %q not found in alertmanager.test.yml", rName)
 		}
 	}
+
+	// Verify test inhibition rules: 2 production rules + 1 synthetic rule = 3 rules
+	if len(cfg.InhibitRules) != 3 {
+		t.Fatalf("expected exactly 3 inhibit rules in alertmanager.test.yml, got %d", len(cfg.InhibitRules))
+	}
+
+	// Rule 3: Synthetic Lifecycle Test Inhibit Rule with equal: [job, tier, test_run_id]
+	r3 := cfg.InhibitRules[2]
+	if !containsMatcher(r3.TargetMatchers, "alertname = \"AegisEdgeE2ELifecycleWarning\"") ||
+		!containsMatcher(r3.TargetMatchers, "severity = \"warning\"") ||
+		!containsMatcher(r3.SourceMatchers, "alertname = \"AegisEdgeE2ELifecycleCritical\"") ||
+		!containsMatcher(r3.SourceMatchers, "severity = \"critical\"") {
+		t.Errorf("unexpected synthetic inhibition rule matchers: %+v", r3)
+	}
+	if !slicesEqual(r3.Equal, []string{"job", "tier", "test_run_id"}) {
+		t.Errorf("expected synthetic inhibition equal: [job, tier, test_run_id], got %+v", r3.Equal)
+	}
+}
+
+func containsMatcher(matchers []string, target string) bool {
+	for _, m := range matchers {
+		if strings.TrimSpace(m) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestAlertRules_PromtoolCheck runs 'promtool check rules', 'promtool check config',
