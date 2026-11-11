@@ -1,5 +1,5 @@
 # Prometheus Alerting Rules for AegisEdge Control Plane
-# Scope: Telemetry Quarantine Backlog, Storage Health, and NATS JetStream Recovery Observability
+# Scope: Telemetry Quarantine Backlog, Storage Health, NATS JetStream Recovery, and Pipeline Meta-Monitoring
 # Reference: ADR-0008, docs/development/telemetry-quarantine.md
 
 groups:
@@ -13,6 +13,8 @@ groups:
         annotations:
           summary: "Elevated active telemetry quarantine backlog"
           description: "Active durable quarantine backlog is {{ $value }} records (threshold > 100) for more than 5m. Inspect quarantined payloads via GET /api/v1/telemetry/quarantine."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#quarantine-backlog-triage"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
 
       - alert: QuarantineActiveBacklogCritical
         expr: aegisedge_quarantine_active_records > 500
@@ -22,6 +24,8 @@ groups:
         annotations:
           summary: "Critically high active telemetry quarantine backlog"
           description: "Active durable quarantine backlog has reached {{ $value }} records (threshold > 500) for more than 5m. High volume of invalid or corrupted edge telemetry requires immediate operator triage."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#quarantine-backlog-triage"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
 
       - alert: QuarantineActiveCountStorageFailure
         expr: aegisedge_quarantine_active_records != aegisedge_quarantine_active_records
@@ -31,6 +35,8 @@ groups:
         annotations:
           summary: "Quarantine active records query failing (NaN emitted)"
           description: "The control plane quarantine count query has returned NaN for more than 2m. SQLite storage query timed out (>2s) or encountered database errors."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#storage-probe-failure"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
 
       - alert: QuarantineActiveMetricMissing
         expr: absent(aegisedge_quarantine_active_records)
@@ -40,6 +46,8 @@ groups:
         annotations:
           summary: "Active quarantine records metric is absent"
           description: "The metric aegisedge_quarantine_active_records is absent from scrape targets for more than 5m. Verify control plane process health and Prometheus scrape configuration."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#storage-probe-failure"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
 
       - alert: NATSPendingRecoveryAccumulationWarning
         expr: aegisedge_nats_pending_recovery_items > 0
@@ -49,6 +57,8 @@ groups:
         annotations:
           summary: "NATS consumer has persistent pending recovery items"
           description: "NATS JetStream consumer has {{ $value }} exhausted messages in process-local memory awaiting quarantine persistence for more than 5m."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#nats-recovery-triage"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
 
       - alert: NATSPendingRecoveryAccumulationCritical
         expr: aegisedge_nats_pending_recovery_items > 20
@@ -58,6 +68,8 @@ groups:
         annotations:
           summary: "NATS consumer pending recovery accumulation is critically high"
           description: "NATS consumer in-memory recovery queue has {{ $value }} items (threshold > 20) for more than 5m. Quarantine persistence may be failing or severely throttled."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#nats-recovery-triage"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
 
       - alert: NATSHighMessageTerminationRate
         expr: increase(aegisedge_nats_terminated_messages_total[5m]) > 10
@@ -67,3 +79,49 @@ groups:
         annotations:
           summary: "High rate of permanent NATS message terminations"
           description: "NATS consumer terminated {{ $value | printf \"%.0f\" }} poisoned messages over 5m (rate > 10 per 5m). Investigate edge producer telemetry validity and quarantine error reasons."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#nats-recovery-triage"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
+
+      - alert: AlertmanagerDown
+        expr: (up{job="aegisedge-alertmanager"} == 0) or (absent(up{job="aegisedge-alertmanager"}) == 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Alertmanager service is unreachable or scrape target missing"
+          description: "Prometheus cannot scrape Alertmanager at job aegisedge-alertmanager for more than 1m. Outbound notification dispatch and alerting suppression are compromised."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#alertmanager-down"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
+
+      - alert: ControlPlaneScrapeTargetDown
+        expr: (up{job="aegisedge-control-plane"} == 0) or (absent(up{job="aegisedge-control-plane"}) == 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Control plane service is unreachable or scrape target missing"
+          description: "Prometheus cannot scrape the AegisEdge control plane target for more than 1m. Ingestion and telemetry persistence may be down."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#control-plane-down"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
+
+      - alert: AlertmanagerNotificationFailures
+        expr: rate(alertmanager_notifications_failed_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alertmanager notification deliveries are failing"
+          description: "Alertmanager failed to deliver notifications to configured receivers over the last 5m (rate > 0 for 2m). Webhook targets may be rejecting payloads or timing out."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#notification-failures"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"
+
+      - alert: PrometheusAlertmanagerNotificationErrors
+        expr: rate(prometheus_notifications_errors_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus is encountering errors sending alerts to Alertmanager"
+          description: "Prometheus failed to communicate with Alertmanager via /api/v2/alerts (rate > 0 for 2m). Network partition or Alertmanager API rejection detected."
+          runbook_url: "https://github.com/Chamalka-heshi/AegisEdge/blob/main/docs/development/telemetry-quarantine.md#prometheus-notification-errors"
+          dashboard_url: "http://127.0.0.1:3000/d/aegisedge-telemetry-recovery"

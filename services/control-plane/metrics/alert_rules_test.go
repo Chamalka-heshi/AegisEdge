@@ -137,13 +137,17 @@ func TestAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
 	}
 
 	expectedAlerts := map[string]string{
-		"QuarantineActiveBacklogHigh":             "aegisedge_quarantine_active_records > 100",
-		"QuarantineActiveBacklogCritical":         "aegisedge_quarantine_active_records > 500",
-		"QuarantineActiveCountStorageFailure":     "aegisedge_quarantine_active_records != aegisedge_quarantine_active_records",
-		"QuarantineActiveMetricMissing":           "absent(aegisedge_quarantine_active_records)",
-		"NATSPendingRecoveryAccumulationWarning":  "aegisedge_nats_pending_recovery_items > 0",
-		"NATSPendingRecoveryAccumulationCritical": "aegisedge_nats_pending_recovery_items > 20",
-		"NATSHighMessageTerminationRate":          "increase(aegisedge_nats_terminated_messages_total[5m]) > 10",
+		"QuarantineActiveBacklogHigh":              "aegisedge_quarantine_active_records > 100",
+		"QuarantineActiveBacklogCritical":          "aegisedge_quarantine_active_records > 500",
+		"QuarantineActiveCountStorageFailure":      "aegisedge_quarantine_active_records != aegisedge_quarantine_active_records",
+		"QuarantineActiveMetricMissing":            "absent(aegisedge_quarantine_active_records)",
+		"NATSPendingRecoveryAccumulationWarning":   "aegisedge_nats_pending_recovery_items > 0",
+		"NATSPendingRecoveryAccumulationCritical":  "aegisedge_nats_pending_recovery_items > 20",
+		"NATSHighMessageTerminationRate":           "increase(aegisedge_nats_terminated_messages_total[5m]) > 10",
+		"AlertmanagerDown":                         `(up{job="aegisedge-alertmanager"} == 0) or (absent(up{job="aegisedge-alertmanager"}) == 1)`,
+		"ControlPlaneScrapeTargetDown":             `(up{job="aegisedge-control-plane"} == 0) or (absent(up{job="aegisedge-control-plane"}) == 1)`,
+		"AlertmanagerNotificationFailures":         "rate(alertmanager_notifications_failed_total[5m]) > 0",
+		"PrometheusAlertmanagerNotificationErrors": "rate(prometheus_notifications_errors_total[5m]) > 0",
 	}
 
 	seenAlerts := make(map[string]bool)
@@ -195,6 +199,12 @@ func TestAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
 		}
 		if strings.TrimSpace(rule.Annotations["description"]) == "" {
 			t.Errorf("alert %q has empty description annotation", rule.Alert)
+		}
+		if strings.TrimSpace(rule.Annotations["runbook_url"]) == "" {
+			t.Errorf("alert %q has empty runbook_url annotation", rule.Alert)
+		}
+		if strings.TrimSpace(rule.Annotations["dashboard_url"]) == "" {
+			t.Errorf("alert %q has empty dashboard_url annotation", rule.Alert)
 		}
 	}
 
@@ -313,9 +323,21 @@ func TestPrometheusConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 			t.Errorf("production prometheus.yml must not contain test rule file %q", rf)
 		}
 	}
+	allowedJobs := map[string]bool{
+		"aegisedge-control-plane": false,
+		"aegisedge-alertmanager":  false,
+		"aegisedge-prometheus":    false,
+	}
 	for _, sc := range cfg.ScrapeConfigs {
-		if sc.JobName != "aegisedge-control-plane" {
-			t.Errorf("production prometheus.yml must not contain test scrape job %q", sc.JobName)
+		if _, ok := allowedJobs[sc.JobName]; ok {
+			allowedJobs[sc.JobName] = true
+		} else {
+			t.Errorf("production prometheus.yml contains unexpected scrape job %q", sc.JobName)
+		}
+	}
+	for job, found := range allowedJobs {
+		if !found {
+			t.Errorf("expected scrape job %q in prometheus.yml", job)
 		}
 	}
 }
@@ -384,13 +406,17 @@ func TestAlertRulesTestFile_YAMLUnmarshalAndSchema(t *testing.T) {
 	}
 
 	expectedAlerts := map[string]bool{
-		"QuarantineActiveBacklogHigh":             false,
-		"QuarantineActiveBacklogCritical":         false,
-		"QuarantineActiveCountStorageFailure":     false,
-		"QuarantineActiveMetricMissing":           false,
-		"NATSPendingRecoveryAccumulationWarning":  false,
-		"NATSPendingRecoveryAccumulationCritical": false,
-		"NATSHighMessageTerminationRate":          false,
+		"QuarantineActiveBacklogHigh":              false,
+		"QuarantineActiveBacklogCritical":          false,
+		"QuarantineActiveCountStorageFailure":      false,
+		"QuarantineActiveMetricMissing":            false,
+		"NATSPendingRecoveryAccumulationWarning":   false,
+		"NATSPendingRecoveryAccumulationCritical":  false,
+		"NATSHighMessageTerminationRate":           false,
+		"AlertmanagerDown":                         false,
+		"ControlPlaneScrapeTargetDown":             false,
+		"AlertmanagerNotificationFailures":         false,
+		"PrometheusAlertmanagerNotificationErrors": false,
 	}
 
 	if len(tf.Tests) == 0 {
@@ -532,9 +558,21 @@ func TestPrometheusDockerConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 			t.Errorf("production prometheus.docker.yml must not contain test rule file %q", rf)
 		}
 	}
+	allowedDockerJobs := map[string]bool{
+		"aegisedge-control-plane": false,
+		"aegisedge-alertmanager":  false,
+		"aegisedge-prometheus":    false,
+	}
 	for _, sc := range cfg.ScrapeConfigs {
-		if sc.JobName != "aegisedge-control-plane" {
-			t.Errorf("production prometheus.docker.yml must not contain test scrape job %q", sc.JobName)
+		if _, ok := allowedDockerJobs[sc.JobName]; ok {
+			allowedDockerJobs[sc.JobName] = true
+		} else {
+			t.Errorf("production prometheus.docker.yml contains unexpected scrape job %q", sc.JobName)
+		}
+	}
+	for job, found := range allowedDockerJobs {
+		if !found {
+			t.Errorf("expected scrape job %q in prometheus.docker.yml", job)
 		}
 	}
 }
@@ -571,16 +609,35 @@ func TestPrometheusTestConfig_YAMLUnmarshalAndSchema(t *testing.T) {
 	}
 
 	foundTestScrapeJob := false
+	foundControlPlaneJob := false
+	foundAlertmanagerJob := false
+	foundPrometheusJob := false
 	for _, sc := range cfg.ScrapeConfigs {
-		if sc.JobName == "aegisedge-lifecycle-test" {
+		switch sc.JobName {
+		case "aegisedge-lifecycle-test":
 			foundTestScrapeJob = true
 			if sc.MetricsPath != "/test-metrics" {
 				t.Errorf("expected metrics_path '/test-metrics', got %q", sc.MetricsPath)
 			}
+		case "aegisedge-control-plane":
+			foundControlPlaneJob = true
+		case "aegisedge-alertmanager":
+			foundAlertmanagerJob = true
+		case "aegisedge-prometheus":
+			foundPrometheusJob = true
 		}
 	}
 	if !foundTestScrapeJob {
 		t.Errorf("expected scrape job 'aegisedge-lifecycle-test' in test scrape_configs")
+	}
+	if !foundControlPlaneJob {
+		t.Errorf("expected scrape job 'aegisedge-control-plane' in test scrape_configs")
+	}
+	if !foundAlertmanagerJob {
+		t.Errorf("expected scrape job 'aegisedge-alertmanager' in test scrape_configs")
+	}
+	if !foundPrometheusJob {
+		t.Errorf("expected scrape job 'aegisedge-prometheus' in test scrape_configs")
 	}
 
 	foundAlertmanager := false
