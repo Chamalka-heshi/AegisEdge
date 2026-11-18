@@ -4,7 +4,7 @@
 
 param(
     [int]$TimeoutSeconds = 60,
-    [ValidateSet("none", "fail-test", "fail-receiver-cleanup", "fail-compose-restore", "fail-target-verify", "fail-both", "fail-partial-receiver-startup")]
+    [ValidateSet("none", "fail-test", "fail-receiver-cleanup", "fail-compose-restore", "fail-target-verify", "fail-both", "fail-partial-receiver-startup", "fail-secret-creation", "fail-secret-cleanup")]
     [string]$SimulateFailure = "none"
 )
 
@@ -14,74 +14,10 @@ Write-Host "==========================================================" -Foregro
 Write-Host "AegisEdge: End-to-End Alert Lifecycle Verification" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
-# 1. Check Docker daemon
-Write-Host "`n==> 1. Checking Docker daemon..." -ForegroundColor Yellow
-$dockerCheck = docker info 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Docker daemon is unavailable. This test requires Docker Desktop." -ForegroundColor Red
-    exit 1
-}
-Write-Host "Docker daemon is active." -ForegroundColor Green
-
-# 2. Build Linux webhook-receiver binary
-Write-Host "`n==> 2. Building webhook-receiver Linux binary..." -ForegroundColor Yellow
-if (-not (Test-Path "bin")) {
-    New-Item -ItemType Directory -Path "bin" -Force | Out-Null
-}
-cmd.exe /c "set CGO_ENABLED=0&& set GOOS=linux&& set GOARCH=amd64&& go build -o bin/webhook-receiver ./services/control-plane/cmd/webhook-receiver"
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Failed to compile webhook-receiver binary." -ForegroundColor Red
-    exit 1
-}
-Write-Host "webhook-receiver binary ready." -ForegroundColor Green
-
-# 2.5 Generate CSPRNG ephemeral token and configure secure test secret file
-Write-Host "`n==> 2.5 Generating CSPRNG ephemeral token and configuring test secret..." -ForegroundColor Yellow
-$tokenBytes = New-Object byte[] 32
-[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($tokenBytes)
-$ephemeralToken = [Convert]::ToBase64String($tokenBytes).TrimEnd('=').Replace('+','-').Replace('/','_')
-
-if ($ephemeralToken.Length -ne 43) {
-    throw "Ephemeral token generation error: expected 43 characters, got $($ephemeralToken.Length)"
-}
-
+# Define paths and IDs
 $pwdPath = (Get-Item -Path ".").FullName
 $secretDir = Join-Path $pwdPath "infra\prometheus\.test_secret"
 $secretFile = Join-Path $secretDir "token"
-
-$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$userSid = $currentUser.User.Value
-
-if (-not (Test-Path $secretDir)) {
-    New-Item -ItemType Directory -Path $secretDir -Force | Out-Null
-}
-if (Test-Path $secretFile) {
-    cmd.exe /c "icacls `"$secretFile`" /grant *${userSid}:(F) >nul 2>&1"
-    Remove-Item -Path $secretFile -Force -ErrorAction SilentlyContinue
-}
-
-# Write raw ASCII bytes (no BOM, no trailing newline)
-$rawTokenBytes = [System.Text.Encoding]::ASCII.GetBytes($ephemeralToken)
-[System.IO.File]::WriteAllBytes($secretFile, $rawTokenBytes)
-
-# Verify written bytes: exactly 43 bytes, no BOM, content matches
-$readBytes = [System.IO.File]::ReadAllBytes($secretFile)
-if ($readBytes.Length -ne 43) {
-    throw "Secret file verification failed: expected 43 bytes, got $($readBytes.Length)"
-}
-if ($readBytes[0] -eq 0xEF -and $readBytes[1] -eq 0xBB -and $readBytes[2] -eq 0xBF) {
-    throw "Secret file contains UTF-8 BOM"
-}
-$readString = [System.Text.Encoding]::ASCII.GetString($readBytes)
-if ($readString -ne $ephemeralToken) {
-    throw "Secret file content does not match generated token"
-}
-
-# Set restrictive Windows ACL using current user SID
-icacls.exe "$secretFile" /inheritance:r /grant:r "*${userSid}:(R)" | Out-Null
-Write-Host "Ephemeral token file configured with restrictive user SID ACL (*$userSid)." -ForegroundColor Green
-
-$authHeaders = @{ Authorization = "Bearer $ephemeralToken" }
 
 # Unique execution run IDs and container name for isolation & ownership
 $MainRunId = "run-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
@@ -92,9 +28,11 @@ Write-Host "Execution Run IDs: Main=$MainRunId, Restart=$RestartRunId, Inhibit=$
 Write-Host "Temporary Receiver Container: $ReceiverContainerName" -ForegroundColor Cyan
 
 # Resource tracking flags for cleanup
+$secretFileAttempted = $false
 $composeOverrideAttempted = $false
 $receiverContainerAttempted = $false
 $testError = $null
+$authHeaders = @{}
 
 function Invoke-CleanupResources {
     Write-Host "`n==> Teardown: Restoring production Compose stack & cleaning test resources..." -ForegroundColor Cyan
@@ -283,22 +221,57 @@ function Invoke-CleanupResources {
         }
     }
 
-    # Step 4: Securely clean up ephemeral secret token
-    if (Test-Path $secretFile) {
+    # Step 4: Ephemeral secret token cleanup and removal verification
+    # Note: Overwriting file contents in place mitigates plaintext residue in volatile caches,
+    # but does NOT guarantee physical data destruction on SSD wear-leveling controllers,
+    # copy-on-write filesystems, snapshots, or storage backups.
+    if ($secretFileAttempted -or (Test-Path $secretFile)) {
         try {
-            $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-            $userSid = $currentUser.User.Value
-            cmd.exe /c "icacls `"$secretFile`" /grant *${userSid}:(F) >nul 2>&1"
-            $len = (Get-Item $secretFile).Length
-            [System.IO.File]::WriteAllBytes($secretFile, (New-Object byte[] $len))
-            Remove-Item -Path $secretFile -Force -ErrorAction SilentlyContinue
-            Write-Host "  Ephemeral token file securely overwritten with zero bytes and removed." -ForegroundColor Green
+            if ($SimulateFailure -eq "fail-secret-cleanup") {
+                $cleanupErrors.Add("[SIMULATED] Ephemeral secret file removal failed")
+                Write-Host "  [SIMULATION] Injected secret file removal failure." -ForegroundColor Magenta
+            } elseif (Test-Path $secretFile) {
+                $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                $userSid = $currentUser.User.Value
+                cmd.exe /c "icacls `"$secretFile`" /grant *${userSid}:(F) >nul 2>&1"
+
+                # Best-effort overwrite before deletion
+                try {
+                    $len = (Get-Item $secretFile).Length
+                    if ($len -gt 0) {
+                        [System.IO.File]::WriteAllBytes($secretFile, (New-Object byte[] $len))
+                    }
+                } catch {
+                    Write-Host "  Warning: could not overwrite token file prior to deletion: $_" -ForegroundColor Yellow
+                }
+
+                Remove-Item -Path $secretFile -Force
+            }
         } catch {
-            $cleanupErrors.Add("Exception securely removing secret file: $_")
+            $cleanupErrors.Add("Failed to remove ephemeral secret file '$secretFile': $_")
+        }
+
+        # Explicitly verify token file no longer exists
+        if (Test-Path $secretFile) {
+            $cleanupErrors.Add("Verification failed: Ephemeral secret file '$secretFile' still exists after cleanup")
+        } else {
+            Write-Host "  Ephemeral token file removal verified (file is absent)." -ForegroundColor Green
         }
     }
+
     if (Test-Path $secretDir) {
-        Remove-Item -Path $secretDir -Recurse -Force -ErrorAction SilentlyContinue
+        try {
+            Remove-Item -Path $secretDir -Recurse -Force
+        } catch {
+            $cleanupErrors.Add("Failed to remove secret directory '$secretDir': $_")
+        }
+
+        # Explicitly verify secret directory no longer exists
+        if (Test-Path $secretDir) {
+            $cleanupErrors.Add("Verification failed: Secret directory '$secretDir' still exists after cleanup")
+        } else {
+            Write-Host "  Ephemeral secret directory removal verified (directory is absent)." -ForegroundColor Green
+        }
     }
 
     if ($cleanupErrors.Count -eq 0) {
@@ -312,8 +285,77 @@ function Invoke-CleanupResources {
     return $cleanupErrors.ToArray()
 }
 
-# Enter protected lifecycle covering all Docker resources
+# Enter protected lifecycle covering all Docker resources and ephemeral secrets
 try {
+    # 1. Check Docker daemon
+    Write-Host "`n==> 1. Checking Docker daemon..." -ForegroundColor Yellow
+    & cmd.exe /c "docker info >nul 2>&1"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Docker daemon is unavailable. This test requires Docker Desktop."
+    }
+    Write-Host "Docker daemon is active." -ForegroundColor Green
+
+    # 2. Build Linux webhook-receiver binary
+    Write-Host "`n==> 2. Building webhook-receiver Linux binary..." -ForegroundColor Yellow
+    if (-not (Test-Path "bin")) {
+        New-Item -ItemType Directory -Path "bin" -Force | Out-Null
+    }
+    cmd.exe /c "set CGO_ENABLED=0&& set GOOS=linux&& set GOARCH=amd64&& go build -o bin/webhook-receiver ./services/control-plane/cmd/webhook-receiver"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to compile webhook-receiver binary."
+    }
+    Write-Host "webhook-receiver binary ready." -ForegroundColor Green
+
+    # 2.5 Generate CSPRNG ephemeral token and configure secure test secret file
+    Write-Host "`n==> 2.5 Generating CSPRNG ephemeral token and configuring test secret..." -ForegroundColor Yellow
+    $secretFileAttempted = $true
+    $tokenBytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($tokenBytes)
+    $ephemeralToken = [Convert]::ToBase64String($tokenBytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+
+    if ($ephemeralToken.Length -ne 43) {
+        throw "Ephemeral token generation error: expected 43 characters, got $($ephemeralToken.Length)"
+    }
+
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $userSid = $currentUser.User.Value
+
+    if (-not (Test-Path $secretDir)) {
+        New-Item -ItemType Directory -Path $secretDir -Force | Out-Null
+    }
+    if (Test-Path $secretFile) {
+        cmd.exe /c "icacls `"$secretFile`" /grant *${userSid}:(F) >nul 2>&1"
+        Remove-Item -Path $secretFile -Force
+    }
+
+    # Write raw ASCII bytes (no BOM, no trailing newline)
+    $rawTokenBytes = [System.Text.Encoding]::ASCII.GetBytes($ephemeralToken)
+    [System.IO.File]::WriteAllBytes($secretFile, $rawTokenBytes)
+
+    # Simulated failure during secret configuration (after file is created on disk)
+    if ($SimulateFailure -eq "fail-secret-creation") {
+        throw "[SIMULATED] Secret configuration failed during verification"
+    }
+
+    # Verify written bytes: exactly 43 bytes, no BOM, content matches
+    $readBytes = [System.IO.File]::ReadAllBytes($secretFile)
+    if ($readBytes.Length -ne 43) {
+        throw "Secret file verification failed: expected 43 bytes, got $($readBytes.Length)"
+    }
+    if ($readBytes[0] -eq 0xEF -and $readBytes[1] -eq 0xBB -and $readBytes[2] -eq 0xBF) {
+        throw "Secret file contains UTF-8 BOM"
+    }
+    $readString = [System.Text.Encoding]::ASCII.GetString($readBytes)
+    if ($readString -ne $ephemeralToken) {
+        throw "Secret file content does not match generated token"
+    }
+
+    # Set restrictive Windows ACL using current user SID
+    icacls.exe "$secretFile" /inheritance:r /grant:r "*${userSid}:(R)" | Out-Null
+    Write-Host "Ephemeral token file configured with restrictive user SID ACL (*$userSid)." -ForegroundColor Green
+
+    $authHeaders = @{ Authorization = "Bearer $ephemeralToken" }
+
     # 3. Start Compose stack with isolated test configuration override
     Write-Host "`n==> 3. Starting Prometheus & Alertmanager with isolated test configuration..." -ForegroundColor Yellow
     $composeOverrideAttempted = $true
@@ -361,7 +403,7 @@ try {
     }
 
     # If simulating cleanup failure on running stack without executing full scenarios:
-    if ($SimulateFailure -in @("fail-receiver-cleanup", "fail-compose-restore", "fail-target-verify")) {
+    if ($SimulateFailure -in @("fail-receiver-cleanup", "fail-compose-restore", "fail-target-verify", "fail-secret-cleanup")) {
         Write-Host "`n==> [SIMULATION] Skipping alert test scenarios to execute teardown failure mode '$SimulateFailure'..." -ForegroundColor Magenta
         return
     }
@@ -1107,7 +1149,7 @@ try {
     Write-Host "  Triggering simultaneous alerts for inhibition test (val=1, run_id=$InhibitRunId)..." -ForegroundColor Cyan
     Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger/inhibition?val=1&run_id=$InhibitRunId" -Headers $authHeaders -Method Post | Out-Null
 
-    # Wait for all 3 alerts to fire in Prometheus
+    # 1. Verify all 3 intended alerts fire in Prometheus
     Write-Host "  Waiting for rules to fire in Prometheus..." -ForegroundColor Cyan
     $critFiringProm = $false
     $warnFiringProm = $false
@@ -1119,10 +1161,14 @@ try {
             foreach ($group in $rulesResp.data.groups) {
                 if ($group.name -eq "aegisedge-lifecycle-test") {
                     foreach ($rule in $group.rules) {
-                        if ($rule.state -eq "firing") {
-                            if ($rule.name -eq "AegisEdgeE2ELifecycleCritical") { $critFiringProm = $true }
-                            if ($rule.name -eq "AegisEdgeE2ELifecycleWarning") { $warnFiringProm = $true }
-                            if ($rule.name -eq "AegisEdgeE2EUnrelatedWarning") { $unrelFiringProm = $true }
+                        if ($rule.state -eq "firing" -and $rule.alerts) {
+                            foreach ($al in $rule.alerts) {
+                                if ($al.labels.test_run_id -eq $InhibitRunId -and $al.state -eq "firing") {
+                                    if ($rule.name -eq "AegisEdgeE2ELifecycleCritical") { $critFiringProm = $true }
+                                    if ($rule.name -eq "AegisEdgeE2ELifecycleWarning") { $warnFiringProm = $true }
+                                    if ($rule.name -eq "AegisEdgeE2EUnrelatedWarning") { $unrelFiringProm = $true }
+                                }
+                            }
                         }
                     }
                 }
@@ -1132,83 +1178,244 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not ($critFiringProm -and $warnFiringProm -and $unrelFiringProm)) {
-        throw "Not all 3 inhibition rules fired in Prometheus (Crit=$critFiringProm, Warn=$warnFiringProm, Unrel=$unrelFiringProm)."
+        throw "Not all 3 inhibition rules fired in Prometheus within $TimeoutSeconds s for run_id $InhibitRunId (Crit=$critFiringProm, Warn=$warnFiringProm, Unrel=$unrelFiringProm)."
     }
-    Write-Host "  Prometheus: AegisEdgeE2ELifecycleCritical, AegisEdgeE2ELifecycleWarning, and AegisEdgeE2EUnrelatedWarning are all FIRING." -ForegroundColor Green
+    Write-Host "  Prometheus: AegisEdgeE2ELifecycleCritical, AegisEdgeE2ELifecycleWarning, and AegisEdgeE2EUnrelatedWarning are all FIRING for run_id $InhibitRunId." -ForegroundColor Green
 
-    # Verify Alertmanager status: AegisEdgeE2ELifecycleWarning must have status.inhibitedBy non-empty
+    # 2. Query Alertmanager /api/v2/alerts to verify inhibition state:
+    # - AegisEdgeE2ELifecycleWarning is suppressed and inhibitedBy identifies critical alert fingerprint
+    # - AegisEdgeE2EUnrelatedWarning remains active and is not inhibited
+    # - AegisEdgeE2ELifecycleCritical remains active
     Write-Host "  Querying Alertmanager /api/v2/alerts to verify inhibition state..." -ForegroundColor Cyan
-    $amInhibited = $false
+    $amStateVerified = $false
+    $expectedCriticalFingerprint = $null
+    $lifecycleWarningFingerprint = $null
+    $unrelatedWarningFingerprint = $null
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt 20) {
         try {
             $amAlerts = Invoke-RestMethod -Uri "http://127.0.0.1:9093/api/v2/alerts"
+            $critAlert = $null
+            $warnAlert = $null
+            $unrelAlert = $null
+
             foreach ($al in $amAlerts) {
-                if ($al.labels.alertname -eq "AegisEdgeE2ELifecycleWarning" -and
-                    $al.labels.test_run_id -eq $InhibitRunId) {
-                    if ($al.status -ne $null -and $al.status.inhibitedBy -ne $null -and $al.status.inhibitedBy.Count -gt 0) {
-                        $amInhibited = $true
-                        Write-Host "  Alertmanager confirms AegisEdgeE2ELifecycleWarning is inhibited by: $($al.status.inhibitedBy -join ', ')" -ForegroundColor Green
-                        break
-                    }
+                if ($al.labels.test_run_id -eq $InhibitRunId) {
+                    if ($al.labels.alertname -eq "AegisEdgeE2ELifecycleCritical") { $critAlert = $al }
+                    if ($al.labels.alertname -eq "AegisEdgeE2ELifecycleWarning") { $warnAlert = $al }
+                    if ($al.labels.alertname -eq "AegisEdgeE2EUnrelatedWarning") { $unrelAlert = $al }
                 }
             }
-            if ($amInhibited) { break }
+
+            if ($critAlert -ne $null -and $warnAlert -ne $null -and $unrelAlert -ne $null) {
+                $expectedCriticalFingerprint = $critAlert.fingerprint
+                $lifecycleWarningFingerprint = $warnAlert.fingerprint
+                $unrelatedWarningFingerprint = $unrelAlert.fingerprint
+
+                $critIsActive = ($critAlert.status -ne $null -and $critAlert.status.state -eq "active")
+                $warnIsSuppressed = ($warnAlert.status -ne $null -and $warnAlert.status.state -eq "suppressed" -and
+                                     $warnAlert.status.inhibitedBy -ne $null -and $warnAlert.status.inhibitedBy -contains $expectedCriticalFingerprint)
+                $unrelIsActive = ($unrelAlert.status -ne $null -and $unrelAlert.status.state -eq "active" -and
+                                  ($unrelAlert.status.inhibitedBy -eq $null -or $unrelAlert.status.inhibitedBy.Count -eq 0))
+
+                if ($critIsActive -and $warnIsSuppressed -and $unrelIsActive) {
+                    $amStateVerified = $true
+                    Write-Host "  Alertmanager confirms:" -ForegroundColor Green
+                    Write-Host "    - AegisEdgeE2ELifecycleCritical is active (Fingerprint: $expectedCriticalFingerprint)" -ForegroundColor Green
+                    Write-Host "    - AegisEdgeE2ELifecycleWarning is SUPPRESSED, inhibitedBy: $($warnAlert.status.inhibitedBy -join ', ')" -ForegroundColor Green
+                    Write-Host "    - AegisEdgeE2EUnrelatedWarning is ACTIVE and NOT inhibited (Fingerprint: $unrelatedWarningFingerprint)" -ForegroundColor Green
+                    break
+                }
+            }
         } catch {}
         Start-Sleep -Milliseconds 500
     }
-    if (-not $amInhibited) {
-        throw "Alertmanager /api/v2/alerts did not show AegisEdgeE2ELifecycleWarning as inhibited for run_id $InhibitRunId."
+    if (-not $amStateVerified) {
+        throw "Alertmanager /api/v2/alerts verification failed for run_id ${InhibitRunId}: expected AegisEdgeE2ELifecycleWarning to be suppressed by critical fingerprint '$expectedCriticalFingerprint' and AegisEdgeE2EUnrelatedWarning to remain active."
     }
 
-    # Verify webhook deliveries:
-    # 1. Critical alert MUST be delivered to critical-receiver
-    # 2. Unrelated warning alert MUST be delivered to warning-receiver
-    # 3. Inhibited warning alert MUST NOT be delivered
-    Write-Host "  Waiting for webhook deliveries on receiver..." -ForegroundColor Cyan
-    $critDelivered = $false
-    $unrelDelivered = $false
+    # 3. Verify webhook deliveries for firing alerts:
+    # - Critical alert reaches critical-receiver on /alerts/critical
+    # - Unrelated warning alert reaches warning-receiver on /alerts/warning
+    # - Inhibited lifecycle warning is NOT delivered
+    Write-Host "  Waiting for firing webhook deliveries on receiver..." -ForegroundColor Cyan
+    $critFiringEvent = $null
+    $unrelFiringEvent = $null
     $inhibitedDelivered = $false
     $stopwatch.Restart()
-    while ($stopwatch.Elapsed.TotalSeconds -lt 20) {
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
             $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
-                foreach ($al in $ev.payload.alerts) {
-                    if ($al.labels.test_run_id -eq $InhibitRunId -and $al.status -eq "firing") {
-                        if ($al.labels.alertname -eq "AegisEdgeE2ELifecycleCritical" -and $ev.route -eq "critical") {
-                            $critDelivered = $true
-                        }
-                        if ($al.labels.alertname -eq "AegisEdgeE2EUnrelatedWarning" -and $ev.route -eq "warning") {
-                            $unrelDelivered = $true
-                        }
-                        if ($al.labels.alertname -eq "AegisEdgeE2ELifecycleWarning") {
-                            $inhibitedDelivered = $true
+                if ($ev.payload.status -eq "firing") {
+                    foreach ($al in $ev.payload.alerts) {
+                        if ($al.labels.test_run_id -eq $InhibitRunId -and $al.status -eq "firing") {
+                            if ($al.labels.alertname -eq "AegisEdgeE2ELifecycleCritical" -and
+                                $ev.route -eq "critical" -and $ev.payload.receiver -eq "critical-receiver" -and
+                                $al.fingerprint -eq $expectedCriticalFingerprint) {
+                                $critFiringEvent = $ev
+                            }
+                            if ($al.labels.alertname -eq "AegisEdgeE2EUnrelatedWarning" -and
+                                $ev.route -eq "warning" -and $ev.payload.receiver -eq "warning-receiver" -and
+                                $al.fingerprint -eq $unrelatedWarningFingerprint) {
+                                $unrelFiringEvent = $ev
+                            }
+                            if ($al.labels.alertname -eq "AegisEdgeE2ELifecycleWarning") {
+                                $inhibitedDelivered = $true
+                            }
                         }
                     }
                 }
             }
-            if ($critDelivered -and $unrelDelivered) { break }
+            if ($critFiringEvent -and $unrelFiringEvent) { break }
         } catch {}
         Start-Sleep -Seconds 1
     }
 
-    if (-not $critDelivered) {
-        throw "AegisEdgeE2ELifecycleCritical was not delivered to critical-receiver."
+    if (-not $critFiringEvent) {
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
+        $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
+        throw "AegisEdgeE2ELifecycleCritical (fingerprint $expectedCriticalFingerprint) was not delivered to critical-receiver on /alerts/critical within $TimeoutSeconds s."
     }
-    if (-not $unrelDelivered) {
-        throw "AegisEdgeE2EUnrelatedWarning was not delivered to warning-receiver (unrelated warnings must NOT be inhibited)."
+    if (-not $unrelFiringEvent) {
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
+        $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
+        throw "AegisEdgeE2EUnrelatedWarning (fingerprint $unrelatedWarningFingerprint) was not delivered to warning-receiver on /alerts/warning within $TimeoutSeconds s (unrelated warnings must NOT be inhibited)."
     }
     if ($inhibitedDelivered) {
         throw "AegisEdgeE2ELifecycleWarning was LEAKED to webhook receiver while it was supposed to be inhibited!"
     }
-    Write-Host "  Inhibition delivery verified: Critical delivered, Unrelated Warning delivered, Inhibited Warning suppressed." -ForegroundColor Green
+    Write-Host "  Inhibition firing delivery verified: Critical delivered, Unrelated Warning delivered, Inhibited Warning suppressed." -ForegroundColor Green
 
-    # Resolve Scenario F alerts
-    Write-Host "  Resolving inhibition test alerts (val=0, run_id=$InhibitRunId)..." -ForegroundColor Cyan
+    # 4. Trigger resolution and verify resolution is actually observed, not merely requested
+    Write-Host "  Triggering resolution of inhibition test alerts (val=0, run_id=$InhibitRunId)..." -ForegroundColor Cyan
     Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger/inhibition?val=0&run_id=$InhibitRunId" -Headers $authHeaders -Method Post | Out-Null
     Write-Host "  Inhibition resolution requested." -ForegroundColor Green
 
+    # Bounded polling: verify all 3 rules stop firing in Prometheus
+    Write-Host "  Waiting for Prometheus rules to observe resolution..." -ForegroundColor Cyan
+    $promRulesResolved = $false
+    $stopwatch.Restart()
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules"
+            $anyInhibitAlertFiring = $false
+            foreach ($group in $rulesResp.data.groups) {
+                if ($group.name -eq "aegisedge-lifecycle-test") {
+                    foreach ($rule in $group.rules) {
+                        if ($rule.alerts) {
+                            foreach ($al in $rule.alerts) {
+                                if ($al.labels.test_run_id -eq $InhibitRunId -and $al.state -eq "firing") {
+                                    $anyInhibitAlertFiring = $true
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (-not $anyInhibitAlertFiring) {
+                $promRulesResolved = $true
+                break
+            }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+    if (-not $promRulesResolved) {
+        throw "Prometheus rules failed to transition away from firing for run_id $InhibitRunId within $TimeoutSeconds s."
+    }
+    Write-Host "  Prometheus confirms all 3 inhibition test rules are no longer firing." -ForegroundColor Green
+
+    # Bounded polling: verify correlated resolved webhook deliveries on receiver
+    Write-Host "  Waiting for correlated resolved webhook deliveries on receiver..." -ForegroundColor Cyan
+    $critResolvedEvent = $null
+    $unrelResolvedEvent = $null
+    $rCritAlert = $null
+    $rUnrelAlert = $null
+    $stopwatch.Restart()
+    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            foreach ($ev in $events) {
+                if ($ev.payload.status -eq "resolved") {
+                    if ($ev.route -eq "critical" -and $ev.payload.receiver -eq "critical-receiver") {
+                        foreach ($candAlert in $ev.payload.alerts) {
+                            if ($candAlert.fingerprint -eq $expectedCriticalFingerprint -and
+                                $candAlert.status -eq "resolved" -and
+                                $candAlert.labels.alertname -eq "AegisEdgeE2ELifecycleCritical" -and
+                                $candAlert.labels.test_run_id -eq $InhibitRunId) {
+                                
+                                $rStartsAt = [DateTime]::Parse($candAlert.startsAt, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                                $rEndsAt = [DateTime]::Parse($candAlert.endsAt, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                                if ($rEndsAt.Year -ge 2024 -and $rEndsAt -gt $rStartsAt) {
+                                    $critResolvedEvent = $ev
+                                    $rCritAlert = $candAlert
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    if ($ev.route -eq "warning" -and $ev.payload.receiver -eq "warning-receiver") {
+                        foreach ($candAlert in $ev.payload.alerts) {
+                            if ($candAlert.fingerprint -eq $unrelatedWarningFingerprint -and
+                                $candAlert.status -eq "resolved" -and
+                                $candAlert.labels.alertname -eq "AegisEdgeE2EUnrelatedWarning" -and
+                                $candAlert.labels.test_run_id -eq $InhibitRunId) {
+                                
+                                $rStartsAt = [DateTime]::Parse($candAlert.startsAt, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                                $rEndsAt = [DateTime]::Parse($candAlert.endsAt, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                                if ($rEndsAt.Year -ge 2024 -and $rEndsAt -gt $rStartsAt) {
+                                    $unrelResolvedEvent = $ev
+                                    $rUnrelAlert = $candAlert
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ($critResolvedEvent -and $unrelResolvedEvent) { break }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not $critResolvedEvent) {
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
+        $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
+        throw "Webhook receiver did not receive resolved notification on /alerts/critical for AegisEdgeE2ELifecycleCritical (fingerprint $expectedCriticalFingerprint, run_id $InhibitRunId) within $TimeoutSeconds s."
+    }
+    if (-not $unrelResolvedEvent) {
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
+        $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
+        throw "Webhook receiver did not receive resolved notification on /alerts/warning for AegisEdgeE2EUnrelatedWarning (fingerprint $unrelatedWarningFingerprint, run_id $InhibitRunId) within $TimeoutSeconds s."
+    }
+    Write-Host "  Correlated resolved notifications verified for Critical (Fingerprint: $($rCritAlert.fingerprint)) and Unrelated Warning (Fingerprint: $($rUnrelAlert.fingerprint))." -ForegroundColor Green
+
+    # 5. Verify that NO inappropriate resolved notification was delivered for the inhibited warning
+    $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+    $inappropriateResolvedFound = $false
+    foreach ($ev in $events) {
+        if ($ev.payload.status -eq "resolved") {
+            foreach ($candAlert in $ev.payload.alerts) {
+                if ($candAlert.labels.alertname -eq "AegisEdgeE2ELifecycleWarning" -and
+                    $candAlert.labels.test_run_id -eq $InhibitRunId) {
+                    $inappropriateResolvedFound = $true
+                    break
+                }
+            }
+        }
+        if ($inappropriateResolvedFound) { break }
+    }
+    if ($inappropriateResolvedFound) {
+        throw "Inappropriate resolved notification delivered for inhibited warning AegisEdgeE2ELifecycleWarning (run_id $InhibitRunId)!"
+    }
+    Write-Host "  Verified no inappropriate resolved notification was delivered for the inhibited warning." -ForegroundColor Green
+
+    # 6. Overall Success Reporting
     Write-Host "`n==========================================================" -ForegroundColor Green
     Write-Host "ALL INTEGRATION TEST SCENARIOS COMPLETED SUCCESSFULLY!" -ForegroundColor Green
     Write-Host "==========================================================" -ForegroundColor Green
