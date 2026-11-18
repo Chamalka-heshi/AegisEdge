@@ -812,6 +812,82 @@ func TestAlertmanagerTestConfig_Schema(t *testing.T) {
 	}
 }
 
+// TestLifecycleAlertRules_YAMLUnmarshalAndSchema validates the structure, labels, and exact PromQL
+// expressions in alert_rules_lifecycle_test.yml, ensuring explicit lifecycle matching, legacy compatibility,
+// and cross-series isolation.
+func TestLifecycleAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
+	rulePath := filepath.Join("..", "..", "..", "infra", "prometheus", "alert_rules_lifecycle_test.yml")
+	data, err := os.ReadFile(rulePath)
+	if err != nil {
+		t.Fatalf("failed to read lifecycle alert rules file at %s: %v", rulePath, err)
+	}
+
+	var rf AlertRuleFile
+	if err := yaml.Unmarshal(data, &rf); err != nil {
+		t.Fatalf("YAML unmarshal failed for %s: %v", rulePath, err)
+	}
+
+	if len(rf.Groups) != 1 {
+		t.Fatalf("expected exactly 1 rule group, got %d", len(rf.Groups))
+	}
+
+	group := rf.Groups[0]
+	if group.Name != "aegisedge-lifecycle-test" {
+		t.Errorf("expected group name 'aegisedge-lifecycle-test', got %q", group.Name)
+	}
+
+	if len(group.Rules) != 4 {
+		t.Fatalf("expected exactly 4 lifecycle rules, got %d", len(group.Rules))
+	}
+
+	expectedRules := map[string]struct {
+		expr     string
+		severity string
+		tier     string
+	}{
+		"AegisEdgeE2ELifecycleWarning": {
+			expr:     `(aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 1)`,
+			severity: "warning",
+			tier:     "integration-test",
+		},
+		"AegisEdgeE2ELifecycleCritical": {
+			expr:     `(aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 2)`,
+			severity: "critical",
+			tier:     "integration-test",
+		},
+		"AegisEdgeE2ELifecycleDefaultFallback": {
+			expr:     "aegisedge_lifecycle_test_metric == 3",
+			severity: "info",
+			tier:     "integration-test",
+		},
+		"AegisEdgeE2EUnrelatedWarning": {
+			expr:     `aegisedge_lifecycle_test_metric{alert_family="unrelated",alert_type="warning"} == 1`,
+			severity: "warning",
+			tier:     "integration-test",
+		},
+	}
+
+	for _, rule := range group.Rules {
+		expected, exists := expectedRules[rule.Alert]
+		if !exists {
+			t.Errorf("unexpected rule in lifecycle test rules: %s", rule.Alert)
+			continue
+		}
+
+		if rule.Expr != expected.expr {
+			t.Errorf("rule %s expr mismatch:\nexpected: %s\ngot:      %s", rule.Alert, expected.expr, rule.Expr)
+		}
+
+		if rule.Labels["severity"] != expected.severity {
+			t.Errorf("rule %s severity mismatch: expected %q, got %q", rule.Alert, expected.severity, rule.Labels["severity"])
+		}
+
+		if rule.Labels["tier"] != expected.tier {
+			t.Errorf("rule %s tier mismatch: expected %q, got %q", rule.Alert, expected.tier, rule.Labels["tier"])
+		}
+	}
+}
+
 func containsMatcher(matchers []string, target string) bool {
 	for _, m := range matchers {
 		if strings.TrimSpace(m) == target {
