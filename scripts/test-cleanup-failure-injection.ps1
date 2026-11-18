@@ -74,7 +74,19 @@ function Verify-ProductionStateDirectly {
         return $false
     }
 
-    Write-Host "  Direct API Verification: 0 leaked containers, Prometheus HTTP 200, 0 test rules/targets, Control Plane target UP." -ForegroundColor Green
+    # 5. Direct secret cleanup check: No leftover ephemeral secret file or directory
+    $secretFile = "infra/prometheus/.test_secret/token"
+    $secretDir = "infra/prometheus/.test_secret"
+    if (Test-Path $secretFile) {
+        Write-Host "  FAILED: Leaked ephemeral secret file detected: $secretFile" -ForegroundColor Red
+        return $false
+    }
+    if (Test-Path $secretDir) {
+        Write-Host "  FAILED: Leaked ephemeral secret directory detected: $secretDir" -ForegroundColor Red
+        return $false
+    }
+
+    Write-Host "  Direct API & Secret Verification: 0 leaked containers, 0 leaked secrets, Prometheus HTTP 200, 0 test rules/targets, Control Plane target UP." -ForegroundColor Green
     return $true
 }
 
@@ -83,7 +95,8 @@ function Run-Scenario {
         [string]$Name,
         [string]$FailureMode,
         [string[]]$ExpectedPatterns,
-        [int]$ExpectedExitCode = 1
+        [int]$ExpectedExitCode = 1,
+        [switch]$ExpectLeakedSecret
     )
 
     Write-Host "`n--- Testing Scenario: $Name ($FailureMode) ---" -ForegroundColor Yellow
@@ -110,6 +123,21 @@ function Run-Scenario {
         } else {
             Write-Host "  Diagnostic verified: '$pat'" -ForegroundColor Green
         }
+    }
+
+    if ($ExpectLeakedSecret) {
+        $secretFile = "infra/prometheus/.test_secret/token"
+        if (-not (Test-Path $secretFile)) {
+            Write-Host "FAILED: Expected secret file '$secretFile' to remain on disk during fail-secret-cleanup, but it was already deleted." -ForegroundColor Red
+            return $false
+        }
+        Write-Host "  Actual failure outcome verified: Ephemeral secret file remained on disk as expected before test suite cleanup." -ForegroundColor Green
+        # Now clean it up so subsequent state verification passes cleanly
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $userSid = $currentUser.User.Value
+        cmd.exe /c "icacls `"$secretFile`" /grant *${userSid}:(F) >nul 2>&1"
+        Remove-Item -Path $secretFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "infra/prometheus/.test_secret" -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # Verify production state directly without relying solely on output matching
@@ -178,10 +206,31 @@ $res6 = Run-Scenario -Name "Test and Cleanup Failures Preserved Together" `
         "Additionally, teardown errors occurred"
     )
 
-# 7. Final Suite Summary
-if ($res1 -and $res2 -and $res3 -and $res4 -and $res5 -and $res6) {
+# 7. Simulate Secret Creation Failure (Verifies secret file and directory are cleaned up even if secret creation fails midway)
+$res7 = Run-Scenario -Name "Secret Cleaned Up If Secret Configuration Fails" `
+    -FailureMode "fail-secret-creation" `
+    -ExpectedPatterns @(
+        "[SIMULATED] Secret configuration failed during verification",
+        "Teardown: Restoring production Compose stack & cleaning test resources",
+        "Ephemeral token file removal verified (file is absent)",
+        "Ephemeral secret directory removal verified (directory is absent)",
+        "FATAL: Integration test failed"
+    )
+
+# 8. Simulate Secret Removal Failure (Verifies secret removal failure and residual presence are reported as teardown failure)
+$res8 = Run-Scenario -Name "Secret Removal Failure Reported and Detected" `
+    -FailureMode "fail-secret-cleanup" `
+    -ExpectedPatterns @(
+        "[SIMULATED] Ephemeral secret file removal failed",
+        "Verification failed: Ephemeral secret file",
+        "FATAL: Teardown failed"
+    ) `
+    -ExpectLeakedSecret
+
+# 9. Final Suite Summary
+if ($res1 -and $res2 -and $res3 -and $res4 -and $res5 -and $res6 -and $res7 -and $res8) {
     Write-Host "`n==========================================================" -ForegroundColor Green
-    Write-Host "ALL 6 CLEANUP FAILURE-INJECTION SCENARIOS PASSED!" -ForegroundColor Green
+    Write-Host "ALL 8 CLEANUP FAILURE-INJECTION SCENARIOS PASSED!" -ForegroundColor Green
     Write-Host "Direct API and Docker verification confirmed for all runs." -ForegroundColor Green
     Write-Host "==========================================================" -ForegroundColor Green
     exit 0
