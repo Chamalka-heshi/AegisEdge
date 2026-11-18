@@ -812,9 +812,12 @@ func TestAlertmanagerTestConfig_Schema(t *testing.T) {
 	}
 }
 
-// TestLifecycleAlertRules_YAMLUnmarshalAndSchema validates the structure, labels, and exact PromQL
-// expressions in alert_rules_lifecycle_test.yml, ensuring explicit lifecycle matching, legacy compatibility,
-// and cross-series isolation.
+// TestLifecycleAlertRules_YAMLUnmarshalAndSchema validates the structure, labels, durations,
+// annotations, and exact PromQL expressions in alert_rules_lifecycle_test.yml, ensuring explicit
+// lifecycle matching, legacy compatibility, and cross-series isolation.
+//
+// NOTE: These custom YAML unmarshalling tests provide fast CI structural verification,
+// but serve as additional checks, not substitutes for official promtool/amtool CLI validation.
 func TestLifecycleAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
 	rulePath := filepath.Join("..", "..", "..", "infra", "prometheus", "alert_rules_lifecycle_test.yml")
 	data, err := os.ReadFile(rulePath)
@@ -841,31 +844,38 @@ func TestLifecycleAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
 	}
 
 	expectedRules := map[string]struct {
-		expr     string
-		severity string
-		tier     string
+		expr        string
+		forDuration string
+		severity    string
+		tier        string
 	}{
 		"AegisEdgeE2ELifecycleWarning": {
-			expr:     `(aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 1)`,
-			severity: "warning",
-			tier:     "integration-test",
+			expr:        `(aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 1)`,
+			forDuration: "4s",
+			severity:    "warning",
+			tier:        "integration-test",
 		},
 		"AegisEdgeE2ELifecycleCritical": {
-			expr:     `(aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 2)`,
-			severity: "critical",
-			tier:     "integration-test",
+			expr:        `(aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 2)`,
+			forDuration: "4s",
+			severity:    "critical",
+			tier:        "integration-test",
 		},
 		"AegisEdgeE2ELifecycleDefaultFallback": {
-			expr:     "aegisedge_lifecycle_test_metric == 3",
-			severity: "info",
-			tier:     "integration-test",
+			expr:        "aegisedge_lifecycle_test_metric == 3",
+			forDuration: "4s",
+			severity:    "info",
+			tier:        "integration-test",
 		},
 		"AegisEdgeE2EUnrelatedWarning": {
-			expr:     `aegisedge_lifecycle_test_metric{alert_family="unrelated",alert_type="warning"} == 1`,
-			severity: "warning",
-			tier:     "integration-test",
+			expr:        `aegisedge_lifecycle_test_metric{alert_family="unrelated",alert_type="warning"} == 1`,
+			forDuration: "4s",
+			severity:    "warning",
+			tier:        "integration-test",
 		},
 	}
+
+	seenRules := make(map[string]bool)
 
 	for _, rule := range group.Rules {
 		expected, exists := expectedRules[rule.Alert]
@@ -873,9 +883,26 @@ func TestLifecycleAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
 			t.Errorf("unexpected rule in lifecycle test rules: %s", rule.Alert)
 			continue
 		}
+		if seenRules[rule.Alert] {
+			t.Errorf("duplicate rule in lifecycle test rules: %s", rule.Alert)
+			continue
+		}
+		seenRules[rule.Alert] = true
 
-		if rule.Expr != expected.expr {
+		if strings.TrimSpace(rule.Expr) != expected.expr {
 			t.Errorf("rule %s expr mismatch:\nexpected: %s\ngot:      %s", rule.Alert, expected.expr, rule.Expr)
+		}
+
+		if rule.For == "" {
+			t.Errorf("rule %s has empty 'for' duration", rule.Alert)
+		} else {
+			dur, err := time.ParseDuration(rule.For)
+			if err != nil || dur <= 0 {
+				t.Errorf("rule %s has invalid 'for' duration %q: %v", rule.Alert, rule.For, err)
+			}
+			if rule.For != expected.forDuration {
+				t.Errorf("rule %s 'for' duration mismatch: expected %q, got %q", rule.Alert, expected.forDuration, rule.For)
+			}
 		}
 
 		if rule.Labels["severity"] != expected.severity {
@@ -884,6 +911,19 @@ func TestLifecycleAlertRules_YAMLUnmarshalAndSchema(t *testing.T) {
 
 		if rule.Labels["tier"] != expected.tier {
 			t.Errorf("rule %s tier mismatch: expected %q, got %q", rule.Alert, expected.tier, rule.Labels["tier"])
+		}
+
+		if strings.TrimSpace(rule.Annotations["summary"]) == "" {
+			t.Errorf("rule %s has empty summary annotation", rule.Alert)
+		}
+		if strings.TrimSpace(rule.Annotations["description"]) == "" {
+			t.Errorf("rule %s has empty description annotation", rule.Alert)
+		}
+	}
+
+	for expectedName := range expectedRules {
+		if !seenRules[expectedName] {
+			t.Errorf("expected lifecycle rule %q was not found in parsed YAML", expectedName)
 		}
 	}
 }
@@ -927,6 +967,14 @@ func TestAlertRules_PromtoolCheck(t *testing.T) {
 	}
 	t.Logf("promtool check rules succeeded:\n%s", string(outRules))
 
+	lifecycleRulePath := filepath.Join("..", "..", "..", "infra", "prometheus", "alert_rules_lifecycle_test.yml")
+	cmdLifecycleRules := exec.Command(promtoolPath, "check", "rules", lifecycleRulePath)
+	outLifecycleRules, err := cmdLifecycleRules.CombinedOutput()
+	if err != nil {
+		t.Fatalf("promtool check rules (lifecycle test) failed: %v\nOutput: %s", err, string(outLifecycleRules))
+	}
+	t.Logf("promtool check rules (lifecycle test) succeeded:\n%s", string(outLifecycleRules))
+
 	cfgPath := filepath.Join("..", "..", "..", "infra", "prometheus", "prometheus.yml")
 	cmdCfg := exec.Command(promtoolPath, "check", "config", cfgPath)
 	outCfg, err := cmdCfg.CombinedOutput()
@@ -943,6 +991,14 @@ func TestAlertRules_PromtoolCheck(t *testing.T) {
 	}
 	t.Logf("promtool check config (docker) succeeded:\n%s", string(outDockerCfg))
 
+	testCfgPath := filepath.Join("..", "..", "..", "infra", "prometheus", "prometheus.test.yml")
+	cmdTestCfg := exec.Command(promtoolPath, "check", "config", testCfgPath)
+	outTestCfg, err := cmdTestCfg.CombinedOutput()
+	if err != nil {
+		t.Fatalf("promtool check config (test) failed: %v\nOutput: %s", err, string(outTestCfg))
+	}
+	t.Logf("promtool check config (test) succeeded:\n%s", string(outTestCfg))
+
 	testRulesPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alert_rules_test.yml")
 	cmdTestRules := exec.Command(promtoolPath, "test", "rules", testRulesPath)
 	outTestRules, err := cmdTestRules.CombinedOutput()
@@ -950,4 +1006,31 @@ func TestAlertRules_PromtoolCheck(t *testing.T) {
 		t.Fatalf("promtool test rules failed: %v\nOutput: %s", err, string(outTestRules))
 	}
 	t.Logf("promtool test rules succeeded:\n%s", string(outTestRules))
+}
+
+// TestAlertmanager_AmtoolCheck runs 'amtool check-config' for production and test Alertmanager
+// configurations if the amtool binary is available on PATH.
+// If missing, it explicitly marks the test skipped.
+func TestAlertmanager_AmtoolCheck(t *testing.T) {
+	amtoolPath, err := exec.LookPath("amtool")
+	if err != nil {
+		t.Skip("amtool binary not found on PATH; skipping CLI validation (run 'amtool check-config infra/prometheus/alertmanager.yml')")
+		return
+	}
+
+	prodCfgPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alertmanager.yml")
+	cmdProd := exec.Command(amtoolPath, "check-config", prodCfgPath)
+	outProd, err := cmdProd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amtool check-config failed: %v\nOutput: %s", err, string(outProd))
+	}
+	t.Logf("amtool check-config succeeded:\n%s", string(outProd))
+
+	testCfgPath := filepath.Join("..", "..", "..", "infra", "prometheus", "alertmanager.test.yml")
+	cmdTest := exec.Command(amtoolPath, "check-config", testCfgPath)
+	outTest, err := cmdTest.CombinedOutput()
+	if err != nil {
+		t.Fatalf("amtool check-config (test) failed: %v\nOutput: %s", err, string(outTest))
+	}
+	t.Logf("amtool check-config (test) succeeded:\n%s", string(outTest))
 }
