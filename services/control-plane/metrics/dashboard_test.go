@@ -29,6 +29,7 @@ type GrafanaPanel struct {
 	Type        string          `json:"type"`
 	Description string          `json:"description"`
 	Targets     []GrafanaTarget `json:"targets"`
+	Panels      []GrafanaPanel  `json:"panels,omitempty"`
 	GridPos     struct {
 		H int `json:"h"`
 		W int `json:"w"`
@@ -115,8 +116,12 @@ func TestGrafanaDashboard_JSONSchemaAndMetrics(t *testing.T) {
 	if dash.SchemaVersion < 38 {
 		t.Errorf("expected schemaVersion >= 38, got %d", dash.SchemaVersion)
 	}
-	if len(dash.Panels) != 20 {
-		t.Fatalf("expected exactly 20 panels, got %d", len(dash.Panels))
+	totalPanels := len(dash.Panels)
+	for _, p := range dash.Panels {
+		totalPanels += len(p.Panels)
+	}
+	if totalPanels != 20 {
+		t.Fatalf("expected exactly 20 panels (including nested panels), got %d (top-level: %d)", totalPanels, len(dash.Panels))
 	}
 
 	seenPanelIDs := make(map[int]string)
@@ -147,7 +152,15 @@ func TestGrafanaDashboard_JSONSchemaAndMetrics(t *testing.T) {
 		"severity": true, "special": true, "table": true, "or": true,
 	}
 
+	var allPanels []GrafanaPanel
 	for _, p := range dash.Panels {
+		allPanels = append(allPanels, p)
+		for _, np := range p.Panels {
+			allPanels = append(allPanels, np)
+		}
+	}
+
+	for _, p := range allPanels {
 		if p.ID <= 0 {
 			t.Errorf("panel has non-positive ID: %d (title: %q)", p.ID, p.Title)
 		}
