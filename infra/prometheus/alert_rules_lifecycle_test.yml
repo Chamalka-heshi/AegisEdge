@@ -7,7 +7,7 @@ groups:
     interval: 2s
     rules:
       - alert: AegisEdgeE2ELifecycleWarning
-        expr: (aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning"} == 1) or (aegisedge_lifecycle_test_metric == 1)
+        expr: (aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 1)
         for: 4s
         labels:
           severity: warning
@@ -17,7 +17,7 @@ groups:
           description: "Integration test alert for Prometheus -> Alertmanager -> webhook delivery"
 
       - alert: AegisEdgeE2ELifecycleCritical
-        expr: (aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical"} == 1) or (aegisedge_lifecycle_test_metric == 2)
+        expr: (aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical"} == 1) or (aegisedge_lifecycle_test_metric{alert_family="",alert_type=""} == 2)
         for: 4s
         labels:
           severity: critical
