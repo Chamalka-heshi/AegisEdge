@@ -1549,7 +1549,7 @@ Verified Lifecycle Steps & Scenarios:
    - Teardown errors are accumulated without terminating `Write-Error` calls under `$ErrorActionPreference = "Stop"`.
    - Strict production restoration assertions require:
      - Prometheus readiness returns HTTP 200 (`/-/ready`).
-     - Production alert rules are loaded (7 rules in `aegisedge-quarantine-and-nats`).
+     - Production alert rules are loaded (11 rules in `aegisedge-quarantine-and-nats`).
      - Lifecycle test rule group is absent (`aegisedge-lifecycle-test`).
      - Lifecycle test scrape target is absent (`aegisedge-lifecycle-test`).
      - Production Control Plane scrape target (`aegisedge-control-plane`) exists and is verified healthy (`health=up`).
@@ -1601,146 +1601,225 @@ The test webhook receiver (`services/control-plane/cmd/webhook-receiver`) enforc
 
 ## 16. Stage 6.31B.16: Alertmanager Inhibition Rules, Notification Security & Observability Meta-Monitoring
 
-Stage 6.31B.16 strengthens the AegisEdge alert notification architecture across five core pillars:
-1. **Alertmanager Production & Test Isolation**: Zero network failures in local development via `local-development-sink`, while authenticated outbound delivery is verified in an isolated test stack (`alertmanager.test.yml`).
-2. **Alert Inhibition Matrix**: Deduplication and alert noise reduction suppressing corresponding warning alerts when higher-severity critical alerts fire for the same incident scope (`equal: ["job", "instance"]`).
-3. **Secret Lifecycle & Bearer Authentication**: Ephemeral token generation with CSPRNG, strict Windows user SID ACLs, Docker Desktop read-only bind mounts, and secure zero-byte destruction.
-4. **Observability Meta-Monitoring**: Self-monitoring rules covering Alertmanager daemon availability, scrape target health, notification dispatch errors, and Prometheus pipeline errors.
-5. **Operational Dashboard Expansion**: 20 comprehensive Grafana operational panels with meta-monitoring telemetry and direct alert triage runbooks.
+Stage 6.31B.16 establishes a hardened, isolated, and verified alerting architecture across five core pillars:
+1. **Production & Test Isolation**: Zero outbound network errors in local development via `local-development-sink`, while authenticated delivery is strictly verified in an isolated test stack (`alertmanager.test.yml`).
+2. **Alert Inhibition Matrix**: Dedicated inhibition rules suppressing corresponding warning alerts when higher-severity critical alerts fire for the same incident scope (`equal: ["job", "instance"]`).
+3. **Secret Lifecycle & Bearer Authentication**: Ephemeral token generation with CSPRNG, strict Windows user SID ACLs, Docker Desktop read-only bind mounts, and protected teardown lifecycle.
+4. **Observability Meta-Monitoring**: 11 production alert rules covering quarantine backlog, storage probes, NATS recovery queue, daemon availability, scrape target health, and pipeline delivery errors.
+5. **Operational Dashboard Synchronization**: 20 synchronized Grafana operational panels with meta-monitoring telemetry and direct alert triage runbooks.
 
 ---
 
 ### 16.1 Production vs Test Alertmanager Isolation
 
-To guarantee that local development stacks never generate outbound webhook errors while maintaining end-to-end testability:
+To guarantee that local development environments never generate outbound webhook errors while maintaining end-to-end integration testability, Alertmanager configurations are partitioned into two strictly isolated environments:
 
 - **Production Configuration (`infra/prometheus/alertmanager.yml`)**:
-  - Uses receiver `local-development-sink` with an empty config block (`webhook_configs: []`).
-  - All alerts route to this sink without generating external network traffic or dial failures.
-  - `alertmanager_notifications_failed_total` remains strictly zero during local development.
-  - Production inhibition rules apply strictly to production alerts.
-- **Test Configuration (`infra/prometheus/alertmanager.test.yml`)**:
-  - Standalone, self-contained configuration overriding the base Alertmanager container in `docker-compose.test.yml`.
-  - Routes alerts to `http://webhook-receiver:9095` across three distinct receivers: `warning-receiver` (`/alerts/warning`), `critical-receiver` (`/alerts/critical`), and `default-receiver` (`/alerts/default`).
+  - Root route directs all alerts to receiver `local-development-sink`.
+  - Configured with empty webhook integrations (`webhook_configs: []`).
+  - Alerts are evaluated, grouped, and resolved entirely in memory with zero external network traffic, dial failures, or authentication token requirements.
+  - Metric `alertmanager_notifications_failed_total` remains strictly zero during local development.
+  - Contains only genuine production inhibition rules (`QuarantineActiveBacklogCritical` $\to$ `QuarantineActiveBacklogHigh` and `NATSPendingRecoveryAccumulationCritical` $\to$ `NATSPendingRecoveryAccumulationWarning`).
+- **Integration Test Configuration (`infra/prometheus/alertmanager.test.yml`)**:
+  - Independent, self-contained configuration mounted into the test Alertmanager container via `docker-compose.test.yml`.
+  - Routes alerts to the ephemeral test webhook receiver (`http://webhook-receiver:9095`) across three dedicated endpoints:
+    - Critical alerts route to `critical-receiver` (`http://webhook-receiver:9095/alerts/critical`).
+    - Warning alerts route to `warning-receiver` (`http://webhook-receiver:9095/alerts/warning`).
+    - Unmatched severities fall back to root `default-receiver` (`http://webhook-receiver:9095/alerts/default`).
   - Authenticates outbound deliveries via `http_config.bearer_token_file: /etc/alertmanager/secrets/test_token`.
-  - `group_by` includes `test_run_id` to strictly isolate parallel or sequential test runs.
-  - Synthetic test inhibition rule `AegisEdgeE2ELifecycleCritical` $\to$ `AegisEdgeE2ELifecycleWarning` is isolated to test configurations and never leaked to production.
+  - Route grouping explicitly includes `test_run_id` in `group_by: ["alertname", "severity", "job", "tier", "test_run_id"]` with accelerated timing (`group_wait: 2s`, `group_interval: 5s`, `repeat_interval: 1h`) to strictly prevent cross-run alert batching and notification bleeding.
+  - Contains the isolated synthetic test inhibition rule (`AegisEdgeE2ELifecycleCritical` $\to$ `AegisEdgeE2ELifecycleWarning` with `equal: ["job", "tier", "test_run_id"]`).
 
 ---
 
 ### 16.2 Alertmanager Inhibition Matrix
 
-Inhibition rules prevent cascade alerting when a critical failure subsumes related warning thresholds.
+Inhibition rules prevent alert fatigue and notification storms by suppressing subordinate warning alerts when a subsuming critical alert has fired for the exact same incident scope.
 
-#### Production Inhibition Rules
+#### Production Inhibition Rules (`infra/prometheus/alertmanager.yml`)
 
-| Source Alert (Critical) | Target Alert (Warning) | Shared Scope (`equal`) | Rationale |
+The production configuration defines two exact inhibition rules scoped by `equal: ["job", "instance"]`:
+
+| Source Alert (Critical) | Target Alert (Warning) | Shared Scope (`equal`) | Architectural Rationale |
 | :--- | :--- | :--- | :--- |
-| `AegisEdgeQuarantineCriticalSpike` (`severity: critical`) | `AegisEdgeQuarantineWarningSpike` (`severity: warning`) | `["job", "instance"]` | When quarantine rate exceeds critical threshold (5/min), warning alert (1/min) is redundant. Scoped by instance to avoid suppressing warnings on other nodes. |
-| `AegisEdgeNATSSyncServiceCritical` (`severity: critical`) | `AegisEdgeNATSSyncFailures` (`severity: warning`) | `["job", "instance"]` | When NATS sync service has completely stalled or failed critically, transient sync error warnings on the same instance are suppressed. |
+| `QuarantineActiveBacklogCritical`<br>(`severity: critical`) | `QuarantineActiveBacklogHigh`<br>(`severity: warning`) | `["job", "instance"]` | When durable quarantine backlog exceeds 500 records on an instance, the lower-severity warning threshold (> 100 records) is redundant. Suppressed on that instance to prevent duplicate incident notifications. |
+| `NATSPendingRecoveryAccumulationCritical`<br>(`severity: critical`) | `NATSPendingRecoveryAccumulationWarning`<br>(`severity: warning`) | `["job", "instance"]` | When in-memory recovery items exceed 20 records on an instance, the lower-severity warning threshold (> 0 records) is subsumed. Suppressed on that instance while critical recovery backlog is actively triaged. |
 
 > [!IMPORTANT]
-> Scoping inhibition with `equal: ["job", "instance"]` is essential. Without label equality matching, a critical alert on node A would globally suppress legitimate warning alerts on node B.
+> The equality constraint `equal: ["job", "instance"]` is mandatory. Without strict equality matching on shared incident labels, a critical alert on one instance would globally suppress legitimate warning alerts on other instances across the fleet.
 
-#### Test Inhibition Rule
+#### Test Inhibition Rule (`infra/prometheus/alertmanager.test.yml`)
 
-| Source Alert (Critical) | Target Alert (Warning) | Shared Scope (`equal`) | Environment |
+The test configuration retains both production inhibition rules and adds an isolated synthetic rule for integration testing:
+
+| Source Alert (Critical) | Target Alert (Warning) | Shared Scope (`equal`) | Environment & Scope |
 | :--- | :--- | :--- | :--- |
-| `AegisEdgeE2ELifecycleCritical` | `AegisEdgeE2ELifecycleWarning` | `["job", "tier", "test_run_id"]` | Isolated to `alertmanager.test.yml` for integration testing. |
+| `AegisEdgeE2ELifecycleCritical`<br>(`severity: critical`) | `AegisEdgeE2ELifecycleWarning`<br>(`severity: warning`) | `["job", "tier", "test_run_id"]` | Isolated strictly to `alertmanager.test.yml`. Scoped by `test_run_id` to guarantee cross-test run isolation without ever appearing in production configurations. |
 
 ---
 
 ### 16.3 Ephemeral Secret Management & Token Lifecycle
 
-Outbound webhook notifications and receiver control endpoints are protected with ephemeral Bearer tokens generated per test run:
+Outbound webhook notifications and receiver management endpoints are protected with ephemeral Bearer tokens generated per test execution:
 
-1. **Token Generation**:
-   - 32 CSPRNG random bytes via `System.Security.Cryptography.RandomNumberGenerator`.
-   - Encoded as a URL-safe Base64 string with padding removed (exactly 43 ASCII characters).
-   - Written as raw ASCII bytes without UTF-8 BOM and without trailing newline characters (`infra/prometheus/.test_secret/token`).
-2. **Access Control (Windows Host)**:
-   - Restrictive ACL applied using current user SID: `icacls.exe "$secretFile" /inheritance:r /grant:r "*${userSid}:(R)"`.
-   - Directory `infra/prometheus/.test_secret/` is included in `.gitignore` to prevent secret commits.
-3. **Container Mounts & Verification**:
-   - Mounted into Alertmanager (`/etc/alertmanager/secrets/test_token:ro`) and Webhook Receiver (`/etc/webhook-receiver/secrets/token:ro`).
-   - Read-only enforcement verified at container launch via `docker exec ... touch /etc/.../token 2>&1`, asserting `Read-only file system`.
-4. **Endpoint Protection**:
+1. **Cryptographic Token Generation**:
+   - Generated using 32 cryptographically secure pseudo-random bytes via `System.Security.Cryptography.RandomNumberGenerator`.
+   - Formatted as URL-safe Base64 with padding stripped (exactly 43 ASCII characters).
+   - Written directly as raw ASCII bytes (`[System.Text.Encoding]::ASCII`) without a UTF-8 Byte Order Mark (BOM) and without trailing newline characters (`infra/prometheus/.test_secret/token`).
+2. **Strict Host Access Control (Windows SID ACL)**:
+   - File and directory permissions are restricted to the executing user's Security Identifier (SID):
+     ```cmd
+     icacls.exe "infra\prometheus\.test_secret\token" /inheritance:r /grant:r "*<UserSID>:(R)"
+     ```
+   - The directory `infra/prometheus/.test_secret/` is excluded by `.gitignore` to prevent ephemeral credentials from being tracked.
+3. **Container Bind Mounts & Read-Only Verification**:
+   - Mounted read-only into Alertmanager (`/etc/alertmanager/secrets/test_token:ro`) and Webhook Receiver (`/etc/webhook-receiver/secrets/token:ro`).
+   - Read-only enforcement is verified upon receiver container launch by executing `docker exec ... touch /etc/webhook-receiver/secrets/token` and asserting `Read-only file system`.
+4. **Endpoint Protection Boundaries**:
    - `/alerts/*` (webhook delivery): Requires valid `Authorization: Bearer <token>`.
    - `/api/events`: Requires valid Bearer token.
    - `/api/trigger` & `/api/trigger/inhibition`: Requires valid Bearer token.
    - `/test-metrics`: Unauthenticated (Prometheus scrape endpoint).
-   - `/health`: Unauthenticated.
-5. **Secure Teardown**:
-   - Secret file is overwritten with zero bytes matching the file length prior to deletion.
-   - Host file and directory are cleanly deleted during teardown.
+   - `/health`: Unauthenticated (readiness probe).
+5. **Protected Cleanup Lifecycle & Removal Verification**:
+   - Token creation and directory preparation are executed inside the outer `try ... finally` lifecycle block (`$secretFileAttempted = $true`). If token generation or file writing fails midway, cleanup is guaranteed.
+   - During teardown (`Invoke-CleanupResources`):
+     - Best-effort zero-byte overwrite matching the token file length is attempted prior to deletion.
+     - Removal is executed via `Remove-Item -Force` without error suppression.
+     - Physical absence is explicitly verified on disk: `Test-Path $secretFile` and `Test-Path $secretDir` add errors to `$cleanupErrors` if any residual files exist.
+   - The failure-injection suite (`scripts/test-cleanup-failure-injection.ps1`) includes `fail-secret-creation` (Scenario 7) and `fail-secret-cleanup` (Scenario 8 with `-ExpectLeakedSecret`) to verify leak detection and cleanup reporting.
+
+> [!CAUTION]
+> **Storage Media Erasure Limitations**: While zero-byte overwriting clears plaintext residual data from operating system file cache buffers, it **cannot** guarantee physical or cryptographic erasure on solid-state drives (SSDs) governed by wear-leveling controllers, copy-on-write (CoW) filesystems, volume snapshots, or storage backups.
 
 ---
 
 ### 16.4 Observability Meta-Monitoring Alert Rules & Runbooks
 
-The AegisEdge alerting ruleset (`infra/prometheus/alert_rules.yml`) includes 11 production rules. Every rule is annotated with a direct `runbook_url` pointing to this document and `dashboard_url` pointing to Grafana:
+The production Prometheus alerting ruleset (`infra/prometheus/alert_rules.yml`) defines 11 production rules in group `aegisedge-quarantine-and-nats`. Every rule is annotated with a direct `runbook_url` pointing to this document and `dashboard_url` pointing to Grafana:
 
 #### Production Alert Inventory
 
-1. **`AegisEdgeHighQuarantineRate`** (`severity: warning`):
-   - *Trigger*: Quarantine rate > 0.05 batches/sec (3/min) for 2 minutes.
-   - *Triage*: Inspect quarantine reason breakdown in Panel 7. Run `aegisedge-agent quarantine list` to inspect recent failures.
-2. **`AegisEdgeQuarantineWarningSpike`** (`severity: warning`):
-   - *Trigger*: Quarantine rate > 0.0167 batches/sec (1/min) for 1 minute.
-   - *Triage*: Identify failing node ID and verify network/HTTP client payload sizes. Inhibited if `AegisEdgeQuarantineCriticalSpike` fires.
-3. **`AegisEdgeQuarantineCriticalSpike`** (`severity: critical`):
-   - *Trigger*: Quarantine rate > 0.0833 batches/sec (5/min) for 30 seconds.
-   - *Triage*: Immediate head-of-line unblocking check. Check control plane log for schema rejection or validation bugs.
-4. **`AegisEdgeNATSSyncFailures`** (`severity: warning`):
-   - *Trigger*: NATS sync failures > 0.05 failures/sec for 2 minutes.
-   - *Triage*: Check NATS connection count and subject permissions. Inhibited if `AegisEdgeNATSSyncServiceCritical` fires.
-5. **`AegisEdgeNATSSyncServiceCritical`** (`severity: critical`):
-   - *Trigger*: NATS sync failures > 0.2 failures/sec for 1 minute.
-   - *Triage*: Inspect NATS JetStream server container logs and broker cluster health.
-6. **`AegisEdgeHighMemoryConsumption`** (`severity: warning`):
-   - *Trigger*: Memory usage > 500 MiB for 5 minutes.
-   - *Triage*: Check edge agent heap usage and in-memory batch queues.
-7. **`AegisEdgeWALCheckpointErrors`** (`severity: warning`):
-   - *Trigger*: SQLite WAL checkpoint error rate > 0 for 1 minute.
-   - *Triage*: Check edge node disk space, SQLite database file lock contention, and WAL file size.
-8. **`AlertmanagerDown`** (`severity: critical`):
-   - *Trigger*: `up{job="aegisedge-alertmanager"} == 0` for 1 minute.
-   - *Triage*: Inspect Alertmanager container `aegisedge-alertmanager`. Verify process status and port 9093 binding.
-9. **`ControlPlaneScrapeTargetDown`** (`severity: critical`):
-   - *Trigger*: `up{job="aegisedge-control-plane"} == 0` for 1 minute.
-   - *Triage*: Inspect AegisEdge control-plane server process on port 8080. Check `/metrics` endpoint accessibility.
-10. **`AlertmanagerNotificationFailures`** (`severity: warning`):
-    - *Trigger*: `rate(alertmanager_notifications_failed_total[2m]) > 0` for 1 minute.
-    - *Triage*: Inspect destination webhook endpoint health, network routing, and authentication credentials.
-11. **`PrometheusAlertmanagerNotificationErrors`** (`severity: warning`):
-    - *Trigger*: `rate(prometheus_notifications_errors_total[2m]) > 0` for 1 minute.
-    - *Triage*: Check Prometheus to Alertmanager communication (`:9093`). Verify network connectivity and Alertmanager discovery.
+| Alert Name | Severity | PromQL Expression | Duration (`for`) | Summary & Triage Guidance |
+| :--- | :--- | :--- | :--- | :--- |
+| **`QuarantineActiveBacklogHigh`** | `warning` | `aegisedge_quarantine_active_records > 100` | `5m` | **Elevated active telemetry quarantine backlog**.<br>Active durable quarantine backlog is > 100 records for 5m. Inspect quarantined payloads via `GET /api/v1/telemetry/quarantine`. Inhibited if `QuarantineActiveBacklogCritical` fires for the same instance. |
+| **`QuarantineActiveBacklogCritical`** | `critical` | `aegisedge_quarantine_active_records > 500` | `5m` | **Critically high active telemetry quarantine backlog**.<br>Backlog has reached > 500 records for 5m. High volume of invalid or corrupted edge telemetry requires immediate triage. Check control plane logs for schema rejection or validation issues. |
+| **`QuarantineActiveCountStorageFailure`** | `critical` | `aegisedge_quarantine_active_records != aegisedge_quarantine_active_records` | `2m` | **Quarantine active records query failing (NaN emitted)**.<br>The control plane quarantine count query has returned IEEE 754 NaN for > 2m. SQLite storage query timed out (> 2s) or encountered database errors. Check SQLite file locks and storage health. |
+| **`QuarantineActiveMetricMissing`** | `critical` | `absent(aegisedge_quarantine_active_records)` | `5m` | **Active quarantine records metric is absent**.<br>Metric is absent from Prometheus scrape targets for 5m. Control plane process may be down, unreachable, or failing to register metrics. Verify process health and Prometheus scrape targets. |
+| **`NATSPendingRecoveryAccumulationWarning`** | `warning` | `aegisedge_nats_pending_recovery_items > 0` | `5m` | **NATS consumer has persistent pending recovery items**.<br>NATS JetStream consumer has exhausted messages in process-local memory awaiting quarantine persistence for > 5m. Inhibited if `NATSPendingRecoveryAccumulationCritical` fires for the same instance. |
+| **`NATSPendingRecoveryAccumulationCritical`** | `critical` | `aegisedge_nats_pending_recovery_items > 20` | `5m` | **NATS consumer pending recovery accumulation is critically high**.<br>In-memory recovery queue has > 20 items for 5m. Quarantine persistence may be failing or severely throttled. Inspect storage write latencies and database contention. |
+| **`NATSHighMessageTerminationRate`** | `warning` | `increase(aegisedge_nats_terminated_messages_total[5m]) > 10` | `2m` | **High rate of permanent NATS message terminations**.<br>NATS consumer terminated > 10 poisoned messages over 5m (evaluated for 2m). Investigate edge producer telemetry validity and quarantine error reasons. |
+| **`AlertmanagerDown`** | `critical` | `(up{job="aegisedge-alertmanager"} == 0) or (absent(up{job="aegisedge-alertmanager"}) == 1)` | `1m` | **Alertmanager service is unreachable or scrape target missing**.<br>Prometheus cannot scrape Alertmanager at job `aegisedge-alertmanager` for 1m. Outbound notification dispatch and alerting suppression are compromised. Inspect container status and port 9093 binding. |
+| **`ControlPlaneScrapeTargetDown`** | `critical` | `(up{job="aegisedge-control-plane"} == 0) or (absent(up{job="aegisedge-control-plane"}) == 1)` | `1m` | **Control plane service is unreachable or scrape target missing**.<br>Prometheus cannot scrape control plane at job `aegisedge-control-plane` for 1m. Ingestion and telemetry persistence may be down. Check control plane process and port 8080 accessibility. |
+| **`AlertmanagerNotificationFailures`** | `warning` | `rate(alertmanager_notifications_failed_total[5m]) > 0` | `2m` | **Alertmanager notification deliveries are failing**.<br>Alertmanager failed to deliver notifications to configured receivers over 5m (rate > 0 for 2m). Webhook targets may be rejecting payloads or timing out. Inspect receiver health and credentials. |
+| **`PrometheusAlertmanagerNotificationErrors`** | `critical` | `rate(prometheus_notifications_errors_total[5m]) > 0` | `2m` | **Prometheus is encountering errors sending alerts to Alertmanager**.<br>Prometheus failed to communicate with Alertmanager via `/api/v2/alerts` (rate > 0 for 2m). Network partition or Alertmanager API rejection detected. Check network routing and Alertmanager API availability. |
 
 ---
 
-### 16.5 Operational Dashboard Panels (17–20)
+### 16.5 Operational Dashboard Inventory & Panel Structure
 
-The Grafana dashboard (`telemetry_and_recovery_operations.json`) provides 20 synchronized panels:
-- **Panel 17**: `Prometheus Scrape Health` (Stat) — Displays target health (`up`) for `aegisedge-control-plane`, `aegisedge-alertmanager`, and `aegisedge-prometheus`.
-- **Panel 18**: `Alertmanager Notifications Total` (Time Series) — Tracks total dispatched notifications by integration and receiver.
-- **Panel 19**: `Alertmanager Notification Failures` (Time Series) — Tracks failed notification attempts with alert threshold at 0.
-- **Panel 20**: `Prometheus Notification Errors` (Time Series) — Tracks communication errors between Prometheus and Alertmanager.
+The Grafana operational dashboard (`infra/prometheus/grafana/dashboards/telemetry_and_recovery_operations.json`, UID `aegisedge-telemetry-recovery`) provides 20 synchronized panels arranged across 4 logical operational rows:
+
+| Panel ID | Panel Title | Panel Type | Target PromQL Expression(s) | Operational Purpose |
+| :---: | :--- | :---: | :--- | :--- |
+| **1** | `Monitoring Health` | `row` | *(Header row)* | Groups foundational scraping and health panels. |
+| **2** | `Control Plane Scrape Target (up)` | `stat` | `up{job="aegisedge-control-plane"}` | Instant scrape health of control plane (:8080/metrics). |
+| **3** | `Telemetry Ingestion Rate` | `timeseries` | `rate(aegisedge_batches_ingested_total[5m])` | 5m telemetry ingestion rate (batches/sec). |
+| **4** | `Storage Probe Failures` | `stat` | `sum(aegisedge_storage_probe_failures_total)` | Total storage probe read/write errors. |
+| **5** | `Quarantine Operations` | `row` | *(Header row)* | Groups quarantine volume and lifecycle panels. |
+| **6** | `Active Quarantine Records` | `gauge` | `aegisedge_quarantine_active_records` | Current backlog count of unpruned quarantined records. |
+| **7** | `Active Quarantine Trend (Backlog Progression)` | `timeseries` | `aegisedge_quarantine_active_records` | Quarantine backlog accumulation over time. |
+| **8** | `Quarantine Storage Health (NaN Check)` | `stat` | `aegisedge_quarantine_active_records != aegisedge_quarantine_active_records` | Emits NaN alert if SQLite count query fails or times out. |
+| **9** | `Quarantine Discard vs Replay Resolution Rate` | `timeseries` | `rate(aegisedge_quarantine_replays_total[5m])`<br>`rate(aegisedge_quarantine_discards_total[5m])` | Compares resolution rates between operator requeues and discards. |
+| **10** | `NATS Recovery Operations` | `row` | *(Header row)* | Groups NATS JetStream consumer recovery metrics. |
+| **11** | `NATS Pending Recovery Queue` | `gauge` | `aegisedge_nats_pending_recovery_items` | Current unpersisted recovery queue count. |
+| **12** | `NATS Pending Recovery Backlog Trend` | `timeseries` | `aegisedge_nats_pending_recovery_items` | NATS recovery backlog progression over time. |
+| **13** | `Terminated Poison Messages (Total)` | `stat` | `aegisedge_nats_terminated_messages_total` | Cumulative total of permanently discarded poison messages. |
+| **14** | `Message Termination Rate (5m Increase)` | `timeseries` | `increase(aegisedge_nats_terminated_messages_total[5m])` | 5m window termination volume to detect poisoned batch bursts. |
+| **15** | `Operational Alerts Status` | `row` | *(Header row)* | Groups active alerts and meta-monitoring panels. |
+| **16** | `Active AegisEdge Quarantine & NATS Alerts` | `table` | `ALERTS{alertname=~"Quarantine.*|NATS.*"}` | Active alert firing/pending status table. |
+| **17** | `Alertmanager Target Status` | `stat` | `up{job="aegisedge-alertmanager"}` | Instant scrape health of Alertmanager (:9093/metrics). |
+| **18** | `Prometheus to Alertmanager Error Rate` | `timeseries` | `rate(prometheus_notifications_errors_total[5m])` | Communication error rate from Prometheus to Alertmanager. |
+| **19** | `Alertmanager Notification Dispatch Rate` | `timeseries` | `sum by (receiver) (rate(alertmanager_notifications_total[5m]))` | Outbound dispatch rate grouped by receiver. |
+| **20** | `Alertmanager Notification Failure Rate` | `stat` | `sum(rate(alertmanager_notifications_failed_total[5m]))` | Total outbound notification failure rate across all receivers. |
+
+> [!WARNING]
+> **Operational Boundary of Notification Metrics (Panels 19–20)**:
+> The metrics `alertmanager_notifications_total` and `alertmanager_notifications_failed_total` record **only the HTTP transport outcome** between the Alertmanager server and the configured immediate webhook receiver endpoint.
+> **These metrics DO NOT establish**:
+> 1. That an upstream third-party operator notification provider (such as PagerDuty, Slack, Opsgenie, or an SMS gateway) successfully queued, formatted, or dispatched the message.
+> 2. That the notification was delivered to an on-call engineer's mobile device or desktop client.
+> 3. That a human operator acknowledged, read, or took action on the incident.
+> A value of 0 failures in Panel 20 proves only that the immediate webhook endpoint returned HTTP 2xx; end-to-end human acknowledgement must be tracked via external incident management systems.
 
 ---
 
-### 16.6 End-to-End Verification Scenarios (A through F)
+### 16.6 End-to-End Verification Scenarios & Failure-Injection Lifecycle
 
-The test runner [`scripts/test-alertmanager-lifecycle.ps1`](../../scripts/test-alertmanager-lifecycle.ps1) verifies the end-to-end alert pipeline:
-- **Scenario A**: Warning Alert Lifecycle (`Firing` $\to$ `Resolved`) with fingerprint correlation.
-- **Scenario B**: Critical Alert Routing to `/alerts/critical`.
-- **Scenario C**: Default Fallback Routing for unmatched alert severities.
-- **Scenario D**: Alert Grouping (batching 2 alert instances into a single webhook).
-- **Scenario E**: Alertmanager Restart Resilience (restarting daemon without losing routing or state).
-- **Scenario F**: Simultaneous Alert Inhibition & Independent Delivery:
-  - Simulates `AegisEdgeE2ELifecycleCritical`, `AegisEdgeE2ELifecycleWarning`, and `AegisEdgeE2EUnrelatedWarning` concurrently.
-  - Asserts Alertmanager API `/api/v2/alerts` marks `AegisEdgeE2ELifecycleWarning` as `inhibitedBy`.
-  - Verifies Webhook Receiver receives `AegisEdgeE2ELifecycleCritical` and `AegisEdgeE2EUnrelatedWarning`.
-  - Verifies `AegisEdgeE2ELifecycleWarning` is completely suppressed.
-- **Teardown & Cleanup Failure Injection**:
-  - Tests cleanup error aggregation across 6 simulated failure modes (`fail-test`, `fail-partial-receiver-startup`, `fail-receiver-cleanup`, `fail-compose-restore`, `fail-target-verify`, `fail-both`).
-  - Verifies 0 leaked containers, production Compose stack restoration, 11 production alert rules, and zero test mounts.
+The integration test runner [`scripts/test-alertmanager-lifecycle.ps1`](../../scripts/test-alertmanager-lifecycle.ps1) verifies alert routing, persistence, grouping, and inhibition across six scenarios (A through F):
+
+- **Scenario A: Warning Alert Lifecycle**:
+  - Triggers lifecycle warning metric; verifies firing notification on `/alerts/warning`.
+  - Resets metric; verifies resolved notification with valid timestamps (`endsAt > startsAt`) and fingerprint correlation.
+- **Scenario B: Critical Alert Routing**:
+  - Triggers lifecycle critical metric; verifies routing to `/alerts/critical` and asserts zero delivery to `/alerts/warning`.
+- **Scenario C: Default Fallback Routing**:
+  - Triggers unmatched severity alert (`severity: info`); verifies delivery to root receiver on `/alerts/default`.
+- **Scenario D: Multi-Instance Grouping**:
+  - Triggers 2 distinct alert instances with identical route labels; verifies that Alertmanager batches them into a single webhook payload (`alerts.Count == 2`).
+- **Scenario E: Restart Resilience**:
+  - Triggers critical alert, restarts Alertmanager container (`docker restart aegisedge-alertmanager`), and triggers recovery; verifies that post-restart resolved notifications are delivered without state corruption.
+- **Scenario F: Simultaneous Alert Inhibition & Independent Delivery**:
+  - Concurrently injects three distinct metric series for the same test run (`test_run_id`):
+    1. Warning series: `aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="warning"} = 1`
+    2. Critical series: `aegisedge_lifecycle_test_metric{alert_family="lifecycle",alert_type="critical"} = 1`
+    3. Unrelated warning series: `aegisedge_lifecycle_test_metric{alert_family="unrelated",alert_type="warning"} = 1`
+  - Asserts Alertmanager API state via `/api/v2/alerts`:
+    - `AegisEdgeE2ELifecycleCritical` is firing and uninhibited (`inhibitedBy: []`).
+    - `AegisEdgeE2ELifecycleWarning` is active in Prometheus, but Alertmanager marks it suppressed with `status.inhibitedBy` containing the exact fingerprint of `AegisEdgeE2ELifecycleCritical`.
+    - `AegisEdgeE2EUnrelatedWarning` is firing and remains uninhibited (`inhibitedBy: []`), verifying that inhibition is strictly scoped by `job`, `tier`, and `test_run_id` and avoids broad suppression.
+  - Asserts Webhook Receiver events:
+    - Critical receiver (`/alerts/critical`) receives `AegisEdgeE2ELifecycleCritical`.
+    - Warning receiver (`/alerts/warning`) receives `AegisEdgeE2EUnrelatedWarning`.
+    - Warning receiver receives zero notifications for the suppressed `AegisEdgeE2ELifecycleWarning`.
+  - Asserts Resolution & Fingerprint Correlation:
+    - Resets all test metrics to 0; polls `/api/events` for resolved notifications.
+    - Verifies resolved delivery for Critical on `/alerts/critical` with matching fingerprint.
+    - Verifies resolved delivery for Unrelated Warning on `/alerts/warning` with matching fingerprint.
+  - Asserts Negative Resolution Delivery:
+    - Asserts that NO resolved notification is delivered for `AegisEdgeE2ELifecycleWarning`. Because it was inhibited while firing, Alertmanager must not emit a false resolution event.
+
+#### Cleanup Failure-Injection Suite (`scripts/test-cleanup-failure-injection.ps1`)
+
+Exercises the teardown engine across 8 simulated failure modes:
+1. `fail-test`: Preserves test error while fully restoring production stack.
+2. `fail-partial-receiver-startup`: Safely cleans up receiver container created before launch failure.
+3. `fail-receiver-cleanup`: Verifies receiver removal error does not block Compose stack restoration.
+4. `fail-compose-restore`: Detects and reports Compose restoration failures.
+5. `fail-target-verify`: Reports failure if production control plane target is missing or unhealthy.
+6. `fail-both`: Preserves both test execution failure and teardown failure without masking either.
+7. `fail-secret-creation`: Verifies secret file and directory are cleanly removed if configuration aborts midway.
+8. `fail-secret-cleanup`: Verifies that secret removal failure is reported as a teardown error (tested with `-ExpectLeakedSecret` verifying file presence before suite cleanup).
+
+Every scenario directly verifies the Docker daemon (0 leftover receiver containers) and Prometheus REST APIs (HTTP 200, 11 production alert rules, 0 test rules, 0 test targets, control plane target UP, and 0 leaked secrets).
+
+---
+
+### 16.7 Verification Methodology and Runtime Limitations
+
+To ensure transparency and rigorous engineering standards, verification boundaries are categorized into four tiers:
+
+1. **Source-Level & AST Verification**:
+   - Syntactic and structural checks across all PowerShell scripts (`scripts/check.ps1`, `test-alertmanager-lifecycle.ps1`, `test-cleanup-failure-injection.ps1`) via `[System.Management.Automation.Language.Parser]::ParseFile`.
+   - Verified 100% syntactically valid with 0 AST errors.
+2. **Go Unit & Schema Tests**:
+   - Executed via `go test -v ./services/control-plane/metrics/...` (**PASS**, 4.29s).
+   - Validates Prometheus config YAML schema, Alertmanager production isolation (`local-development-sink`), test config schemas, 11 production alert rules, 4 lifecycle test alert rules, webhook payload unmarshalling, and the 20-panel Grafana dashboard structure.
+3. **Official Validator CLIs (`promtool` & `amtool`)**:
+   - `scripts/check.ps1` separates `promtool` and `amtool` checks and probes native binaries and Docker containers.
+   - *Current Host Status*: Native `promtool.exe` and `amtool.exe` are not installed on the Windows host `PATH`, and the local Docker daemon is stopped. Consequently, official CLI validations were **skipped with explicit warnings** as designed.
+   - Go YAML schema unit tests provide structural validation, but are explicitly documented as non-substitutes for official CLI validation.
+4. **Docker Integration Testing**:
+   - Full live execution of `test-alertmanager-lifecycle.ps1` and `test-cleanup-failure-injection.ps1` requires an active Docker Desktop engine.
+   - *Current Host Status*: Docker Desktop is stopped (`//./pipe/docker_engine` unreachable). Live container execution was **not run at runtime** and is honest-reported as requiring Docker Desktop to be started.
+
