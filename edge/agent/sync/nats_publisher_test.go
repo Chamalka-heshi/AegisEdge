@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -294,7 +295,7 @@ func TestNATSPublisher_PerNodeSequenceIntact(t *testing.T) {
 	}
 	defer publisher.Close()
 
-	prefix := time.Now().Format("150405000")
+	prefix := strconv.FormatInt(time.Now().UnixNano(), 10)
 	ctx := context.Background()
 
 	// Subscribe to capture messages
@@ -303,6 +304,10 @@ func TestNATSPublisher_PerNodeSequenceIntact(t *testing.T) {
 		t.Fatalf("subscribe failed: %v", err)
 	}
 	defer sub.Unsubscribe()
+
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("flush subscription failed: %v", err)
+	}
 
 	for seq := int64(0); seq < 3; seq++ {
 		batch := &types.TelemetryBatch{
