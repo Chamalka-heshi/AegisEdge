@@ -1,12 +1,25 @@
-# AegisEdge End-to-End Alertmanager Lifecycle Integration Test
+﻿# AegisEdge End-to-End Alertmanager Lifecycle Integration Test
 # Verifies: Prometheus -> Alertmanager -> Webhook Receiver complete lifecycle
-# Requirements: Docker Desktop running, Compose network prometheus_default
+# Requirements: Docker Desktop running, isolated network aegisedge_test_network
 
 param(
     [int]$TimeoutSeconds = 60,
     [ValidateSet("none", "fail-test", "fail-receiver-cleanup", "fail-compose-restore", "fail-target-verify", "fail-both", "fail-partial-receiver-startup", "fail-secret-creation", "fail-secret-cleanup")]
-    [string]$SimulateFailure = "none"
+    [string]$SimulateFailure = "none",
+    [switch]$Isolated = $true
 )
+
+if (-not $Isolated) {
+    Write-Error "Non-isolated execution is unsafe and disabled. This lifecycle script runs exclusively in isolated mode."
+    exit 1
+}
+
+$promPort = 19090
+$amPort = 19093
+$recvPort = 19095
+$amContainer = "aegisedge-test-alertmanager"
+$testNetwork = "aegisedge_test_network"
+$isolatedComposeFile = "infra/prometheus/docker-compose.isolated-test.yml"
 
 $ErrorActionPreference = "Stop"
 
@@ -35,7 +48,7 @@ $testError = $null
 $authHeaders = @{}
 
 function Invoke-CleanupResources {
-    Write-Host "`n==> Teardown: Restoring production Compose stack & cleaning test resources..." -ForegroundColor Cyan
+    Write-Host "`n==> Teardown: Stopping isolated test Compose stack & cleaning test resources..." -ForegroundColor Cyan
     $cleanupErrors = [System.Collections.Generic.List[string]]::new()
 
     # Step 1: Stop and remove temporary receiver container if launch was attempted and container exists
@@ -69,145 +82,42 @@ function Invoke-CleanupResources {
         Write-Host "  Temporary receiver container launch was not attempted (skipped removal)." -ForegroundColor Gray
     }
 
-    # Step 2: Restore production compose deployment (if test compose was attempted or started)
+    # Step 2: Stop isolated test Compose stack and remove test volumes
     if ($composeOverrideAttempted) {
         try {
             if ($SimulateFailure -eq "fail-compose-restore") {
-                $cleanupErrors.Add("[SIMULATED] Production Compose restoration failure")
-                Write-Host "  [SIMULATION] Injected Compose restore failure." -ForegroundColor Magenta
+                $cleanupErrors.Add("[SIMULATED] Isolated Compose teardown failure")
+                Write-Host "  [SIMULATION] Injected Compose teardown failure." -ForegroundColor Magenta
             }
 
-            docker compose -f infra/prometheus/docker-compose.yml up -d
+            docker compose -f $isolatedComposeFile down -v
             if ($LASTEXITCODE -ne 0) {
-                $cleanupErrors.Add("docker compose up -d failed with exit code ${LASTEXITCODE}")
+                $cleanupErrors.Add("docker compose down -v failed with exit code ${LASTEXITCODE}")
             } else {
-                Write-Host "  Production Compose stack restored (test mounts removed)." -ForegroundColor Green
+                Write-Host "  Isolated test Compose stack stopped and test volumes removed." -ForegroundColor Green
             }
         } catch {
-            $cleanupErrors.Add("Exception during production Compose restoration: $_")
+            $cleanupErrors.Add("Exception during isolated Compose teardown: $_")
         }
     }
 
-    # Step 3: Verify production stack state (Prometheus, targets, rules, alertmanager, receiver absence)
+    # Step 3: Verify isolated test containers and receiver are absent from Docker engine
     if ($composeOverrideAttempted) {
         try {
             if ($SimulateFailure -eq "fail-target-verify") {
-                $cleanupErrors.Add("[SIMULATED] Production Control Plane target verification failed")
-                Write-Host "  [SIMULATION] Injected target verification failure." -ForegroundColor Magenta
+                $cleanupErrors.Add("[SIMULATED] Isolated resource teardown verification failed")
+                Write-Host "  [SIMULATION] Injected teardown verification failure." -ForegroundColor Magenta
             }
 
-            $promHealthy = $false
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($sw.Elapsed.TotalSeconds -lt 30) {
-                try {
-                    $readyResp = Invoke-WebRequest -Uri "http://127.0.0.1:9090/-/ready" -UseBasicParsing -TimeoutSec 2
-                    if ($readyResp.StatusCode -eq 200) {
-                        $promHealthy = $true
-                        break
-                    }
-                } catch {
-                    Start-Sleep -Milliseconds 500
-                }
-            }
-
-            if (-not $promHealthy) {
-                $cleanupErrors.Add("Production Prometheus failed to become ready (HTTP 200) within 30s during teardown")
+            # Check that isolated test containers are completely absent
+            $lingeringContainers = cmd.exe /c "docker ps -a --filter name=^/(aegisedge-test-alertmanager|aegisedge-test-prometheus)$ --format {{.Names}}"
+            if (-not [string]::IsNullOrWhiteSpace($lingeringContainers)) {
+                $cleanupErrors.Add("Isolated test container(s) still present on Docker daemon: $lingeringContainers")
             } else {
-                Write-Host "  Production Prometheus readiness verified (HTTP 200)." -ForegroundColor Green
-
-                # Check production alert rules are loaded and test rule group is absent
-                $rules = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules" -TimeoutSec 5
-                $foundProdRules = $false
-                $foundTestGroup = $false
-                foreach ($g in $rules.data.groups) {
-                    if ($g.name -eq "aegisedge-quarantine-and-nats") {
-                        if ($g.rules.Count -eq 11) {
-                            $foundProdRules = $true
-                        } else {
-                            $cleanupErrors.Add("Production rule group 'aegisedge-quarantine-and-nats' has $($g.rules.Count) rules, expected 11")
-                        }
-                    }
-                    if ($g.name -eq "aegisedge-lifecycle-test") {
-                        $foundTestGroup = $true
-                        $cleanupErrors.Add("Test rule group 'aegisedge-lifecycle-test' still present in production Prometheus")
-                    }
-                }
-                if (-not $foundProdRules) {
-                    $cleanupErrors.Add("Production alert rules group 'aegisedge-quarantine-and-nats' (11 rules) not loaded in Prometheus")
-                } else {
-                    Write-Host "  Production alert rules verified loaded (11 rules, 'aegisedge-quarantine-and-nats')." -ForegroundColor Green
-                }
-                if (-not $foundTestGroup) {
-                    Write-Host "  Lifecycle test rule group is absent (clean)." -ForegroundColor Green
-                }
-
-                # Check targets: test target absent, production Control Plane and Alertmanager scrape targets present and healthy (poll up to 20s)
-                $foundTestTarget = $false
-                $controlPlaneTarget = $null
-                $alertmanagerTarget = $null
-                $targetSw = [System.Diagnostics.Stopwatch]::StartNew()
-                while ($targetSw.Elapsed.TotalSeconds -lt 20) {
-                    try {
-                        $targets = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/targets" -TimeoutSec 3
-                        $foundTestTarget = $false
-                        $controlPlaneTarget = $null
-                        $alertmanagerTarget = $null
-                        foreach ($t in $targets.data.activeTargets) {
-                            if ($t.scrapePool -eq "aegisedge-lifecycle-test" -or $t.labels.job -eq "aegisedge-lifecycle-test") {
-                                $foundTestTarget = $true
-                            }
-                            if ($t.scrapePool -eq "aegisedge-control-plane" -or $t.labels.job -eq "aegisedge-control-plane") {
-                                $controlPlaneTarget = $t
-                            }
-                            if ($t.scrapePool -eq "aegisedge-alertmanager" -or $t.labels.job -eq "aegisedge-alertmanager") {
-                                $alertmanagerTarget = $t
-                            }
-                        }
-                        if ($controlPlaneTarget -ne $null -and $controlPlaneTarget.health -eq "up" -and
-                            $alertmanagerTarget -ne $null -and $alertmanagerTarget.health -eq "up") {
-                            break
-                        }
-                    } catch {}
-                    Start-Sleep -Milliseconds 500
-                }
-
-                if ($foundTestTarget) {
-                    $cleanupErrors.Add("Test scrape target 'aegisedge-lifecycle-test' still present in production Prometheus")
-                } else {
-                    Write-Host "  Lifecycle test scrape target is absent (clean)." -ForegroundColor Green
-                }
-                if ($null -eq $controlPlaneTarget) {
-                    $cleanupErrors.Add("Expected production Control Plane scrape target 'aegisedge-control-plane' is MISSING from Prometheus targets")
-                } elseif ($controlPlaneTarget.health -ne "up") {
-                    $cleanupErrors.Add("Production Control Plane scrape target 'aegisedge-control-plane' is not healthy: health='$($controlPlaneTarget.health)', lastError='$($controlPlaneTarget.lastError)'")
-                } else {
-                    Write-Host "  Production Control Plane target 'aegisedge-control-plane' verified active and healthy (health=up)." -ForegroundColor Green
-                }
-                if ($null -eq $alertmanagerTarget) {
-                    $cleanupErrors.Add("Expected production Alertmanager scrape target 'aegisedge-alertmanager' is MISSING from Prometheus targets")
-                } elseif ($alertmanagerTarget.health -ne "up") {
-                    $cleanupErrors.Add("Production Alertmanager scrape target 'aegisedge-alertmanager' is not healthy: health='$($alertmanagerTarget.health)', lastError='$($alertmanagerTarget.lastError)'")
-                } else {
-                    Write-Host "  Production Alertmanager scrape target 'aegisedge-alertmanager' verified active and healthy (health=up)." -ForegroundColor Green
-                }
-
-                # Production Alertmanager endpoint is discovered
-                $amResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/alertmanagers" -TimeoutSec 5
-                $amFound = $false
-                foreach ($am in $amResp.data.activeAlertmanagers) {
-                    if ($am.url -like "*9093*") {
-                        $amFound = $true
-                        break
-                    }
-                }
-                if (-not $amFound) {
-                    $cleanupErrors.Add("Production Alertmanager endpoint not discovered by Prometheus")
-                } else {
-                    Write-Host "  Production Alertmanager endpoint verified discovered (:9093)." -ForegroundColor Green
-                }
+                Write-Host "  Isolated test containers verified absent from Docker daemon." -ForegroundColor Green
             }
 
-            # Verify test-only webhook receiver is absent
+            # Verify test-only webhook receiver container is absent
             if ($receiverContainerAttempted) {
                 $checkRecv = cmd.exe /c "docker ps -a --filter name=^/${ReceiverContainerName}$ --format {{.Names}}"
                 if ($checkRecv -match "^${ReceiverContainerName}$") {
@@ -217,7 +127,7 @@ function Invoke-CleanupResources {
                 }
             }
         } catch {
-            $cleanupErrors.Add("Exception verifying production stack state: $_")
+            $cleanupErrors.Add("Exception verifying isolated teardown: $_")
         }
     }
 
@@ -275,7 +185,7 @@ function Invoke-CleanupResources {
     }
 
     if ($cleanupErrors.Count -eq 0) {
-        Write-Host "  Production restoration fully verified (all checks passed, 0 errors)." -ForegroundColor Green
+        Write-Host "  Isolated test teardown fully verified (all checks passed, 0 errors)." -ForegroundColor Green
     } else {
         foreach ($ce in $cleanupErrors) {
             Write-Host "  Cleanup Error: $ce" -ForegroundColor Red
@@ -311,7 +221,8 @@ try {
     $secretFileAttempted = $true
     $tokenBytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($tokenBytes)
-    $ephemeralToken = [Convert]::ToBase64String($tokenBytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+    # Standard Base64 without padding (RFC 4648 § 4, exactly 43 characters for 32 bytes)
+    $ephemeralToken = [Convert]::ToBase64String($tokenBytes).TrimEnd('=')
 
     if ($ephemeralToken.Length -ne 43) {
         throw "Ephemeral token generation error: expected 43 characters, got $($ephemeralToken.Length)"
@@ -359,22 +270,22 @@ try {
     # 3. Start Compose stack with isolated test configuration override
     Write-Host "`n==> 3. Starting Prometheus & Alertmanager with isolated test configuration..." -ForegroundColor Yellow
     $composeOverrideAttempted = $true
-    docker compose -f infra/prometheus/docker-compose.yml -f infra/prometheus/docker-compose.test.yml up -d
+    docker compose -f $isolatedComposeFile up -d
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to start docker-compose stack with test override."
+        throw "Failed to start docker-compose stack with isolated test configuration."
     }
 
     # Flush Alertmanager to clear any residual active alerts from prior aborted runs
-    docker restart aegisedge-alertmanager | Out-Null
+    docker restart $amContainer | Out-Null
 
     # 4. Start temporary webhook-receiver container on Compose network with unique name and network-alias
-    Write-Host "`n==> 4. Starting temporary webhook-receiver container '$ReceiverContainerName' on prometheus_default..." -ForegroundColor Yellow
+    Write-Host "`n==> 4. Starting temporary webhook-receiver container '$ReceiverContainerName' on $testNetwork..." -ForegroundColor Yellow
     $receiverContainerAttempted = $true
     $pwdPath = (Get-Item -Path ".").FullName
     docker run -d --name $ReceiverContainerName `
-        --network prometheus_default `
+        --network $testNetwork `
         --network-alias webhook-receiver `
-        -p 127.0.0.1:9095:9095 `
+        -p 127.0.0.1:${recvPort}:9095 `
         -v "${pwdPath}\bin\webhook-receiver:/webhook-receiver:ro" `
         -v "${secretFile}:/etc/webhook-receiver/secrets/token:ro" `
         --entrypoint /webhook-receiver `
@@ -414,9 +325,9 @@ try {
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($stopwatch.Elapsed.TotalSeconds -lt 30) {
         try {
-            $promResp = Invoke-WebRequest -Uri "http://127.0.0.1:9090/-/ready" -UseBasicParsing -TimeoutSec 2
-            $amResp = Invoke-WebRequest -Uri "http://127.0.0.1:9093/-/ready" -UseBasicParsing -TimeoutSec 2
-            $recvResp = Invoke-WebRequest -Uri "http://127.0.0.1:9095/health" -UseBasicParsing -TimeoutSec 2
+            $promResp = Invoke-WebRequest -Uri "http://127.0.0.1:${promPort}/-/ready" -UseBasicParsing -TimeoutSec 2
+            $amResp = Invoke-WebRequest -Uri "http://127.0.0.1:${amPort}/-/ready" -UseBasicParsing -TimeoutSec 2
+            $recvResp = Invoke-WebRequest -Uri "http://127.0.0.1:${recvPort}/health" -UseBasicParsing -TimeoutSec 2
             if ($promResp.StatusCode -eq 200 -and $amResp.StatusCode -eq 200 -and $recvResp.StatusCode -eq 200) {
                 $ready = $true
                 break
@@ -432,7 +343,7 @@ try {
 
     # Verify unauthenticated request to /api/events is rejected with HTTP 401
     try {
-        $unauthResp = Invoke-WebRequest -Uri "http://127.0.0.1:9095/api/events" -UseBasicParsing -TimeoutSec 2
+        $unauthResp = Invoke-WebRequest -Uri "http://127.0.0.1:${recvPort}/api/events" -UseBasicParsing -TimeoutSec 2
         throw "Expected unauthenticated request to /api/events to fail with 401, but got HTTP $($unauthResp.StatusCode)"
     } catch {
         $statusCode = $null
@@ -452,7 +363,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt 20) {
         try {
-            $amResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/alertmanagers"
+            $amResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/alertmanagers"
             foreach ($am in $amResp.data.activeAlertmanagers) {
                 if ($am.url -like "*9093*") {
                     $amDiscovered = $true
@@ -474,7 +385,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt 20) {
         try {
-            $targets = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/targets"
+            $targets = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/targets"
             foreach ($t in $targets.data.activeTargets) {
                 if (($t.labels.job -eq "aegisedge-lifecycle-test" -or $t.scrapePool -eq "aegisedge-lifecycle-test") -and $t.health -eq "up") {
                     $scrapeOk = $true
@@ -494,15 +405,15 @@ try {
     # Scenario A: Warning Alert Lifecycle (Firing -> Resolved + Strict Correlation)
     # =========================================================================
     Write-Host "`n==> 8. Testing Warning Alert Lifecycle (Firing -> Resolved)..." -ForegroundColor Yellow
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders -Method Delete | Out-Null
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=1&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders -Method Delete | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=1&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for Prometheus rule AegisEdgeE2ELifecycleWarning to fire..." -ForegroundColor Cyan
     $ruleFiring = $false
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules"
+            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/rules"
             foreach ($group in $rulesResp.data.groups) {
                 if ($group.name -eq "aegisedge-lifecycle-test") {
                     foreach ($rule in $group.rules) {
@@ -528,7 +439,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "warning" -and $ev.payload.status -eq "firing" -and $ev.payload.receiver -eq "warning-receiver") {
                     foreach ($alert in $ev.payload.alerts) {
@@ -550,7 +461,7 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $warnFiringEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "Webhook receiver did not receive firing warning alert payload on /alerts/warning for run_id $MainRunId."
@@ -585,7 +496,7 @@ try {
 
     # Trigger Warning Alert Resolution
     Write-Host "  Triggering Warning Alert Resolution (val=0, run_id=$MainRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=0&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=0&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for resolved webhook delivery correlated with firing fingerprint $firingFingerprint..." -ForegroundColor Cyan
     $warnResolvedEvent = $null
@@ -593,7 +504,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "warning" -and
                     $ev.payload.status -eq "resolved" -and
@@ -626,7 +537,7 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $warnResolvedEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "Webhook receiver did not receive strictly correlated resolved warning alert payload for fingerprint $firingFingerprint (run_id $MainRunId)."
@@ -638,15 +549,15 @@ try {
     # Scenario B: Critical Alert Routing (Severity Matching) & Resolution
     # =========================================================================
     Write-Host "`n==> 9. Testing Critical Alert Routing (/alerts/critical)..." -ForegroundColor Yellow
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders -Method Delete | Out-Null
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=2&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders -Method Delete | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=2&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for Prometheus rule AegisEdgeE2ELifecycleCritical to fire..." -ForegroundColor Cyan
     $critFiring = $false
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules"
+            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/rules"
             foreach ($group in $rulesResp.data.groups) {
                 if ($group.name -eq "aegisedge-lifecycle-test") {
                     foreach ($rule in $group.rules) {
@@ -671,7 +582,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "critical" -and $ev.payload.status -eq "firing" -and $ev.payload.receiver -eq "critical-receiver") {
                     foreach ($alert in $ev.payload.alerts) {
@@ -698,14 +609,14 @@ try {
 
     # Resolve critical alert and wait for resolution webhook
     Write-Host "  Triggering Critical Alert Resolution (val=0, run_id=$MainRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=0&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=0&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for resolved webhook delivery on /alerts/critical..." -ForegroundColor Cyan
     $critResolvedEvent = $null
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "critical" -and $ev.payload.status -eq "resolved" -and $ev.payload.receiver -eq "critical-receiver") {
                     foreach ($alert in $ev.payload.alerts) {
@@ -736,15 +647,15 @@ try {
     # Scenario C: Default Receiver Fallback (Unmatched Severity) & Resolution
     # =========================================================================
     Write-Host "`n==> 10. Testing Default Receiver Fallback for Unmatched Severity (/alerts/default)..." -ForegroundColor Yellow
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders -Method Delete | Out-Null
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=3&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders -Method Delete | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=3&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for rule AegisEdgeE2ELifecycleDefaultFallback to fire..." -ForegroundColor Cyan
     $fallbackFiring = $false
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules"
+            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/rules"
             foreach ($group in $rulesResp.data.groups) {
                 if ($group.name -eq "aegisedge-lifecycle-test") {
                     foreach ($rule in $group.rules) {
@@ -769,7 +680,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "default" -and $ev.payload.status -eq "firing" -and $ev.payload.receiver -eq "default-receiver") {
                     foreach ($alert in $ev.payload.alerts) {
@@ -788,7 +699,7 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $defaultEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "Webhook receiver did not receive unmatched severity alert on /alerts/default."
@@ -797,14 +708,14 @@ try {
 
     # Resolve fallback alert
     Write-Host "  Triggering fallback alert resolution (val=0, run_id=$MainRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=0&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=0&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for resolved webhook delivery on /alerts/default..." -ForegroundColor Cyan
     $defaultResolvedEvent = $null
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "default" -and $ev.payload.status -eq "resolved" -and $ev.payload.receiver -eq "default-receiver") {
                     foreach ($alert in $ev.payload.alerts) {
@@ -835,15 +746,15 @@ try {
     # Scenario D: Strict Alert Grouping & Grouped Resolution Verification
     # =========================================================================
     Write-Host "`n==> 11. Testing Alert Grouping Behavior (Multi-instance Alert Batching)..." -ForegroundColor Yellow
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders -Method Delete | Out-Null
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=1&instances=2&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders -Method Delete | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=1&instances=2&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for multi-instance grouped webhook delivery on /alerts/warning..." -ForegroundColor Cyan
     $groupedEvent = $null
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "warning" -and $ev.payload.status -eq "firing" -and $ev.payload.receiver -eq "warning-receiver") {
                     if ($ev.payload.alerts.Count -eq 2) {
@@ -924,14 +835,14 @@ try {
 
     # Strict Grouped Resolution Verification
     Write-Host "  Resolving multi-instance alert (val=0, instances=2, run_id=$MainRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=0&instances=2&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=0&instances=2&run_id=$MainRunId" -Headers $authHeaders -Method Post | Out-Null
 
     Write-Host "  Waiting for strictly correlated resolved webhook delivery for grouped alerts on /alerts/warning..." -ForegroundColor Cyan
     $groupedResolvedEvent = $null
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "warning" -and
                     $ev.payload.status -eq "resolved" -and
@@ -979,7 +890,7 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $groupedResolvedEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "Webhook receiver did not receive strictly correlated grouped resolution payload with 2 instances ('node-a' and 'node-b')."
@@ -990,12 +901,12 @@ try {
     # Scenario E: Alertmanager Restart & Real Post-Restart Delivery
     # =========================================================================
     Write-Host "`n==> 12. Testing Alertmanager Restart Resilience & Post-Restart Delivery (RunID=$RestartRunId)..." -ForegroundColor Yellow
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders -Method Delete | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders -Method Delete | Out-Null
 
     # Restart Alertmanager
-    docker restart aegisedge-alertmanager | Out-Null
+    docker restart $amContainer | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "docker restart aegisedge-alertmanager failed with exit code $LASTEXITCODE"
+        throw "docker restart $amContainer failed with exit code $LASTEXITCODE"
     }
 
     # Wait for Alertmanager readiness
@@ -1003,7 +914,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt 20) {
         try {
-            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:9093/-/ready" -UseBasicParsing -TimeoutSec 2
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:${amPort}/-/ready" -UseBasicParsing -TimeoutSec 2
             if ($resp.StatusCode -eq 200) {
                 $amReady = $true
                 break
@@ -1021,7 +932,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt 20) {
         try {
-            $amResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/alertmanagers"
+            $amResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/alertmanagers"
             foreach ($am in $amResp.data.activeAlertmanagers) {
                 if ($am.url -like "*9093*") {
                     $amDiscoveredPostRestart = $true
@@ -1039,14 +950,14 @@ try {
 
     # Trigger post-restart synthetic warning metric with dedicated RestartRunId
     Write-Host "  Triggering warning alert post-restart (val=1, run_id=$RestartRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=1&run_id=$RestartRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=1&run_id=$RestartRunId" -Headers $authHeaders -Method Post | Out-Null
 
     # Wait for rule to fire in Prometheus
     $restartRuleFiring = $false
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules"
+            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/rules"
             foreach ($group in $rulesResp.data.groups) {
                 if ($group.name -eq "aegisedge-lifecycle-test") {
                     foreach ($rule in $group.rules) {
@@ -1071,7 +982,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "warning" -and $ev.payload.status -eq "firing" -and $ev.payload.receiver -eq "warning-receiver") {
                     foreach ($alert in $ev.payload.alerts) {
@@ -1100,14 +1011,14 @@ try {
 
     # Trigger post-restart resolution
     Write-Host "  Triggering post-restart alert resolution (val=0, run_id=$RestartRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger?val=0&run_id=$RestartRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger?val=0&run_id=$RestartRunId" -Headers $authHeaders -Method Post | Out-Null
 
     # Wait for strictly correlated resolved notification
     $restartResolvedEvent = $null
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.route -eq "warning" -and $ev.payload.status -eq "resolved" -and $ev.payload.receiver -eq "warning-receiver") {
                     foreach ($alert in $ev.payload.alerts) {
@@ -1143,11 +1054,11 @@ try {
     # Scenario F: Simultaneous Alertmanager Inhibition Verification
     # =========================================================================
     Write-Host "`n==> 13. Testing Alertmanager Simultaneous Alert Inhibition (Scenario F, RunID=$InhibitRunId)..." -ForegroundColor Yellow
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders -Method Delete | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders -Method Delete | Out-Null
 
     # Trigger simultaneous critical + warning + unrelated warning
     Write-Host "  Triggering simultaneous alerts for inhibition test (val=1, run_id=$InhibitRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger/inhibition?val=1&run_id=$InhibitRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger/inhibition?val=1&run_id=$InhibitRunId" -Headers $authHeaders -Method Post | Out-Null
 
     # 1. Verify all 3 intended alerts fire in Prometheus
     Write-Host "  Waiting for rules to fire in Prometheus..." -ForegroundColor Cyan
@@ -1157,7 +1068,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules"
+            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/rules"
             foreach ($group in $rulesResp.data.groups) {
                 if ($group.name -eq "aegisedge-lifecycle-test") {
                     foreach ($rule in $group.rules) {
@@ -1194,7 +1105,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt 20) {
         try {
-            $amAlerts = Invoke-RestMethod -Uri "http://127.0.0.1:9093/api/v2/alerts"
+            $amAlerts = Invoke-RestMethod -Uri "http://127.0.0.1:${amPort}/api/v2/alerts"
             $critAlert = $null
             $warnAlert = $null
             $unrelAlert = $null
@@ -1245,7 +1156,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.payload.status -eq "firing") {
                     foreach ($al in $ev.payload.alerts) {
@@ -1273,13 +1184,13 @@ try {
     }
 
     if (-not $critFiringEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "AegisEdgeE2ELifecycleCritical (fingerprint $expectedCriticalFingerprint) was not delivered to critical-receiver on /alerts/critical within $TimeoutSeconds s."
     }
     if (-not $unrelFiringEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "AegisEdgeE2EUnrelatedWarning (fingerprint $unrelatedWarningFingerprint) was not delivered to warning-receiver on /alerts/warning within $TimeoutSeconds s (unrelated warnings must NOT be inhibited)."
@@ -1291,7 +1202,7 @@ try {
 
     # 4. Trigger resolution and verify resolution is actually observed, not merely requested
     Write-Host "  Triggering resolution of inhibition test alerts (val=0, run_id=$InhibitRunId)..." -ForegroundColor Cyan
-    Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/trigger/inhibition?val=0&run_id=$InhibitRunId" -Headers $authHeaders -Method Post | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/trigger/inhibition?val=0&run_id=$InhibitRunId" -Headers $authHeaders -Method Post | Out-Null
     Write-Host "  Inhibition resolution requested." -ForegroundColor Green
 
     # Bounded polling: verify all 3 rules stop firing in Prometheus
@@ -1300,7 +1211,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:9090/api/v1/rules"
+            $rulesResp = Invoke-RestMethod -Uri "http://127.0.0.1:${promPort}/api/v1/rules"
             $anyInhibitAlertFiring = $false
             foreach ($group in $rulesResp.data.groups) {
                 if ($group.name -eq "aegisedge-lifecycle-test") {
@@ -1337,7 +1248,7 @@ try {
     $stopwatch.Restart()
     while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
-            $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+            $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
             foreach ($ev in $events) {
                 if ($ev.payload.status -eq "resolved") {
                     if ($ev.route -eq "critical" -and $ev.payload.receiver -eq "critical-receiver") {
@@ -1382,13 +1293,13 @@ try {
     }
 
     if (-not $critResolvedEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "Webhook receiver did not receive resolved notification on /alerts/critical for AegisEdgeE2ELifecycleCritical (fingerprint $expectedCriticalFingerprint, run_id $InhibitRunId) within $TimeoutSeconds s."
     }
     if (-not $unrelResolvedEvent) {
-        $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+        $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
         Write-Host "  Events recorded in receiver at timeout ($($events.Count)):" -ForegroundColor Red
         $events | ForEach-Object { Write-Host "    - route: $($_.route), receiver: $($_.payload.receiver), status: $($_.payload.status), alerts: $($_.payload.alerts.Count)" -ForegroundColor Red }
         throw "Webhook receiver did not receive resolved notification on /alerts/warning for AegisEdgeE2EUnrelatedWarning (fingerprint $unrelatedWarningFingerprint, run_id $InhibitRunId) within $TimeoutSeconds s."
@@ -1396,7 +1307,7 @@ try {
     Write-Host "  Correlated resolved notifications verified for Critical (Fingerprint: $($rCritAlert.fingerprint)) and Unrelated Warning (Fingerprint: $($rUnrelAlert.fingerprint))." -ForegroundColor Green
 
     # 5. Verify that NO inappropriate resolved notification was delivered for the inhibited warning
-    $events = Invoke-RestMethod -Uri "http://127.0.0.1:9095/api/events" -Headers $authHeaders
+    $events = Invoke-RestMethod -Uri "http://127.0.0.1:${recvPort}/api/events" -Headers $authHeaders
     $inappropriateResolvedFound = $false
     foreach ($ev in $events) {
         if ($ev.payload.status -eq "resolved") {
