@@ -1,0 +1,59 @@
+# AegisEdge Phase 16-E: Isolated Test Compose Configuration
+# Provides complete runtime isolation from production containers, ports, and volumes.
+# Reference: Stage 16 Phase 16-E
+
+name: aegisedge-test
+
+services:
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    container_name: aegisedge-test-alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--cluster.listen-address="
+    ports:
+      - "127.0.0.1:19093:9093"
+    networks:
+      test_network:
+        aliases:
+          - alertmanager
+    volumes:
+      - ./alertmanager.test.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./.test_secret/token:/etc/alertmanager/secrets/test_token:ro
+      - test_alertmanager_data:/alertmanager
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: aegisedge-test-prometheus
+    depends_on:
+      - alertmanager
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:19090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      test_network:
+        aliases:
+          - prometheus
+    volumes:
+      - ./prometheus.test.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - ./alert_rules_lifecycle_test.yml:/etc/prometheus/alert_rules_lifecycle_test.yml:ro
+      - test_prometheus_data:/prometheus
+
+networks:
+  test_network:
+    name: aegisedge_test_network
+
+volumes:
+  test_prometheus_data:
+    name: aegisedge_test_prometheus_data
+  test_alertmanager_data:
+    name: aegisedge_test_alertmanager_data
