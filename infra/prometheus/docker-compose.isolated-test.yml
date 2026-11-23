@@ -1,13 +1,11 @@
 # AegisEdge Phase 16-E: Isolated Test Compose Configuration
 # Provides complete runtime isolation from production containers, ports, and volumes.
+# Namespaced per execution via Docker Compose project name (-p).
 # Reference: Stage 16 Phase 16-E
-
-name: aegisedge-test
 
 services:
   alertmanager:
     image: prom/alertmanager:v0.28.1
-    container_name: aegisedge-test-alertmanager
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
@@ -25,7 +23,6 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.2.1
-    container_name: aegisedge-test-prometheus
     depends_on:
       - alertmanager
     command:
@@ -50,10 +47,7 @@ services:
 
 networks:
   test_network:
-    name: aegisedge_test_network
 
 volumes:
   test_prometheus_data:
-    name: aegisedge_test_prometheus_data
   test_alertmanager_data:
-    name: aegisedge_test_alertmanager_data
