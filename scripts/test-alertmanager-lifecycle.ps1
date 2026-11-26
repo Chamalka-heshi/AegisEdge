@@ -25,35 +25,209 @@ Write-Host "==========================================================" -Foregro
 Write-Host "AegisEdge: End-to-End Alert Lifecycle Verification" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
-# Define paths and IDs
+# -------------------------------------------------------------------------
+# Host-Level Concurrency Lock (Exclusive Host-Wide Named Mutex)
+# Enforces strictly single execution across all sessions and elevation levels
+# on the host machine to prevent collisions on fixed loopback ports
+# (19090, 19093, 19095) and shared filesystem paths.
+# -------------------------------------------------------------------------
+$mutexName = "Global\AegisEdge_Alertmanager_Lifecycle_Test_Mutex"
+$mutex = $null
+$mutexAcquired = $false
+
+# Initialize resource tracking variables prior to protected try block
 $pwdPath = (Get-Item -Path ".").FullName
 $secretDir = Join-Path $pwdPath "infra\prometheus\.test_secret"
 $secretFile = Join-Path $secretDir "token"
 
-# Unique execution run IDs, project name, container names, and network for strict per-execution isolation & ownership
-$MainRunId = "run-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
-$RestartRunId = "rst-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
-$InhibitRunId = "inh-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
-$composeProject = "aegisedge-test-" + $MainRunId
+# Complete GUIDs for per-execution isolation & strict ownership
+$MainRunGuid = [Guid]::NewGuid().ToString("N")
+$RestartRunGuid = [Guid]::NewGuid().ToString("N")
+$InhibitRunGuid = [Guid]::NewGuid().ToString("N")
+$ReceiverGuid = [Guid]::NewGuid().ToString("N")
+
+$MainRunId = "run-" + $MainRunGuid
+$RestartRunId = "rst-" + $RestartRunGuid
+$InhibitRunId = "inh-" + $InhibitRunGuid
+
+# Compose project name uses the complete GUID
+$composeProject = "aegisedge-test-" + $MainRunGuid
 $amContainer = "${composeProject}-alertmanager-1"
 $promContainer = "${composeProject}-prometheus-1"
 $testNetwork = "${composeProject}_test_network"
-$ReceiverContainerName = "aegisedge-recv-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
 
-Write-Host "Execution Run IDs: Main=$MainRunId, Restart=$RestartRunId, Inhibit=$InhibitRunId" -ForegroundColor Cyan
-Write-Host "Compose Project Name: $composeProject" -ForegroundColor Cyan
-Write-Host "Isolated Containers: Alertmanager=$amContainer, Prometheus=$promContainer" -ForegroundColor Cyan
-Write-Host "Isolated Network: $testNetwork" -ForegroundColor Cyan
-Write-Host "Temporary Receiver Container: $ReceiverContainerName" -ForegroundColor Cyan
+# Receiver container name uses the complete GUID
+$ReceiverContainerName = "aegisedge-recv-" + $ReceiverGuid
+$ReceiverOwnershipKey = "aegisedge.test.receiver_owner"
+$ReceiverOwnershipVal = $ReceiverContainerName
 
 # Resource tracking flags for cleanup
-$secretFileAttempted = $false
-$composeProjectAttempted = $false
+$secretDirCreatedByThisRun = $false
+$secretFileCreatedByThisRun = $false
+$composeProjectPreflightPassed = $false
+$composeProjectStartupAttempted = $false
 $composeProjectStarted = $false
 $receiverContainerAttempted = $false
 $receiverContainerStarted = $false
 $testError = $null
 $authHeaders = @{}
+$cleanupErrors = @()
+
+function Test-MutexSecurityConservativePolicy {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Threading.Mutex]$MutexHandle,
+        [Parameter(Mandatory = $true)]
+        [string]$MutexIdentifier
+    )
+
+    # Limitation Disclosure:
+    # This is a conservative static DACL policy check, not a dynamic Win32 AccessCheck() kernel API call.
+    # It strictly validates that:
+    # 1. Zero Deny ACEs exist in the DACL (Deny ACEs unconditionally fail validation to prevent masking or DoS).
+    # 2. Authenticated Users (S-1-5-11) is explicitly granted Synchronize, Modify, and ReadPermissions (mandatory for cross-session coordination).
+    # 3. Builtin Administrators (S-1-5-32-544) or Local System (S-1-5-18) is explicitly granted Synchronize and Modify.
+    # 4. The current caller identity (or Authenticated Users) is granted Synchronize and Modify.
+
+    try {
+        $sec = $MutexHandle.GetAccessControl()
+        $rules = @($sec.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    } catch {
+        Write-Error "Failed to retrieve security descriptor for mutex '$MutexIdentifier': $_"
+        return $false
+    }
+
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $userSidStr = $currentUser.User.Value
+
+    $authUsersSid = "S-1-5-11"        # WellKnownSidType: AuthenticatedUserSid
+    $adminSid = "S-1-5-32-544"        # WellKnownSidType: BuiltinAdministratorsSid
+    $systemSid = "S-1-5-18"           # WellKnownSidType: LocalSystemSid
+
+    $requiredRights = [System.Security.AccessControl.MutexRights]::Synchronize -bor [System.Security.AccessControl.MutexRights]::Modify
+    $requiredAuthRights = [System.Security.AccessControl.MutexRights]::Synchronize -bor `
+                          [System.Security.AccessControl.MutexRights]::Modify -bor `
+                          [System.Security.AccessControl.MutexRights]::ReadPermissions
+
+    # Rule 1: Zero Deny ACEs allowed. Any Deny ACE fails validation immediately.
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny) {
+            Write-Error "Mutex '$MutexIdentifier' contains an explicit Deny ACE for SID '$($rule.IdentityReference.Value)'. Conservative policy rejects all Deny ACEs."
+            return $false
+        }
+    }
+
+    # Rule 2: Authenticated Users (S-1-5-11) MUST have explicit Allow for Synchronize, Modify, and ReadPermissions.
+    # An Administrators-only ACE is strictly insufficient to prove ordinary authenticated users can coordinate across sessions.
+    $hasAuthUsersCoord = $false
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            $rule.IdentityReference.Value -eq $authUsersSid) {
+            if (($rule.MutexRights -band $requiredAuthRights) -eq $requiredAuthRights) {
+                $hasAuthUsersCoord = $true
+                break
+            }
+        }
+    }
+
+    if (-not $hasAuthUsersCoord) {
+        Write-Error "Mutex '$MutexIdentifier' DACL lacks mandatory cross-session coordination: Authenticated Users ($authUsersSid) is not granted Synchronize, Modify, and ReadPermissions."
+        return $false
+    }
+
+    # Rule 3: Administrative / Elevated oversight (Builtin Administrators or Local System) MUST have Synchronize and Modify.
+    $hasAdminCoord = $false
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            ($rule.IdentityReference.Value -eq $adminSid -or $rule.IdentityReference.Value -eq $systemSid)) {
+            if (($rule.MutexRights -band $requiredRights) -eq $requiredRights) {
+                $hasAdminCoord = $true
+                break
+            }
+        }
+    }
+
+    if (-not $hasAdminCoord) {
+        Write-Error "Mutex '$MutexIdentifier' DACL lacks elevated runner oversight: neither Administrators ($adminSid) nor Local System ($systemSid) is granted Synchronize and Modify."
+        return $false
+    }
+
+    # Rule 4: Verify caller has explicit Allow (either via direct user SID or via Authenticated Users).
+    $callerExplicitAllow = $false
+    if ($hasAuthUsersCoord) {
+        if ($null -ne $currentUser.Groups) {
+            foreach ($g in $currentUser.Groups) {
+                if ($g.Value -eq $authUsersSid) {
+                    $callerExplicitAllow = $true
+                    break
+                }
+            }
+        }
+    }
+    if (-not $callerExplicitAllow) {
+        foreach ($rule in $rules) {
+            if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                $rule.IdentityReference.Value -eq $userSidStr) {
+                if (($rule.MutexRights -band $requiredRights) -eq $requiredRights) {
+                    $callerExplicitAllow = $true
+                    break
+                }
+            }
+        }
+    }
+
+    if (-not $callerExplicitAllow) {
+        Write-Error "Mutex '$MutexIdentifier' DACL does not grant Synchronize and Modify to current caller token ($userSidStr)."
+        return $false
+    }
+
+    return $true
+}
+
+function Format-WindowsCommandLine {
+    param(
+        [string[]]$ArgsList
+    )
+    if ($null -eq $ArgsList -or $ArgsList.Count -eq 0) { return "" }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($arg in $ArgsList) {
+        if ($null -eq $arg) { continue }
+        $s = [string]$arg
+        if ($s.Length -eq 0) {
+            $parts.Add('""')
+            continue
+        }
+        if ($s -notmatch '[\s\t\n\v"]') {
+            $parts.Add($s)
+            continue
+        }
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.Append('"')
+        $numBackslashes = 0
+        for ($i = 0; $i -lt $s.Length; $i++) {
+            $c = $s[$i]
+            if ($c -eq '\') {
+                $numBackslashes++
+            } elseif ($c -eq '"') {
+                [void]$sb.Append('\', (2 * $numBackslashes + 1))
+                [void]$sb.Append('"')
+                $numBackslashes = 0
+            } else {
+                if ($numBackslashes -gt 0) {
+                    [void]$sb.Append('\', $numBackslashes)
+                    $numBackslashes = 0
+                }
+                [void]$sb.Append($c)
+            }
+        }
+        if ($numBackslashes -gt 0) {
+            [void]$sb.Append('\', (2 * $numBackslashes))
+        }
+        [void]$sb.Append('"')
+        $parts.Add($sb.ToString())
+    }
+    return [string]::Join(" ", $parts)
+}
 
 function Invoke-NativeCommand {
     param(
@@ -62,33 +236,52 @@ function Invoke-NativeCommand {
         [Parameter(ValueFromRemainingArguments = $true, Position = 1)]
         [string[]]$Arguments
     )
-    $origEAP = $ErrorActionPreference
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    if ($Arguments -and $Arguments.Count -gt 0) {
+        $psi.Arguments = Format-WindowsCommandLine -ArgsList $Arguments
+    }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+
     try {
-        $ErrorActionPreference = "Continue"
-        $stdoutList = [System.Collections.Generic.List[string]]::new()
-        $stderrList = [System.Collections.Generic.List[string]]::new()
+        [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
 
-        $rawOutput = & $Executable @Arguments 2>&1
-        $exitCode = $LASTEXITCODE
+        $process.WaitForExit()
+        [System.Threading.Tasks.Task]::WaitAll($stdoutTask, $stderrTask)
 
-        if ($rawOutput) {
-            foreach ($item in $rawOutput) {
-                if ($item -is [System.Management.Automation.ErrorRecord]) {
-                    $stderrList.Add($item.ToString())
-                } else {
-                    $stdoutList.Add($item.ToString())
-                }
-            }
+        $stdoutRaw = $stdoutTask.Result
+        $stderrRaw = $stderrTask.Result
+        $exitCode = $process.ExitCode
+
+        $stdoutLines = if ([string]::IsNullOrEmpty($stdoutRaw)) {
+            @()
+        } else {
+            @($stdoutRaw -split "`r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+        }
+
+        $stderrLines = if ([string]::IsNullOrEmpty($stderrRaw)) {
+            @()
+        } else {
+            @($stderrRaw -split "`r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
         }
 
         return [PSCustomObject]@{
             ExitCode = $exitCode
-            Stdout   = [string[]]$stdoutList.ToArray()
-            Stderr   = [string[]]$stderrList.ToArray()
-            Combined = if ($rawOutput) { ($rawOutput | ForEach-Object { $_.ToString() }) -join "`n" } else { "" }
+            Stdout   = [string[]]$stdoutLines
+            Stderr   = [string[]]$stderrLines
+            Combined = ($stdoutRaw + $stderrRaw).Trim()
         }
     } finally {
-        $ErrorActionPreference = $origEAP
+        $process.Dispose()
     }
 }
 
@@ -119,25 +312,36 @@ function Invoke-CleanupResources {
             } else {
                 $existing = @($psRes.Stdout | ForEach-Object { $_.Trim() } | Where-Object { $_ -ceq $ReceiverContainerName })
                 if ($existing.Count -gt 0) {
-                    $stopRes = Invoke-DockerCmd "stop", $ReceiverContainerName
-                    if ($stopRes.ExitCode -ne 0) {
-                        $cleanupErrors.Add("Failed to stop receiver container '$ReceiverContainerName' (exit code $($stopRes.ExitCode)): $($stopRes.Stderr -join ' ')")
-                    }
-                    $rmRes = Invoke-DockerCmd "rm", "-f", $ReceiverContainerName
-                    if ($rmRes.ExitCode -ne 0) {
-                        $cleanupErrors.Add("Failed to remove receiver container '$ReceiverContainerName' (exit code $($rmRes.ExitCode)): $($rmRes.Stderr -join ' ')")
-                    }
-
-                    # Verify absence afterward using exact case-sensitive matching
-                    $verRes = Invoke-DockerCmd "ps", "-a", "--format", "{{.Names}}"
-                    if ($verRes.ExitCode -ne 0) {
-                        $cleanupErrors.Add("Failed to verify receiver container absence (exit code $($verRes.ExitCode)): $($verRes.Stderr -join ' ')")
+                    # Verify ownership label before stopping or removing
+                    $inspectRes = Invoke-DockerCmd "inspect", "--format", "{{ index .Config.Labels `"$ReceiverOwnershipKey`" }}", $ReceiverContainerName
+                    if ($inspectRes.ExitCode -ne 0) {
+                        $cleanupErrors.Add("Failed to inspect labels on container '$ReceiverContainerName' (exit code $($inspectRes.ExitCode)): $($inspectRes.Stderr -join ' ')")
                     } else {
-                        $remaining = @($verRes.Stdout | ForEach-Object { $_.Trim() } | Where-Object { $_ -ceq $ReceiverContainerName })
-                        if ($remaining.Count -gt 0) {
-                            $cleanupErrors.Add("Failed to remove temporary receiver container '$ReceiverContainerName'")
+                        $actualLabel = ($inspectRes.Stdout -join "").Trim()
+                        if ($actualLabel -ceq $ReceiverOwnershipVal) {
+                            $stopRes = Invoke-DockerCmd "stop", $ReceiverContainerName
+                            if ($stopRes.ExitCode -ne 0) {
+                                $cleanupErrors.Add("Failed to stop receiver container '$ReceiverContainerName' (exit code $($stopRes.ExitCode)): $($stopRes.Stderr -join ' ')")
+                            }
+                            $rmRes = Invoke-DockerCmd "rm", "-f", $ReceiverContainerName
+                            if ($rmRes.ExitCode -ne 0) {
+                                $cleanupErrors.Add("Failed to remove receiver container '$ReceiverContainerName' (exit code $($rmRes.ExitCode)): $($rmRes.Stderr -join ' ')")
+                            }
+
+                            # Verify absence afterward using exact case-sensitive matching
+                            $verRes = Invoke-DockerCmd "ps", "-a", "--format", "{{.Names}}"
+                            if ($verRes.ExitCode -ne 0) {
+                                $cleanupErrors.Add("Failed to verify receiver container absence (exit code $($verRes.ExitCode)): $($verRes.Stderr -join ' ')")
+                            } else {
+                                $remaining = @($verRes.Stdout | ForEach-Object { $_.Trim() } | Where-Object { $_ -ceq $ReceiverContainerName })
+                                if ($remaining.Count -gt 0) {
+                                    $cleanupErrors.Add("Failed to remove temporary receiver container '$ReceiverContainerName'")
+                                } else {
+                                    Write-Host "  Temporary receiver container '$ReceiverContainerName' (ownership verified) removed." -ForegroundColor Green
+                                }
+                            }
                         } else {
-                            Write-Host "  Temporary receiver container '$ReceiverContainerName' removed." -ForegroundColor Green
+                            $cleanupErrors.Add("Container '$ReceiverContainerName' exists but ownership label did not match (expected '$ReceiverOwnershipVal', got '$actualLabel'). Skipping removal to prevent deleting unowned container.")
                         }
                     }
                 } else {
@@ -152,26 +356,204 @@ function Invoke-CleanupResources {
     }
 
     # Step 2: Stop isolated test Compose stack and remove test volumes
-    if ($composeProjectAttempted) {
+    # Teardown is STRICTLY FAIL-CLOSED:
+    # 1. We enumerate ALL containers, networks, and volumes carrying com.docker.compose.project=$composeProject,
+    #    plus any resources matching the generated resource names.
+    # 2. Every single discovered resource must pass exact ownership and expected service/role label validation.
+    # 3. Any listing failure, inspection failure, unexpected resource, or label mismatch sets $teardownBlocked = $true.
+    # 4. If $teardownBlocked is $true, destructive teardown ('docker compose down -v') is strictly BLOCKED.
+    #    Resources are preserved on the host engine to prevent deleting unowned or colliding resources.
+    if ($composeProjectStartupAttempted) {
         try {
             if ($SimulateFailure -eq "fail-compose-restore") {
                 $cleanupErrors.Add("[SIMULATED] Isolated Compose teardown failure")
                 Write-Host "  [SIMULATION] Injected Compose teardown failure." -ForegroundColor Magenta
             }
 
-            $downRes = Invoke-DockerCmd "compose", "-p", $composeProject, "-f", $isolatedComposeFile, "down", "-v"
-            if ($downRes.ExitCode -ne 0) {
-                $cleanupErrors.Add("docker compose down -v failed with exit code $($downRes.ExitCode): $($downRes.Stderr -join ' ')")
+            $teardownBlocked = $false
+            $unverifiedResources = [System.Collections.Generic.List[string]]::new()
+            $verifiedContainers = [System.Collections.Generic.List[string]]::new()
+            $verifiedNetworks = [System.Collections.Generic.List[string]]::new()
+            $verifiedVolumes = [System.Collections.Generic.List[string]]::new()
+
+            # 1. Comprehensive Container Enumeration & Validation
+            # Enumerate ALL containers carrying the project label
+            $psByLabelRes = Invoke-DockerCmd "ps", "-a", "--filter", "label=com.docker.compose.project=$composeProject", "--format", "{{.ID}}|{{.Names}}"
+            if ($psByLabelRes.ExitCode -ne 0) {
+                $cleanupErrors.Add("Failed to list Docker containers by project label (exit code $($psByLabelRes.ExitCode)): $($psByLabelRes.Stderr -join ' ')")
+                $teardownBlocked = $true
+            }
+
+            # Also enumerate all containers by name to catch any unlabelled name collisions
+            $psAllRes = Invoke-DockerCmd "ps", "-a", "--format", "{{.Names}}"
+            if ($psAllRes.ExitCode -ne 0) {
+                $cleanupErrors.Add("Failed to list all Docker containers (exit code $($psAllRes.ExitCode)): $($psAllRes.Stderr -join ' ')")
+                $teardownBlocked = $true
+            }
+
+            $allContainersToInspect = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            if ($psByLabelRes.ExitCode -eq 0) {
+                foreach ($line in $psByLabelRes.Stdout) {
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    $cName = ($line -split '\|')[1].Trim()
+                    if (-not [string]::IsNullOrEmpty($cName)) { [void]$allContainersToInspect.Add($cName) }
+                }
+            }
+            if ($psAllRes.ExitCode -eq 0) {
+                foreach ($cName in $psAllRes.Stdout) {
+                    $trimName = $cName.Trim()
+                    if ($trimName -cin @($amContainer, $promContainer) -or $trimName.StartsWith("${composeProject}-")) {
+                        [void]$allContainersToInspect.Add($trimName)
+                    }
+                }
+            }
+
+            foreach ($cName in $allContainersToInspect) {
+                $cInspect = Invoke-DockerCmd "inspect", "--format", "{{ index .Config.Labels `"com.docker.compose.project`" }}|{{ index .Config.Labels `"com.docker.compose.service`" }}", $cName
+                if ($cInspect.ExitCode -ne 0) {
+                    $cleanupErrors.Add("Failed to inspect container '$cName' (exit code $($cInspect.ExitCode)): $($cInspect.Stderr -join ' ')")
+                    $unverifiedResources.Add("container:$cName (inspect failed)")
+                    $teardownBlocked = $true
+                } else {
+                    $parts = ($cInspect.Stdout -join "").Trim() -split '\|'
+                    $projLabel = if ($parts.Length -gt 0) { $parts[0] } else { "" }
+                    $svcLabel = if ($parts.Length -gt 1) { $parts[1] } else { "" }
+                    if ($projLabel -ceq $composeProject -and $svcLabel -in @("alertmanager", "prometheus")) {
+                        $verifiedContainers.Add($cName)
+                    } else {
+                        $unverifiedResources.Add("container:$cName (project='$projLabel', service='$svcLabel')")
+                        $teardownBlocked = $true
+                    }
+                }
+            }
+
+            # 2. Comprehensive Network Enumeration & Validation
+            # Enumerate ALL networks carrying the project label
+            $netByLabelRes = Invoke-DockerCmd "network", "ls", "--filter", "label=com.docker.compose.project=$composeProject", "--format", "{{.Name}}"
+            if ($netByLabelRes.ExitCode -ne 0) {
+                $cleanupErrors.Add("Failed to list Docker networks by project label (exit code $($netByLabelRes.ExitCode)): $($netByLabelRes.Stderr -join ' ')")
+                $teardownBlocked = $true
+            }
+
+            # Also enumerate all networks by name
+            $netAllRes = Invoke-DockerCmd "network", "ls", "--format", "{{.Name}}"
+            if ($netAllRes.ExitCode -ne 0) {
+                $cleanupErrors.Add("Failed to list all Docker networks (exit code $($netAllRes.ExitCode)): $($netAllRes.Stderr -join ' ')")
+                $teardownBlocked = $true
+            }
+
+            $allNetworksToInspect = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            if ($netByLabelRes.ExitCode -eq 0) {
+                foreach ($nName in $netByLabelRes.Stdout) {
+                    $trimNet = $nName.Trim()
+                    if (-not [string]::IsNullOrEmpty($trimNet)) { [void]$allNetworksToInspect.Add($trimNet) }
+                }
+            }
+            if ($netAllRes.ExitCode -eq 0) {
+                foreach ($nName in $netAllRes.Stdout) {
+                    $trimNet = $nName.Trim()
+                    if ($trimNet -ceq $testNetwork -or $trimNet.StartsWith("${composeProject}_")) {
+                        [void]$allNetworksToInspect.Add($trimNet)
+                    }
+                }
+            }
+
+            foreach ($nName in $allNetworksToInspect) {
+                $nInspect = Invoke-DockerCmd "network", "inspect", "--format", "{{ index .Labels `"com.docker.compose.project`" }}|{{ index .Labels `"com.docker.compose.network`" }}", $nName
+                if ($nInspect.ExitCode -ne 0) {
+                    $cleanupErrors.Add("Failed to inspect network '$nName' (exit code $($nInspect.ExitCode)): $($nInspect.Stderr -join ' ')")
+                    $unverifiedResources.Add("network:$nName (inspect failed)")
+                    $teardownBlocked = $true
+                } else {
+                    $nParts = ($nInspect.Stdout -join "").Trim() -split '\|'
+                    $nProj = if ($nParts.Length -gt 0) { $nParts[0] } else { "" }
+                    $nNet = if ($nParts.Length -gt 1) { $nParts[1] } else { "" }
+                    if ($nProj -ceq $composeProject -and $nNet -ceq "test_network") {
+                        $verifiedNetworks.Add($nName)
+                    } else {
+                        $unverifiedResources.Add("network:$nName (project='$nProj', network='$nNet')")
+                        $teardownBlocked = $true
+                    }
+                }
+            }
+
+            # 3. Comprehensive Volume Enumeration & Validation
+            # Enumerate ALL volumes carrying the project label
+            $volByLabelRes = Invoke-DockerCmd "volume", "ls", "--filter", "label=com.docker.compose.project=$composeProject", "--format", "{{.Name}}"
+            if ($volByLabelRes.ExitCode -ne 0) {
+                $cleanupErrors.Add("Failed to list Docker volumes by project label (exit code $($volByLabelRes.ExitCode)): $($volByLabelRes.Stderr -join ' ')")
+                $teardownBlocked = $true
+            }
+
+            # Also enumerate all volumes by name
+            $volAllRes = Invoke-DockerCmd "volume", "ls", "--format", "{{.Name}}"
+            if ($volAllRes.ExitCode -ne 0) {
+                $cleanupErrors.Add("Failed to list all Docker volumes (exit code $($volAllRes.ExitCode)): $($volAllRes.Stderr -join ' ')")
+                $teardownBlocked = $true
+            }
+
+            $allVolumesToInspect = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            if ($volByLabelRes.ExitCode -eq 0) {
+                foreach ($vName in $volByLabelRes.Stdout) {
+                    $trimVol = $vName.Trim()
+                    if (-not [string]::IsNullOrEmpty($trimVol)) { [void]$allVolumesToInspect.Add($trimVol) }
+                }
+            }
+            if ($volAllRes.ExitCode -eq 0) {
+                foreach ($vName in $volAllRes.Stdout) {
+                    $trimVol = $vName.Trim()
+                    if ($trimVol.StartsWith("${composeProject}_") -or $trimVol -cin @("${composeProject}_test_prometheus_data", "${composeProject}_test_alertmanager_data")) {
+                        [void]$allVolumesToInspect.Add($trimVol)
+                    }
+                }
+            }
+
+            foreach ($vName in $allVolumesToInspect) {
+                $vInspect = Invoke-DockerCmd "volume", "inspect", "--format", "{{ index .Labels `"com.docker.compose.project`" }}|{{ index .Labels `"com.docker.compose.volume`" }}", $vName
+                if ($vInspect.ExitCode -ne 0) {
+                    $cleanupErrors.Add("Failed to inspect volume '$vName' (exit code $($vInspect.ExitCode)): $($vInspect.Stderr -join ' ')")
+                    $unverifiedResources.Add("volume:$vName (inspect failed)")
+                    $teardownBlocked = $true
+                } else {
+                    $vParts = ($vInspect.Stdout -join "").Trim() -split '\|'
+                    $vProj = if ($vParts.Length -gt 0) { $vParts[0] } else { "" }
+                    $vVol = if ($vParts.Length -gt 1) { $vParts[1] } else { "" }
+                    if ($vProj -ceq $composeProject -and $vVol -in @("test_prometheus_data", "test_alertmanager_data")) {
+                        $verifiedVolumes.Add($vName)
+                    } else {
+                        $unverifiedResources.Add("volume:$vName (project='$vProj', volume='$vVol')")
+                        $teardownBlocked = $true
+                    }
+                }
+            }
+
+            # 4. Strict Fail-Closed Execution Gate
+            if ($teardownBlocked -or $unverifiedResources.Count -gt 0) {
+                $unverifiedSummary = if ($unverifiedResources.Count -gt 0) { $unverifiedResources -join ", " } else { "Docker command failures occurred" }
+                $cleanupErrors.Add("STRICT FAIL-CLOSED GATE ACTIVATED: Refusing destructive compose down. Unverified resource(s) or inspection failure(s) detected ($unverifiedSummary). Resources preserved on Docker daemon to prevent data loss.")
+                Write-Host "  WARNING: Strict fail-closed gate activated: Compose teardown blocked ($unverifiedSummary)." -ForegroundColor Yellow
             } else {
-                Write-Host "  Isolated test Compose stack stopped and test volumes removed (project: $composeProject)." -ForegroundColor Green
+                # Only execute teardown if verified resources were found
+                if ($verifiedContainers.Count -gt 0 -or $verifiedNetworks.Count -gt 0 -or $verifiedVolumes.Count -gt 0) {
+                    $downRes = Invoke-DockerCmd "compose", "-p", $composeProject, "-f", $isolatedComposeFile, "down", "-v"
+                    if ($downRes.ExitCode -ne 0) {
+                        $cleanupErrors.Add("docker compose down -v failed with exit code $($downRes.ExitCode): $($downRes.Stderr -join ' ')")
+                    } else {
+                        Write-Host "  Isolated test Compose stack stopped and test volumes removed (project: $composeProject; verified: $($verifiedContainers.Count) containers, $($verifiedNetworks.Count) networks, $($verifiedVolumes.Count) volumes)." -ForegroundColor Green
+                    }
+                } else {
+                    Write-Host "  No Compose project resources were present on Docker daemon (skipped teardown)." -ForegroundColor Gray
+                }
             }
         } catch {
             $cleanupErrors.Add("Exception during isolated Compose teardown: $_")
         }
+    } else {
+        Write-Host "  Compose project launch was not attempted (skipped teardown)." -ForegroundColor Gray
     }
 
     # Step 3: Verify isolated test containers and receiver are absent from Docker engine
-    if ($composeProjectAttempted) {
+    if ($composeProjectStartupAttempted) {
         try {
             if ($SimulateFailure -eq "fail-target-verify") {
                 $cleanupErrors.Add("[SIMULATED] Isolated resource teardown verification failed")
@@ -213,15 +595,15 @@ function Invoke-CleanupResources {
     # Note: Overwriting file contents in place mitigates plaintext residue in volatile caches,
     # but does NOT guarantee physical data destruction on SSD wear-leveling controllers,
     # copy-on-write filesystems, snapshots, or storage backups.
-    if ($secretFileAttempted -or (Test-Path $secretFile)) {
+    if ($secretFileCreatedByThisRun -and (Test-Path $secretFile)) {
         try {
             if ($SimulateFailure -eq "fail-secret-cleanup") {
                 $cleanupErrors.Add("[SIMULATED] Ephemeral secret file removal failed")
                 Write-Host "  [SIMULATION] Injected secret file removal failure." -ForegroundColor Magenta
-            } elseif (Test-Path $secretFile) {
+            } else {
                 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
                 $userSid = $currentUser.User.Value
-                $grantRes = Invoke-NativeCommand -Executable "icacls.exe" "$secretFile", "/grant", "*${userSid}:(F)"
+                $grantRes = Invoke-NativeCommand -Executable "icacls.exe" -Arguments @("$secretFile", "/grant", "*${userSid}:(F)")
                 if ($grantRes.ExitCode -ne 0) {
                     Write-Host "  Warning: icacls grant full control returned exit code $($grantRes.ExitCode): $($grantRes.Stderr -join ' ')" -ForegroundColor Yellow
                 }
@@ -250,16 +632,24 @@ function Invoke-CleanupResources {
         }
     }
 
-    if (Test-Path $secretDir) {
+    if ($secretDirCreatedByThisRun -and (Test-Path $secretDir)) {
         try {
-            Remove-Item -Path $secretDir -Recurse -Force
+            $remainingFiles = @(Get-ChildItem -Path $secretDir -Force)
+            if ($remainingFiles.Count -eq 0) {
+                Remove-Item -Path $secretDir -Force
+            } else {
+                $cleanupErrors.Add("Secret directory '$secretDir' contains unexpected files; skipped removal to protect unrelated files: $($remainingFiles.Name -join ', ')")
+            }
         } catch {
             $cleanupErrors.Add("Failed to remove secret directory '$secretDir': $_")
         }
 
-        # Explicitly verify secret directory no longer exists
+        # Explicitly verify secret directory no longer exists if it was empty
         if (Test-Path $secretDir) {
-            $cleanupErrors.Add("Verification failed: Secret directory '$secretDir' still exists after cleanup")
+            $remainingFiles = @(Get-ChildItem -Path $secretDir -Force)
+            if ($remainingFiles.Count -eq 0) {
+                $cleanupErrors.Add("Verification failed: Secret directory '$secretDir' still exists after cleanup")
+            }
         } else {
             Write-Host "  Ephemeral secret directory removal verified (directory is absent)." -ForegroundColor Green
         }
@@ -276,8 +666,97 @@ function Invoke-CleanupResources {
     return , [string[]]$cleanupErrors.ToArray()
 }
 
-# Enter protected lifecycle covering all Docker resources and ephemeral secrets
+# -------------------------------------------------------------------------
+# Host-Level Concurrency Lock (Exclusive Host-Wide Named Mutex)
+# Enforces strictly single execution across all sessions and elevation levels
+# on the host machine to prevent collisions on fixed loopback ports
+# (19090, 19093, 19095) and shared filesystem paths.
+# -------------------------------------------------------------------------
 try {
+    # Configure restricted MutexSecurity for user, administrator, and service/CI identities:
+    # - Current User: FullControl
+    # - Builtin Administrators: FullControl
+    # - Local System (services / CI runners): FullControl
+    # - Authenticated Users (standard users / cross-session): Synchronize | Modify | ReadPermissions
+    # (Enables cross-session lock acquisition, release, and DACL validation, while forbidding TakeOwnership and WriteDac)
+    $mSec = [System.Security.AccessControl.MutexSecurity]::new()
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $userSid = $currentUser.User
+    $adminSid = [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+    $systemSid = [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $authUsersSid = [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::AuthenticatedUserSid, $null)
+
+    $mSec.AddAccessRule([System.Security.AccessControl.MutexAccessRule]::new($userSid, [System.Security.AccessControl.MutexRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow))
+    $mSec.AddAccessRule([System.Security.AccessControl.MutexAccessRule]::new($adminSid, [System.Security.AccessControl.MutexRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow))
+    $mSec.AddAccessRule([System.Security.AccessControl.MutexAccessRule]::new($systemSid, [System.Security.AccessControl.MutexRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow))
+
+    $authRights = [System.Security.AccessControl.MutexRights]::Synchronize -bor [System.Security.AccessControl.MutexRights]::Modify -bor [System.Security.AccessControl.MutexRights]::ReadPermissions
+    $mSec.AddAccessRule([System.Security.AccessControl.MutexAccessRule]::new($authUsersSid, $authRights, [System.Security.AccessControl.AccessControlType]::Allow))
+
+    $createdNew = $false
+    $mutex = [System.Threading.Mutex]::new($false, $mutexName, [ref]$createdNew, $mSec)
+
+    if (-not $createdNew -and $null -ne $mutex) {
+        # Inspect and validate effective access on the opened mutex
+        if (-not (Test-MutexSecurityEffectiveAccess -MutexHandle $mutex -MutexIdentifier $mutexName)) {
+            Write-Error "Existing host mutex '$mutexName' failed security validation. Aborting safely."
+            $mutex.Dispose()
+            exit 1
+        }
+    }
+} catch [System.UnauthorizedAccessException] {
+    # Fallback if mutex already exists with an established DACL
+    try {
+        $reqRights = [System.Security.AccessControl.MutexRights]::Synchronize -bor [System.Security.AccessControl.MutexRights]::Modify -bor [System.Security.AccessControl.MutexRights]::ReadPermissions
+        $mutex = [System.Threading.Mutex]::OpenExisting($mutexName, $reqRights)
+
+        # Inspect and validate effective access on the opened mutex
+        if (-not (Test-MutexSecurityEffectiveAccess -MutexHandle $mutex -MutexIdentifier $mutexName)) {
+            Write-Error "Existing host mutex '$mutexName' failed security validation. Aborting safely."
+            if ($null -ne $mutex) { $mutex.Dispose() }
+            exit 1
+        }
+    } catch {
+        Write-Error "Failed to open or validate existing host mutex '$mutexName': $_"
+        exit 1
+    }
+} catch {
+    Write-Error "Failed to initialize host mutex '$mutexName': $_"
+    exit 1
+}
+
+try {
+    $mutexAcquired = $mutex.WaitOne(0, $false)
+} catch [System.Threading.AbandonedMutexException] {
+    # A previous process terminated abnormally without releasing the mutex.
+    # The mutex is now acquired by the current thread.
+    $mutexAcquired = $true
+} catch {
+    Write-Error "Failed to acquire host mutex '$mutexName': $_"
+    if ($null -ne $mutex) { $mutex.Dispose() }
+    exit 1
+}
+
+if (-not $mutexAcquired) {
+    Write-Error "Another AegisEdge lifecycle test execution is currently running and holds the host lock ('$mutexName'). Aborting safely without modifying shared resources."
+    if ($null -ne $mutex) { $mutex.Dispose() }
+    exit 1
+}
+
+Write-Host "Host concurrency lock acquired ($mutexName)." -ForegroundColor Green
+
+# -------------------------------------------------------------------------
+# Protected Lifecycle Block
+# Guaranteed execution inside try/finally ensures the host mutex is released
+# and test resources are cleaned up on ANY exit path, failure, or cancellation.
+# -------------------------------------------------------------------------
+try {
+    Write-Host "Execution Run IDs: Main=$MainRunId, Restart=$RestartRunId, Inhibit=$InhibitRunId" -ForegroundColor Cyan
+    Write-Host "Compose Project Name: $composeProject" -ForegroundColor Cyan
+    Write-Host "Isolated Containers: Alertmanager=$amContainer, Prometheus=$promContainer" -ForegroundColor Cyan
+    Write-Host "Isolated Network: $testNetwork" -ForegroundColor Cyan
+    Write-Host "Temporary Receiver Container: $ReceiverContainerName" -ForegroundColor Cyan
+
     # 1. Check Docker daemon
     Write-Host "`n==> 1. Checking Docker daemon..." -ForegroundColor Yellow
     $infoRes = Invoke-DockerCmd "info"
@@ -291,15 +770,43 @@ try {
     if (-not (Test-Path "bin")) {
         New-Item -ItemType Directory -Path "bin" -Force | Out-Null
     }
-    cmd.exe /c "set CGO_ENABLED=0&& set GOOS=linux&& set GOARCH=amd64&& go build -o bin/webhook-receiver ./services/control-plane/cmd/webhook-receiver"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to compile webhook-receiver binary."
+    $origCgo = $env:CGO_ENABLED
+    $origGoos = $env:GOOS
+    $origGoarch = $env:GOARCH
+    try {
+        $env:CGO_ENABLED = "0"
+        $env:GOOS = "linux"
+        $env:GOARCH = "amd64"
+        $goRes = Invoke-NativeCommand -Executable "go" -Arguments @("build", "-o", "bin/webhook-receiver", "./services/control-plane/cmd/webhook-receiver")
+        if ($goRes.ExitCode -ne 0) {
+            throw "Failed to compile webhook-receiver binary (exit code $($goRes.ExitCode)): $($goRes.Stderr -join ' ')"
+        }
+        Write-Host "webhook-receiver binary ready." -ForegroundColor Green
+    } finally {
+        $env:CGO_ENABLED = $origCgo
+        $env:GOOS = $origGoos
+        $env:GOARCH = $origGoarch
     }
-    Write-Host "webhook-receiver binary ready." -ForegroundColor Green
 
     # 2.5 Generate CSPRNG ephemeral token and configure secure test secret file
-    Write-Host "`n==> 2.5 Generating CSPRNG ephemeral token and configuring test secret..." -ForegroundColor Yellow
-    $secretFileAttempted = $true
+    Write-Host "`n==> 2.5 Configuring ephemeral test secret..." -ForegroundColor Yellow
+
+    # Verify no pre-existing secret file exists (protect pre-existing secret files)
+    if (Test-Path $secretFile) {
+        throw "Pre-existing secret file found at '$secretFile'. Aborting safely without modifying or deleting pre-existing secret file."
+    }
+
+    # Verify secret directory does not contain unexpected files
+    if (Test-Path $secretDir) {
+        $existingItems = @(Get-ChildItem -Path $secretDir -Force)
+        if ($existingItems.Count -gt 0) {
+            throw "Pre-existing files found in secret directory '$secretDir' ($($existingItems.Name -join ', ')). Aborting safely to protect unexpected files."
+        }
+    } else {
+        New-Item -ItemType Directory -Path $secretDir -Force | Out-Null
+        $secretDirCreatedByThisRun = $true
+    }
+
     $tokenBytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($tokenBytes)
     # Standard Base64 without padding (RFC 4648 § 4, exactly 43 characters for 32 bytes)
@@ -312,17 +819,18 @@ try {
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $userSid = $currentUser.User.Value
 
-    if (-not (Test-Path $secretDir)) {
-        New-Item -ItemType Directory -Path $secretDir -Force | Out-Null
-    }
-    if (Test-Path $secretFile) {
-        $preGrantRes = Invoke-NativeCommand -Executable "icacls.exe" "$secretFile", "/grant", "*${userSid}:(F)"
-        Remove-Item -Path $secretFile -Force
-    }
-
-    # Write raw ASCII bytes (no BOM, no trailing newline)
+    # Write raw ASCII bytes using FileMode::CreateNew to atomically fail if the file already exists.
+    # Ownership flag ($secretFileCreatedByThisRun = $true) is established immediately upon file creation
+    # so that any subsequent partial-write error triggers cleanup of the created file.
     $rawTokenBytes = [System.Text.Encoding]::ASCII.GetBytes($ephemeralToken)
-    [System.IO.File]::WriteAllBytes($secretFile, $rawTokenBytes)
+    $secretFileStream = [System.IO.File]::Open($secretFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $secretFileCreatedByThisRun = $true
+    try {
+        $secretFileStream.Write($rawTokenBytes, 0, $rawTokenBytes.Length)
+        $secretFileStream.Flush()
+    } finally {
+        $secretFileStream.Dispose()
+    }
 
     # Simulated failure during secret configuration (after file is created on disk)
     if ($SimulateFailure -eq "fail-secret-creation") {
@@ -343,7 +851,7 @@ try {
     }
 
     # Set restrictive Windows ACL using current user SID
-    $aclRes = Invoke-NativeCommand -Executable "icacls.exe" "$secretFile", "/inheritance:r", "/grant:r", "*${userSid}:(R)"
+    $aclRes = Invoke-NativeCommand -Executable "icacls.exe" -Arguments @("$secretFile", "/inheritance:r", "/grant:r", "*${userSid}:(R)")
     if ($aclRes.ExitCode -ne 0) {
         throw "Failed to set restrictive ACL on ephemeral token file (exit code $($aclRes.ExitCode)): $($aclRes.Stderr -join ' ')"
     }
@@ -352,8 +860,60 @@ try {
     $authHeaders = @{ Authorization = "Bearer $ephemeralToken" }
 
     # 3. Start Compose stack with isolated test configuration override
-    Write-Host "`n==> 3. Starting Prometheus & Alertmanager with isolated test configuration..." -ForegroundColor Yellow
-    $composeProjectAttempted = $true
+    Write-Host "`n==> 3. Preflight check and starting Prometheus & Alertmanager ($composeProject)..." -ForegroundColor Yellow
+
+    # Preflight ownership verification: verify no conflicting resources exist before starting Compose stack
+    # 1. Check all Docker networks
+    $allNetworksRes = Invoke-DockerCmd "network", "ls", "--format", "{{.Name}}"
+    if ($allNetworksRes.ExitCode -ne 0) {
+        throw "Preflight failed: cannot retrieve Docker networks (exit code $($allNetworksRes.ExitCode)): $($allNetworksRes.Stderr -join ' ')"
+    }
+    $allNetworkNames = @($allNetworksRes.Stdout | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($allNetworkNames -cin @($testNetwork)) {
+        throw "Preflight ownership check failed: network '$testNetwork' already exists on Docker daemon. Aborting safely without modifying existing resources."
+    }
+
+    # 2. Check all Docker volumes
+    $allVolumesRes = Invoke-DockerCmd "volume", "ls", "--format", "{{.Name}}"
+    if ($allVolumesRes.ExitCode -ne 0) {
+        throw "Preflight failed: cannot retrieve Docker volumes (exit code $($allVolumesRes.ExitCode)): $($allVolumesRes.Stderr -join ' ')"
+    }
+    $allVolumeNames = @($allVolumesRes.Stdout | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $expectedVolumes = @(
+        "${composeProject}_test_prometheus_data",
+        "${composeProject}_test_alertmanager_data"
+    )
+    $conflictingVolumes = @($allVolumeNames | Where-Object { $_ -cin $expectedVolumes })
+    if ($conflictingVolumes.Count -gt 0) {
+        throw "Preflight ownership check failed: volume(s) already exist for project '$composeProject' ($($conflictingVolumes -join ', ')). Aborting safely without modifying existing resources."
+    }
+
+    # 3. Check all Docker containers
+    $allContainersRes = Invoke-DockerCmd "ps", "-a", "--format", "{{.Names}}"
+    if ($allContainersRes.ExitCode -ne 0) {
+        throw "Preflight failed: cannot retrieve Docker containers (exit code $($allContainersRes.ExitCode)): $($allContainersRes.Stderr -join ' ')"
+    }
+    $allContainerNames = @($allContainersRes.Stdout | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $expectedContainers = @($amContainer, $promContainer)
+    $conflictingContainers = @($allContainerNames | Where-Object { $_ -cin $expectedContainers })
+    if ($conflictingContainers.Count -gt 0) {
+        throw "Preflight ownership check failed: container(s) already exist for project '$composeProject' ($($conflictingContainers -join ', ')). Aborting safely without modifying existing resources."
+    }
+
+    # Also check if any container carries compose project label for this project
+    $composeProjectContainersRes = Invoke-DockerCmd "ps", "-a", "--filter", "label=com.docker.compose.project=$composeProject", "--format", "{{.Names}}"
+    if ($composeProjectContainersRes.ExitCode -ne 0) {
+        throw "Preflight failed: cannot query Docker containers by Compose project label (exit code $($composeProjectContainersRes.ExitCode)): $($composeProjectContainersRes.Stderr -join ' ')"
+    }
+    if ($composeProjectContainersRes.Stdout.Count -gt 0) {
+        throw "Preflight ownership check failed: container(s) with label com.docker.compose.project=$composeProject already exist ($($composeProjectContainersRes.Stdout -join ', ')). Aborting safely without modifying existing resources."
+    }
+
+    # Preflight passed: zero conflicting networks, volumes, or containers exist
+    $composeProjectPreflightPassed = $true
+    Write-Host "  Preflight passed: zero conflicting networks, volumes, or containers for '$composeProject'." -ForegroundColor Green
+
+    $composeProjectStartupAttempted = $true
     $upRes = Invoke-DockerCmd "compose", "-p", $composeProject, "-f", $isolatedComposeFile, "up", "-d"
     if ($upRes.ExitCode -ne 0) {
         throw "Failed to start docker-compose stack with isolated test configuration (exit code $($upRes.ExitCode)): $($upRes.Stderr -join ' ')"
@@ -366,12 +926,24 @@ try {
         throw "Failed to restart Alertmanager container '$amContainer' (exit code $($flushRes.ExitCode)): $($flushRes.Stderr -join ' ')"
     }
 
-    # 4. Start temporary webhook-receiver container on Compose network with unique name and network-alias
+    # 4. Start temporary webhook-receiver container on Compose network with unique name and ownership label
     Write-Host "`n==> 4. Starting temporary webhook-receiver container '$ReceiverContainerName' on $testNetwork..." -ForegroundColor Yellow
+    
+    # Preflight check for receiver container name
+    $recvPreflightRes = Invoke-DockerCmd "ps", "-a", "--format", "{{.Names}}"
+    if ($recvPreflightRes.ExitCode -ne 0) {
+        throw "Failed to query Docker containers during receiver preflight (exit code $($recvPreflightRes.ExitCode)): $($recvPreflightRes.Stderr -join ' ')"
+    }
+    $existingRecv = @($recvPreflightRes.Stdout | Where-Object { $_ -ceq $ReceiverContainerName })
+    if ($existingRecv.Count -gt 0) {
+        throw "Preflight ownership check failed: receiver container name '$ReceiverContainerName' already exists on Docker engine. Aborting without modifying existing container."
+    }
     $receiverContainerAttempted = $true
+
     $pwdPath = (Get-Item -Path ".").FullName
     $runRes = Invoke-DockerCmd "run", "-d", `
         "--name", $ReceiverContainerName, `
+        "--label", "${ReceiverOwnershipKey}=${ReceiverOwnershipVal}", `
         "--network", $testNetwork, `
         "--network-alias", "webhook-receiver", `
         "-p", "127.0.0.1:${recvPort}:9095", `
@@ -1427,8 +1999,29 @@ catch {
     Write-Host "Test Execution Failed: $testError" -ForegroundColor Red
 }
 finally {
-    # Teardown and cleanup
-    $cleanupErrors = Invoke-CleanupResources
+    # Teardown and cleanup while still holding the host concurrency lock
+    try {
+        $cleanupErrors = Invoke-CleanupResources
+    } catch {
+        Write-Host "Unexpected exception during cleanup: $_" -ForegroundColor Red
+        if ($null -eq $cleanupErrors) {
+            $cleanupErrors = @("Unexpected exception during cleanup: $_")
+        } else {
+            $cleanupErrors = @($cleanupErrors) + "Unexpected exception during cleanup: $_"
+        }
+    } finally {
+        # Release and dispose the host concurrency lock
+        if ($mutexAcquired -and $null -ne $mutex) {
+            try {
+                $mutex.ReleaseMutex()
+                Write-Host "Host concurrency lock released ($mutexName)." -ForegroundColor Green
+            } catch {
+                Write-Host "Warning: error releasing host mutex: $_" -ForegroundColor Yellow
+            }
+            $mutex.Dispose()
+            $mutex = $null
+        }
+    }
 
     if ($cleanupErrors.Count -gt 0) {
         $cleanupSummary = $cleanupErrors -join "; "
